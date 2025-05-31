@@ -90,7 +90,11 @@ impl FileRepository {
         match fs::read_to_string(filename) {
             Ok(content) => {
                 match serde_json::from_str::<Spreadsheet>(&content) {
-                    Ok(spreadsheet) => Ok((spreadsheet, filename.to_string())),
+                    Ok(mut spreadsheet) => {
+                        // Rebuild dependencies since they're not serialized
+                        spreadsheet.rebuild_dependencies();
+                        Ok((spreadsheet, filename.to_string()))
+                    }
                     Err(e) => Err(format!("Invalid file format - {}", e)),
                 }
             }

@@ -3,7 +3,7 @@
 //! This module contains the core data structures that represent
 //! spreadsheet cells and the spreadsheet itself.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 /// Represents the data contained within a single spreadsheet cell.
@@ -77,6 +77,12 @@ pub struct Spreadsheet {
     pub column_widths: HashMap<usize, usize>,
     /// Default width for columns without custom widths
     pub default_column_width: usize,
+    /// Dependency graph: cell -> set of cells that depend on it
+    #[serde(skip)]
+    pub dependents: HashMap<(usize, usize), HashSet<(usize, usize)>>,
+    /// Dependencies: cell -> set of cells it depends on
+    #[serde(skip)]
+    pub dependencies: HashMap<(usize, usize), HashSet<(usize, usize)>>,
 }
 
 impl Default for Spreadsheet {
@@ -87,6 +93,8 @@ impl Default for Spreadsheet {
             cols: 26,
             column_widths: HashMap::new(),
             default_column_width: 8,
+            dependents: HashMap::new(),
+            dependencies: HashMap::new(),
         }
     }
 }
@@ -114,10 +122,35 @@ impl Spreadsheet {
         self.cells.get(&(row, col)).cloned().unwrap_or_default()
     }
 
+    /// Sets the cell data at the specified coordinates without recalculation.
+    ///
+    /// This is the low-level method that just stores the cell data and adjusts column width.
+    /// Use `set_cell_with_recalc` for normal operations that should trigger recalculation.
+    ///
+    /// # Arguments
+    ///
+    /// * `row` - Zero-based row index
+    /// * `col` - Zero-based column index
+    /// * `data` - Cell data to store
+    fn set_cell_internal(&mut self, row: usize, col: usize, data: CellData) {
+        self.cells.insert((row, col), data.clone());
+        
+        let current_width = self.get_column_width(col);
+        let value_width = data.value.len();
+        let formula_width = data.formula.as_ref().map(|f| f.len()).unwrap_or(0);
+        let content_width = value_width.max(formula_width);
+        let header_width = Self::column_label(col).len();
+        let needed_width = content_width.max(header_width).max(3).min(50);
+        
+        if needed_width > current_width {
+            self.set_column_width(col, needed_width);
+        }
+    }
+
     /// Sets the cell data at the specified coordinates.
     ///
-    /// This method also automatically adjusts the column width if the new
-    /// content is wider than the current column width.
+    /// This method handles dependency tracking and automatic recalculation.
+    /// When a cell is updated, all cells that depend on it are automatically recalculated.
     ///
     /// # Arguments
     ///
@@ -138,17 +171,118 @@ impl Spreadsheet {
     /// sheet.set_cell(0, 0, cell);
     /// ```
     pub fn set_cell(&mut self, row: usize, col: usize, data: CellData) {
-        self.cells.insert((row, col), data.clone());
+        // Remove old dependencies for this cell
+        self.remove_cell_dependencies(row, col);
         
-        let current_width = self.get_column_width(col);
-        let value_width = data.value.len();
-        let formula_width = data.formula.as_ref().map(|f| f.len()).unwrap_or(0);
-        let content_width = value_width.max(formula_width);
-        let header_width = Self::column_label(col).len();
-        let needed_width = content_width.max(header_width).max(3).min(50);
+        // Set the cell data
+        self.set_cell_internal(row, col, data.clone());
         
-        if needed_width > current_width {
-            self.set_column_width(col, needed_width);
+        // Add new dependencies if this cell has a formula
+        if let Some(ref formula) = data.formula {
+            self.add_cell_dependencies(row, col, formula);
+        }
+        
+        // Recalculate all cells that depend on this cell
+        self.recalculate_dependents(row, col);
+    }
+
+    /// Removes all dependencies for a cell.
+    fn remove_cell_dependencies(&mut self, row: usize, col: usize) {
+        let cell_pos = (row, col);
+        
+        // Remove this cell from the dependents of cells it depends on
+        if let Some(deps) = self.dependencies.get(&cell_pos).cloned() {
+            for dep in deps {
+                if let Some(dependents) = self.dependents.get_mut(&dep) {
+                    dependents.remove(&cell_pos);
+                    if dependents.is_empty() {
+                        self.dependents.remove(&dep);
+                    }
+                }
+            }
+        }
+        
+        // Clear this cell's dependencies
+        self.dependencies.remove(&cell_pos);
+    }
+
+    /// Adds dependencies for a cell based on its formula.
+    fn add_cell_dependencies(&mut self, row: usize, col: usize, formula: &str) {
+        use super::services::FormulaEvaluator;
+        
+        let evaluator = FormulaEvaluator::new(self);
+        let dependencies = evaluator.extract_cell_references(formula);
+        let cell_pos = (row, col);
+        
+        if !dependencies.is_empty() {
+            // Store dependencies for this cell
+            self.dependencies.insert(cell_pos, dependencies.iter().cloned().collect());
+            
+            // Add this cell as a dependent of each cell it depends on
+            for dep in dependencies {
+                self.dependents.entry(dep).or_insert_with(HashSet::new).insert(cell_pos);
+            }
+        }
+    }
+
+    /// Recalculates all cells that depend on the given cell.
+    fn recalculate_dependents(&mut self, row: usize, col: usize) {
+        let cell_pos = (row, col);
+        
+        // Get all cells that depend on this cell
+        if let Some(dependents) = self.dependents.get(&cell_pos).cloned() {
+            // Use a breadth-first approach with cycle detection
+            let mut to_recalc: Vec<_> = dependents.into_iter().collect();
+            let mut visited = HashSet::new();
+            let mut in_progress = HashSet::new();
+            
+            while let Some(dependent) = to_recalc.pop() {
+                if visited.contains(&dependent) {
+                    continue;
+                }
+                
+                // Check for circular dependency
+                if in_progress.contains(&dependent) {
+                    // Circular dependency detected - skip this cell
+                    continue;
+                }
+                
+                in_progress.insert(dependent);
+                
+                // Recalculate this dependent cell
+                self.recalculate_cell(dependent.0, dependent.1);
+                
+                visited.insert(dependent);
+                in_progress.remove(&dependent);
+                
+                // Add its dependents to the queue
+                if let Some(next_deps) = self.dependents.get(&dependent).cloned() {
+                    for next_dep in next_deps {
+                        if !visited.contains(&next_dep) && !in_progress.contains(&next_dep) {
+                            to_recalc.push(next_dep);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Recalculates a single cell's value based on its formula.
+    fn recalculate_cell(&mut self, row: usize, col: usize) {
+        let cell_pos = (row, col);
+        
+        if let Some(cell) = self.cells.get(&cell_pos).cloned() {
+            if let Some(ref formula) = cell.formula {
+                use super::services::FormulaEvaluator;
+                
+                let evaluator = FormulaEvaluator::new(self);
+                let new_value = evaluator.evaluate_formula(formula);
+                
+                // Update only the value, keep the formula
+                let mut updated_cell = cell;
+                updated_cell.value = new_value;
+                self.set_cell_internal(row, col, updated_cell);
+            }
         }
     }
 
@@ -348,6 +482,28 @@ impl Spreadsheet {
     pub fn auto_resize_all_columns(&mut self) {
         for col in 0..self.cols {
             self.auto_resize_column(col);
+        }
+    }
+
+    /// Rebuilds the dependency graph for all cells with formulas.
+    ///
+    /// This should be called after loading a spreadsheet from file,
+    /// since dependency information is not serialized.
+    pub fn rebuild_dependencies(&mut self) {
+        // Clear existing dependencies
+        self.dependencies.clear();
+        self.dependents.clear();
+        
+        // Rebuild dependencies for all cells with formulas
+        let cells_with_formulas: Vec<_> = self.cells
+            .iter()
+            .filter_map(|((row, col), cell)| {
+                cell.formula.as_ref().map(|formula| (*row, *col, formula.clone()))
+            })
+            .collect();
+        
+        for (row, col, formula) in cells_with_formulas {
+            self.add_cell_dependencies(row, col, &formula);
         }
     }
 }
@@ -622,5 +778,261 @@ mod tests {
         assert!(cell_1_1.formula.is_none());
         
         assert_eq!(deserialized.get_column_width(0), 15);
+    }
+
+    #[test]
+    fn test_automatic_recalculation() {
+        let mut sheet = Spreadsheet::default();
+        
+        // Set up a simple dependency chain: C1 = A1 + B1
+        sheet.set_cell(0, 0, CellData { value: "10".to_string(), formula: None }); // A1 = 10
+        sheet.set_cell(0, 1, CellData { value: "20".to_string(), formula: None }); // B1 = 20
+        sheet.set_cell(0, 2, CellData { 
+            value: "30".to_string(), 
+            formula: Some("=A1+B1".to_string()) 
+        }); // C1 = A1+B1 = 30
+        
+        // Verify initial state
+        assert_eq!(sheet.get_cell(0, 2).value, "30");
+        
+        // Change A1 and verify C1 updates automatically
+        sheet.set_cell(0, 0, CellData { value: "15".to_string(), formula: None });
+        assert_eq!(sheet.get_cell(0, 2).value, "35"); // Should be 15+20=35
+        
+        // Change B1 and verify C1 updates automatically
+        sheet.set_cell(0, 1, CellData { value: "25".to_string(), formula: None });
+        assert_eq!(sheet.get_cell(0, 2).value, "40"); // Should be 15+25=40
+    }
+
+    #[test]
+    fn test_dependency_chain_recalculation() {
+        let mut sheet = Spreadsheet::default();
+        
+        // Set up a dependency chain: A1 -> B1 -> C1
+        sheet.set_cell(0, 0, CellData { value: "5".to_string(), formula: None }); // A1 = 5
+        sheet.set_cell(0, 1, CellData { 
+            value: "10".to_string(), 
+            formula: Some("=A1*2".to_string()) 
+        }); // B1 = A1*2 = 10
+        sheet.set_cell(0, 2, CellData { 
+            value: "20".to_string(), 
+            formula: Some("=B1*2".to_string()) 
+        }); // C1 = B1*2 = 20
+        
+        // Verify initial state
+        assert_eq!(sheet.get_cell(0, 0).value, "5");
+        assert_eq!(sheet.get_cell(0, 1).value, "10");
+        assert_eq!(sheet.get_cell(0, 2).value, "20");
+        
+        // Change A1 and verify the entire chain updates
+        sheet.set_cell(0, 0, CellData { value: "10".to_string(), formula: None });
+        assert_eq!(sheet.get_cell(0, 0).value, "10");
+        assert_eq!(sheet.get_cell(0, 1).value, "20"); // 10*2=20
+        assert_eq!(sheet.get_cell(0, 2).value, "40"); // 20*2=40
+    }
+
+    #[test]
+    fn test_multiple_dependents() {
+        let mut sheet = Spreadsheet::default();
+        
+        // Set up multiple cells depending on A1
+        sheet.set_cell(0, 0, CellData { value: "10".to_string(), formula: None }); // A1 = 10
+        sheet.set_cell(0, 1, CellData { 
+            value: "11".to_string(), 
+            formula: Some("=A1+1".to_string()) 
+        }); // B1 = A1+1 = 11
+        sheet.set_cell(0, 2, CellData { 
+            value: "20".to_string(), 
+            formula: Some("=A1*2".to_string()) 
+        }); // C1 = A1*2 = 20
+        sheet.set_cell(0, 3, CellData { 
+            value: "100".to_string(), 
+            formula: Some("=A1*A1".to_string()) 
+        }); // D1 = A1*A1 = 100
+        
+        // Verify initial state
+        assert_eq!(sheet.get_cell(0, 1).value, "11");
+        assert_eq!(sheet.get_cell(0, 2).value, "20");
+        assert_eq!(sheet.get_cell(0, 3).value, "100");
+        
+        // Change A1 and verify all dependents update
+        sheet.set_cell(0, 0, CellData { value: "5".to_string(), formula: None });
+        assert_eq!(sheet.get_cell(0, 1).value, "6");   // 5+1=6
+        assert_eq!(sheet.get_cell(0, 2).value, "10");  // 5*2=10
+        assert_eq!(sheet.get_cell(0, 3).value, "25");  // 5*5=25
+    }
+
+    #[test]
+    fn test_dependency_removal() {
+        let mut sheet = Spreadsheet::default();
+        
+        // Set up a dependency
+        sheet.set_cell(0, 0, CellData { value: "10".to_string(), formula: None }); // A1 = 10
+        sheet.set_cell(0, 1, CellData { 
+            value: "20".to_string(), 
+            formula: Some("=A1*2".to_string()) 
+        }); // B1 = A1*2 = 20
+        
+        // Verify dependency exists
+        assert_eq!(sheet.get_cell(0, 1).value, "20");
+        
+        // Change A1 and verify B1 updates
+        sheet.set_cell(0, 0, CellData { value: "15".to_string(), formula: None });
+        assert_eq!(sheet.get_cell(0, 1).value, "30");
+        
+        // Replace B1 with a constant value (remove dependency)
+        sheet.set_cell(0, 1, CellData { value: "42".to_string(), formula: None });
+        assert_eq!(sheet.get_cell(0, 1).value, "42");
+        
+        // Change A1 again - B1 should NOT update since dependency is removed
+        sheet.set_cell(0, 0, CellData { value: "100".to_string(), formula: None });
+        assert_eq!(sheet.get_cell(0, 1).value, "42"); // Should remain 42, not recalculate
+    }
+
+    #[test]
+    fn test_rebuild_dependencies() {
+        let mut sheet = Spreadsheet::default();
+        
+        // Manually insert cells with formulas (simulating loading from file)
+        sheet.cells.insert((0, 0), CellData { value: "10".to_string(), formula: None });
+        sheet.cells.insert((0, 1), CellData { 
+            value: "20".to_string(), 
+            formula: Some("=A1*2".to_string()) 
+        });
+        sheet.cells.insert((0, 2), CellData { 
+            value: "40".to_string(), 
+            formula: Some("=B1*2".to_string()) 
+        });
+        
+        // At this point, dependencies are not tracked
+        assert!(sheet.dependencies.is_empty());
+        assert!(sheet.dependents.is_empty());
+        
+        // Rebuild dependencies
+        sheet.rebuild_dependencies();
+        
+        // Verify dependencies are now tracked
+        assert!(!sheet.dependencies.is_empty());
+        assert!(!sheet.dependents.is_empty());
+        
+        // Test that recalculation works after rebuilding
+        sheet.set_cell(0, 0, CellData { value: "5".to_string(), formula: None });
+        assert_eq!(sheet.get_cell(0, 1).value, "10"); // 5*2=10
+        assert_eq!(sheet.get_cell(0, 2).value, "20"); // 10*2=20
+    }
+
+    #[test]
+    fn test_range_dependency_recalculation() {
+        let mut sheet = Spreadsheet::default();
+        
+        // Set up cells A1:A3 and a SUM formula
+        sheet.set_cell(0, 0, CellData { value: "1".to_string(), formula: None }); // A1 = 1
+        sheet.set_cell(1, 0, CellData { value: "2".to_string(), formula: None }); // A2 = 2
+        sheet.set_cell(2, 0, CellData { value: "3".to_string(), formula: None }); // A3 = 3
+        sheet.set_cell(0, 1, CellData { 
+            value: "6".to_string(), 
+            formula: Some("=SUM(A1:A3)".to_string()) 
+        }); // B1 = SUM(A1:A3) = 6
+        
+        // Verify initial state
+        assert_eq!(sheet.get_cell(0, 1).value, "6");
+        
+        // Change one cell in the range
+        sheet.set_cell(1, 0, CellData { value: "5".to_string(), formula: None }); // A2 = 5
+        assert_eq!(sheet.get_cell(0, 1).value, "9"); // Should be 1+5+3=9
+        
+        // Change another cell in the range
+        sheet.set_cell(2, 0, CellData { value: "10".to_string(), formula: None }); // A3 = 10
+        assert_eq!(sheet.get_cell(0, 1).value, "16"); // Should be 1+5+10=16
+    }
+
+    #[test]
+    fn test_circular_dependency_handling() {
+        let mut sheet = Spreadsheet::default();
+        
+        // Set up a potential circular dependency scenario
+        sheet.set_cell(0, 0, CellData { value: "10".to_string(), formula: None }); // A1 = 10
+        sheet.set_cell(0, 1, CellData { 
+            value: "20".to_string(), 
+            formula: Some("=A1*2".to_string()) 
+        }); // B1 = A1*2 = 20
+        
+        // Now try to create a circular dependency A1 = B1 + 1
+        // This should be prevented by the circular reference check
+        use crate::domain::services::FormulaEvaluator;
+        let evaluator = FormulaEvaluator::new(&sheet);
+        let would_be_circular = evaluator.would_create_circular_reference("=B1+1", (0, 0));
+        assert!(would_be_circular); // Should detect the circular reference
+        
+        // The dependency system should also handle this gracefully
+        // Even if somehow a circular dependency got through, recalculation should not hang
+    }
+
+    #[test]
+    fn test_extract_cell_references_from_formula() {
+        use crate::domain::services::FormulaEvaluator;
+        
+        let sheet = Spreadsheet::default();
+        let evaluator = FormulaEvaluator::new(&sheet);
+        
+        // Test simple cell reference
+        let refs = evaluator.extract_cell_references("=A1");
+        assert_eq!(refs, vec![(0, 0)]);
+        
+        // Test multiple cell references
+        let refs = evaluator.extract_cell_references("=A1+B2*C3");
+        assert_eq!(refs.len(), 3);
+        assert!(refs.contains(&(0, 0))); // A1
+        assert!(refs.contains(&(1, 1))); // B2
+        assert!(refs.contains(&(2, 2))); // C3
+        
+        // Test range reference
+        let refs = evaluator.extract_cell_references("=SUM(A1:A3)");
+        assert_eq!(refs.len(), 3);
+        assert!(refs.contains(&(0, 0))); // A1
+        assert!(refs.contains(&(1, 0))); // A2
+        assert!(refs.contains(&(2, 0))); // A3
+        
+        // Test no references
+        let refs = evaluator.extract_cell_references("=5+10");
+        assert!(refs.is_empty());
+        
+        // Test non-formula
+        let refs = evaluator.extract_cell_references("Hello World");
+        assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn test_dependency_tracking_persistence() {
+        use crate::infrastructure::FileRepository;
+        use tempfile::NamedTempFile;
+        
+        let mut original = Spreadsheet::default();
+        
+        // Set up dependencies
+        original.set_cell(0, 0, CellData { value: "10".to_string(), formula: None }); // A1 = 10
+        original.set_cell(0, 1, CellData { 
+            value: "20".to_string(), 
+            formula: Some("=A1*2".to_string()) 
+        }); // B1 = A1*2 = 20
+        original.set_cell(0, 2, CellData { 
+            value: "40".to_string(), 
+            formula: Some("=B1*2".to_string()) 
+        }); // C1 = B1*2 = 40
+        
+        // Save to file
+        let temp_file = NamedTempFile::new().expect("Failed to create temp file");
+        let file_path = temp_file.path().to_str().unwrap();
+        FileRepository::save_spreadsheet(&original, file_path).expect("Save failed");
+        
+        // Load from file
+        let (mut loaded, _) = FileRepository::load_spreadsheet(file_path).expect("Load failed");
+        
+        // Dependencies should be rebuilt and functional
+        loaded.set_cell(0, 0, CellData { value: "5".to_string(), formula: None }); // Change A1 to 5
+        
+        // Verify that dependent cells were recalculated
+        assert_eq!(loaded.get_cell(0, 1).value, "10"); // B1 = 5*2 = 10
+        assert_eq!(loaded.get_cell(0, 2).value, "20"); // C1 = 10*2 = 20
     }
 }

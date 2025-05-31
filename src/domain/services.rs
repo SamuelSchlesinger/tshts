@@ -215,10 +215,38 @@ impl<'a> FormulaEvaluator<'a> {
         }
     }
 
+    /// Extracts all cell references from a formula string.
+    ///
+    /// Parses the formula and analyzes its AST to find all cell references.
+    /// This is used for dependency tracking and automatic recalculation.
+    ///
+    /// # Arguments
+    ///
+    /// * `formula` - Formula string to analyze (should start with '=')
+    ///
+    /// # Returns
+    ///
+    /// Vector of (row, col) tuples representing the referenced cells
+    pub fn extract_cell_references(&self, formula: &str) -> Vec<(usize, usize)> {
+        if !formula.starts_with('=') {
+            return Vec::new();
+        }
+        
+        let expr = &formula[1..];
+        match Parser::new(expr) {
+            Ok(mut parser) => {
+                match parser.parse() {
+                    Ok(ast) => self.extract_cell_references_from_ast(&ast),
+                    Err(_) => Vec::new(),
+                }
+            }
+            Err(_) => Vec::new(),
+        }
+    }
+
     /// Extracts all cell references from an AST.
     ///
     /// This is a utility method for analyzing formula dependencies.
-    /// Currently used mainly for testing and future dependency analysis features.
     ///
     /// # Arguments
     ///
@@ -227,7 +255,6 @@ impl<'a> FormulaEvaluator<'a> {
     /// # Returns
     ///
     /// Vector of (row, col) tuples representing the referenced cells
-    #[allow(dead_code)]
     fn extract_cell_references_from_ast(&self, expr: &Expr) -> Vec<(usize, usize)> {
         let mut references = Vec::new();
         
@@ -380,6 +407,9 @@ impl CsvExporter {
             spreadsheet.rows = spreadsheet.rows.max(max_row + 10); // Add some buffer
             spreadsheet.cols = spreadsheet.cols.max(max_col + 5);   // Add some buffer
         }
+        
+        // Rebuild dependencies in case any imported cells contain formulas
+        spreadsheet.rebuild_dependencies();
         
         Ok(spreadsheet)
     }
