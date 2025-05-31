@@ -11,7 +11,7 @@ An efficient, lightweight terminal-based spreadsheet application built in Rust. 
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/tshts.git
+git clone https://github.com/SamuelSchlesinger/tshts.git
 cd tshts
 
 # Build and run
