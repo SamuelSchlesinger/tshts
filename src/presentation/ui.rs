@@ -54,7 +54,12 @@ fn render_spreadsheet(f: &mut Frame, app: &App, area: Rect) {
     
     let mut headers = vec![Cell::from("")];
     for col in app.scroll_col..app.scroll_col + visible_cols {
-        headers.push(Cell::from(Spreadsheet::column_label(col)).style(Style::default().fg(Color::Yellow)));
+        let header_style = if col == app.selected_col {
+            Style::default().bg(Color::LightBlue).fg(Color::Black)
+        } else {
+            Style::default().fg(Color::Yellow)
+        };
+        headers.push(Cell::from(Spreadsheet::column_label(col)).style(header_style));
     }
 
     let header_row = Row::new(headers).height(1);
@@ -62,7 +67,12 @@ fn render_spreadsheet(f: &mut Frame, app: &App, area: Rect) {
     let mut rows = vec![header_row];
     
     for row in app.scroll_row..std::cmp::min(app.scroll_row + visible_rows, app.spreadsheet.rows) {
-        let mut cells = vec![Cell::from(format!("{}", row + 1)).style(Style::default().fg(Color::Yellow))];
+        let row_number_style = if row == app.selected_row {
+            Style::default().bg(Color::LightBlue).fg(Color::Black)
+        } else {
+            Style::default().fg(Color::Yellow)
+        };
+        let mut cells = vec![Cell::from(format!("{}", row + 1)).style(row_number_style)];
         
         for col in app.scroll_col..app.scroll_col + visible_cols {
             let cell_data = app.spreadsheet.get_cell(row, col);
