@@ -1,5 +1,6 @@
 use crate::application::{App, AppMode};
 use crate::infrastructure::FileRepository;
+use crate::domain::CsvExporter;
 use crossterm::event::{KeyCode, KeyModifiers};
 
 pub struct InputHandler;
@@ -10,8 +11,10 @@ impl InputHandler {
             AppMode::Normal => Self::handle_normal_mode(app, key, modifiers),
             AppMode::Editing => Self::handle_editing_mode(app, key),
             AppMode::Help => Self::handle_help_mode(app, key),
-            AppMode::SaveAs => Self::handle_filename_input_mode(app, key, true),
-            AppMode::LoadFile => Self::handle_filename_input_mode(app, key, false),
+            AppMode::SaveAs => Self::handle_filename_input_mode(app, key, "save"),
+            AppMode::LoadFile => Self::handle_filename_input_mode(app, key, "load"),
+            AppMode::ExportCsv => Self::handle_filename_input_mode(app, key, "csv_export"),
+            AppMode::ImportCsv => Self::handle_filename_input_mode(app, key, "csv_import"),
         }
     }
 
@@ -24,6 +27,18 @@ impl InputHandler {
                 }
                 KeyCode::Char('o') => {
                     app.start_load_file();
+                    return;
+                }
+                KeyCode::Char('e') => {
+                    app.start_csv_export();
+                    return;
+                }
+                KeyCode::Char('i') => {
+                    app.start_csv_import();
+                    return;
+                }
+                KeyCode::Char('l') => {
+                    app.start_csv_import();
                     return;
                 }
                 _ => {}
@@ -158,17 +173,31 @@ impl InputHandler {
         }
     }
 
-    fn handle_filename_input_mode(app: &mut App, key: KeyCode, is_save: bool) {
+    fn handle_filename_input_mode(app: &mut App, key: KeyCode, mode: &str) {
         match key {
             KeyCode::Enter => {
-                if is_save {
-                    let filename = app.get_save_filename();
-                    let result = FileRepository::save_spreadsheet(&app.spreadsheet, &filename);
-                    app.set_save_result(result);
-                } else {
-                    let filename = app.get_load_filename();
-                    let result = FileRepository::load_spreadsheet(&filename);
-                    app.set_load_result(result);
+                match mode {
+                    "save" => {
+                        let filename = app.get_save_filename();
+                        let result = FileRepository::save_spreadsheet(&app.spreadsheet, &filename);
+                        app.set_save_result(result);
+                    }
+                    "load" => {
+                        let filename = app.get_load_filename();
+                        let result = FileRepository::load_spreadsheet(&filename);
+                        app.set_load_result(result);
+                    }
+                    "csv_export" => {
+                        let filename = app.get_csv_export_filename();
+                        let result = CsvExporter::export_to_csv(&app.spreadsheet, &filename);
+                        app.set_csv_export_result(result);
+                    }
+                    "csv_import" => {
+                        let filename = app.get_csv_import_filename();
+                        let result = CsvExporter::import_from_csv(&filename);
+                        app.set_csv_import_result(result);
+                    }
+                    _ => {}
                 }
             }
             KeyCode::Esc => {
@@ -207,5 +236,75 @@ impl InputHandler {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::application::{App, AppMode};
+
+    #[test]
+    fn test_csv_import_key_binding() {
+        let mut app = App::default();
+        
+        // Initially in normal mode
+        assert!(matches!(app.mode, AppMode::Normal));
+        
+        // Simulate Ctrl+I key press
+        InputHandler::handle_key_event(&mut app, KeyCode::Char('i'), KeyModifiers::CONTROL);
+        
+        // Should switch to ImportCsv mode
+        assert!(matches!(app.mode, AppMode::ImportCsv));
+        assert_eq!(app.filename_input, "data.csv");
+    }
+
+    #[test]
+    fn test_csv_import_alternative_key_binding() {
+        let mut app = App::default();
+        
+        // Initially in normal mode
+        assert!(matches!(app.mode, AppMode::Normal));
+        
+        // Simulate Ctrl+L key press (alternative binding)
+        InputHandler::handle_key_event(&mut app, KeyCode::Char('l'), KeyModifiers::CONTROL);
+        
+        // Should switch to ImportCsv mode
+        assert!(matches!(app.mode, AppMode::ImportCsv));
+        assert_eq!(app.filename_input, "data.csv");
+    }
+
+    #[test]
+    fn test_csv_export_key_binding() {
+        let mut app = App::default();
+        
+        // Initially in normal mode
+        assert!(matches!(app.mode, AppMode::Normal));
+        
+        // Simulate Ctrl+E key press
+        InputHandler::handle_key_event(&mut app, KeyCode::Char('e'), KeyModifiers::CONTROL);
+        
+        // Should switch to ExportCsv mode
+        assert!(matches!(app.mode, AppMode::ExportCsv));
+        assert_eq!(app.filename_input, "spreadsheet.csv");
+    }
+
+    #[test]
+    fn test_import_csv_filename_input() {
+        let mut app = App::default();
+        app.start_csv_import();
+        
+        // Test typing a character
+        InputHandler::handle_key_event(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
+        assert_eq!(app.filename_input, "data.csvm");
+        
+        // Test backspace
+        InputHandler::handle_key_event(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(app.filename_input, "data.csv");
+        
+        // Test escape to cancel
+        InputHandler::handle_key_event(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(matches!(app.mode, AppMode::Normal));
+        assert!(app.filename_input.is_empty());
     }
 }

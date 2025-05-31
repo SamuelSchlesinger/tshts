@@ -21,6 +21,10 @@ pub enum AppMode {
     SaveAs,
     /// Load dialog is open
     LoadFile,
+    /// CSV export dialog is open
+    ExportCsv,
+    /// CSV import dialog is open
+    ImportCsv,
 }
 
 /// Main application state containing the spreadsheet and UI state.
@@ -240,6 +244,111 @@ impl App {
         } else {
             self.filename_input.clone()
         }
+    }
+
+    /// Switches to CSV export mode to prompt for a filename.
+    ///
+    /// Initializes the filename input with a default CSV filename.
+    pub fn start_csv_export(&mut self) {
+        self.mode = AppMode::ExportCsv;
+        self.filename_input = self.filename
+            .as_ref()
+            .map(|f| f.replace(".tshts", ".csv"))
+            .unwrap_or_else(|| "spreadsheet.csv".to_string());
+        self.cursor_position = self.filename_input.len();
+        self.status_message = None;
+    }
+
+    /// Gets the filename to use for CSV export.
+    ///
+    /// Returns the filename input if not empty, otherwise returns a default CSV filename.
+    ///
+    /// # Returns
+    ///
+    /// The filename to use for CSV export
+    pub fn get_csv_export_filename(&self) -> String {
+        if self.filename_input.is_empty() {
+            "spreadsheet.csv".to_string()
+        } else {
+            self.filename_input.clone()
+        }
+    }
+
+    /// Processes the result of a CSV export operation.
+    ///
+    /// Sets appropriate status message based on whether the export was successful.
+    /// Returns to normal mode.
+    ///
+    /// # Arguments
+    ///
+    /// * `result` - Result of the CSV export operation (filename or error message)
+    pub fn set_csv_export_result(&mut self, result: Result<String, String>) {
+        match result {
+            Ok(filename) => {
+                self.status_message = Some(format!("Exported to {}", filename));
+            }
+            Err(error) => {
+                self.status_message = Some(format!("Export failed: {}", error));
+            }
+        }
+        
+        self.mode = AppMode::Normal;
+        self.filename_input.clear();
+        self.cursor_position = 0;
+    }
+
+    /// Switches to CSV import mode to prompt for a filename.
+    ///
+    /// Initializes the filename input with a default CSV filename.
+    pub fn start_csv_import(&mut self) {
+        self.mode = AppMode::ImportCsv;
+        self.filename_input = "data.csv".to_string();
+        self.cursor_position = self.filename_input.len();
+        self.status_message = None;
+    }
+
+    /// Gets the filename to use for CSV import.
+    ///
+    /// Returns the filename input if not empty, otherwise returns a default CSV filename.
+    ///
+    /// # Returns
+    ///
+    /// The filename to use for CSV import
+    pub fn get_csv_import_filename(&self) -> String {
+        if self.filename_input.is_empty() {
+            "data.csv".to_string()
+        } else {
+            self.filename_input.clone()
+        }
+    }
+
+    /// Processes the result of a CSV import operation.
+    ///
+    /// Updates the spreadsheet data and resets the view if successful.
+    /// Sets appropriate status message and returns to normal mode.
+    ///
+    /// # Arguments
+    ///
+    /// * `result` - Result of the CSV import operation (spreadsheet or error message)
+    pub fn set_csv_import_result(&mut self, result: Result<Spreadsheet, String>) {
+        match result {
+            Ok(spreadsheet) => {
+                self.spreadsheet = spreadsheet;
+                self.selected_row = 0;
+                self.selected_col = 0;
+                self.scroll_row = 0;
+                self.scroll_col = 0;
+                self.status_message = Some("CSV data imported successfully".to_string());
+                // Don't set filename since this is imported CSV data, not a saved spreadsheet
+            }
+            Err(error) => {
+                self.status_message = Some(format!("Import failed: {}", error));
+            }
+        }
+        
+        self.mode = AppMode::Normal;
+        self.filename_input.clear();
+        self.cursor_position = 0;
     }
 }
 
@@ -572,5 +681,84 @@ mod tests {
         // Starting load dialog clears status message
         app.start_load_file();
         assert!(app.status_message.is_none());
+    }
+
+    #[test]
+    fn test_csv_import_mode() {
+        let mut app = App::default();
+        
+        // Initially in normal mode
+        assert!(matches!(app.mode, AppMode::Normal));
+        assert!(app.filename_input.is_empty());
+        
+        // Start CSV import mode
+        app.start_csv_import();
+        
+        // Should be in ImportCsv mode with default filename
+        assert!(matches!(app.mode, AppMode::ImportCsv));
+        assert_eq!(app.filename_input, "data.csv");
+        assert_eq!(app.cursor_position, "data.csv".len());
+        assert!(app.status_message.is_none());
+        
+        // Test getting import filename
+        assert_eq!(app.get_csv_import_filename(), "data.csv");
+        
+        // Test with custom filename
+        app.filename_input = "custom.csv".to_string();
+        assert_eq!(app.get_csv_import_filename(), "custom.csv");
+        
+        // Test with empty filename
+        app.filename_input.clear();
+        assert_eq!(app.get_csv_import_filename(), "data.csv");
+        
+        // Test cancel
+        app.cancel_filename_input();
+        assert!(matches!(app.mode, AppMode::Normal));
+        assert!(app.filename_input.is_empty());
+        assert_eq!(app.cursor_position, 0);
+    }
+
+    #[test]
+    fn test_csv_import_result_handling() {
+        let mut app = App::default();
+        app.start_csv_import();
+        
+        // Set initial position away from origin
+        app.selected_row = 5;
+        app.selected_col = 3;
+        app.scroll_row = 2;
+        app.scroll_col = 1;
+        
+        // Test successful import
+        let mut new_sheet = Spreadsheet::default();
+        new_sheet.set_cell(0, 0, CellData {
+            value: "Imported".to_string(),
+            formula: None,
+        });
+        
+        app.set_csv_import_result(Ok(new_sheet));
+        
+        // Should return to normal mode with success message
+        assert!(matches!(app.mode, AppMode::Normal));
+        assert!(app.status_message.as_ref().unwrap().contains("imported successfully"));
+        assert!(app.filename_input.is_empty());
+        assert_eq!(app.cursor_position, 0);
+        
+        // Position should be reset to origin
+        assert_eq!(app.selected_row, 0);
+        assert_eq!(app.selected_col, 0);
+        assert_eq!(app.scroll_row, 0);
+        assert_eq!(app.scroll_col, 0);
+        
+        // Spreadsheet should be updated
+        let cell = app.spreadsheet.get_cell(0, 0);
+        assert_eq!(cell.value, "Imported");
+        
+        // Test failed import
+        app.start_csv_import();
+        app.set_csv_import_result(Err("File not found".to_string()));
+        
+        assert!(matches!(app.mode, AppMode::Normal));
+        assert!(app.status_message.as_ref().unwrap().contains("Import failed: File not found"));
     }
 }

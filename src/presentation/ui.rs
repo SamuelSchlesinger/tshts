@@ -108,13 +108,15 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
                 status.clone()
             } else {
                 let filename = app.filename.as_ref().map(|f| f.as_str()).unwrap_or("unsaved");
-                format!("File: {} | Ctrl+S: save | Ctrl+O: load | F1/?: help | q: quit", filename)
+                format!("File: {} | Ctrl+S: save | Ctrl+O: load | Ctrl+E: export CSV | Ctrl+L: import CSV | F1/?: help | q: quit", filename)
             }
         }
         AppMode::Editing => format!("Editing: {} (Enter to save, Esc to cancel)", app.input),
         AppMode::Help => "↑↓/jk: scroll | PgUp/PgDn: fast scroll | Home: top | Esc/q: close help".to_string(),
         AppMode::SaveAs => format!("Save as: {} (Enter to save, Esc to cancel)", app.filename_input),
         AppMode::LoadFile => format!("Load file: {} (Enter to load, Esc to cancel)", app.filename_input),
+        AppMode::ExportCsv => format!("Export CSV as: {} (Enter to export, Esc to cancel)", app.filename_input),
+        AppMode::ImportCsv => format!("Import CSV from: {} (Enter to import, Esc to cancel)", app.filename_input),
     };
 
     let input = Paragraph::new(input_text)
@@ -125,6 +127,8 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
             AppMode::Help => Style::default().fg(Color::Cyan),
             AppMode::SaveAs => Style::default().fg(Color::Yellow),
             AppMode::LoadFile => Style::default().fg(Color::Yellow),
+            AppMode::ExportCsv => Style::default().fg(Color::Magenta),
+            AppMode::ImportCsv => Style::default().fg(Color::Green),
         });
     f.render_widget(input, area);
 }
@@ -215,7 +219,11 @@ B2:D2           Row 2, columns B-D
 === FILE OPERATIONS ===
 Ctrl+S          Save spreadsheet to file
 Ctrl+O          Load spreadsheet from file
+Ctrl+E          Export spreadsheet to CSV file
+Ctrl+L          Import data from CSV file
                 Files are saved as "spreadsheet.tshts" in JSON format
+                CSV exports contain only cell values (not formulas)
+                CSV imports replace current spreadsheet data
 
 === NAVIGATION SHORTCUTS ===
 F1 or ?         Show this help (scroll with ↑↓, PgUp/PgDn, Home)
