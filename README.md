@@ -4,7 +4,6 @@ An efficient, lightweight terminal-based spreadsheet application built in Rust. 
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Rust](https://img.shields.io/badge/language-Rust-orange.svg)
-![Build](https://img.shields.io/badge/build-passing-green.svg)
 
 ## 🚀 Quick Start
 
