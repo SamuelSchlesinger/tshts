@@ -15,6 +15,7 @@ impl InputHandler {
             AppMode::LoadFile => Self::handle_filename_input_mode(app, key, "load"),
             AppMode::ExportCsv => Self::handle_filename_input_mode(app, key, "csv_export"),
             AppMode::ImportCsv => Self::handle_filename_input_mode(app, key, "csv_import"),
+            AppMode::Search => Self::handle_search_mode(app, key),
         }
     }
 
@@ -41,44 +42,105 @@ impl InputHandler {
                     app.start_csv_import();
                     return;
                 }
+                KeyCode::Char('z') => {
+                    app.undo();
+                    return;
+                }
+                KeyCode::Char('y') => {
+                    app.redo();
+                    return;
+                }
+                KeyCode::Char('d') => {
+                    app.autofill_selection();
+                    return;
+                }
                 _ => {}
             }
         }
         
-        app.status_message = None;
+        // Handle navigation with optional selection
+        let is_shift = modifiers.contains(KeyModifiers::SHIFT);
+        
+        // Clear status message if not doing something that should preserve it
+        if !matches!(key, KeyCode::Char('d')) || !modifiers.contains(KeyModifiers::CONTROL) {
+            app.status_message = None;
+        }
         
         match key {
             KeyCode::Up | KeyCode::Char('k') => {
+                if !is_shift {
+                    app.clear_selection();
+                }
+                
                 if app.selected_row > 0 {
+                    if is_shift && !app.selecting {
+                        app.start_selection();
+                    }
+                    
                     app.selected_row -= 1;
-                    if app.selected_row < app.scroll_row {
-                        app.scroll_row = app.selected_row;
+                    app.ensure_cursor_visible();
+                    
+                    if is_shift {
+                        app.update_selection(app.selected_row, app.selected_col);
                     }
                 }
             }
             KeyCode::Down | KeyCode::Char('j') => {
+                if !is_shift {
+                    app.clear_selection();
+                }
+                
                 if app.selected_row < app.spreadsheet.rows - 1 {
+                    if is_shift && !app.selecting {
+                        app.start_selection();
+                    }
+                    
                     app.selected_row += 1;
+                    app.ensure_cursor_visible();
+                    
+                    if is_shift {
+                        app.update_selection(app.selected_row, app.selected_col);
+                    }
                 }
             }
             KeyCode::Left | KeyCode::Char('h') => {
+                if !is_shift {
+                    app.clear_selection();
+                }
+                
                 if app.selected_col > 0 {
+                    if is_shift && !app.selecting {
+                        app.start_selection();
+                    }
+                    
                     app.selected_col -= 1;
-                    if app.selected_col < app.scroll_col {
-                        app.scroll_col = app.selected_col;
+                    app.ensure_cursor_visible();
+                    
+                    if is_shift {
+                        app.update_selection(app.selected_row, app.selected_col);
                     }
                 }
             }
             KeyCode::Right | KeyCode::Char('l') => {
+                if !is_shift {
+                    app.clear_selection();
+                }
+                
                 if app.selected_col < app.spreadsheet.cols - 1 {
+                    if is_shift && !app.selecting {
+                        app.start_selection();
+                    }
+                    
                     app.selected_col += 1;
+                    app.ensure_cursor_visible();
+                    
+                    if is_shift {
+                        app.update_selection(app.selected_row, app.selected_col);
+                    }
                 }
             }
             KeyCode::Enter | KeyCode::F(2) => {
                 app.start_editing();
-            }
-            KeyCode::Char('=') => {
-                app.spreadsheet.auto_resize_column(app.selected_col);
             }
             KeyCode::Char('+') => {
                 app.spreadsheet.auto_resize_all_columns();
@@ -97,8 +159,29 @@ impl InputHandler {
                 app.mode = AppMode::Help;
                 app.help_scroll = 0;
             }
+            KeyCode::Backspace => {
+                app.clear_cell_with_undo(app.selected_row, app.selected_col);
+            }
+            KeyCode::Char('/') => {
+                app.start_search();
+            }
+            KeyCode::Char('n') => {
+                // Next search result (only if we have previous search results)
+                if !app.search_results.is_empty() {
+                    app.next_search_result();
+                }
+            }
+            KeyCode::Char('N') => {
+                // Previous search result (only if we have previous search results)
+                if !app.search_results.is_empty() {
+                    app.previous_search_result();
+                }
+            }
             KeyCode::Char('q') => {
                 // Will be handled by main loop
+            }
+            KeyCode::Esc => {
+                app.clear_selection();
             }
             _ => {}
         }
@@ -233,6 +316,64 @@ impl InputHandler {
             KeyCode::Char(c) => {
                 app.filename_input.insert(app.cursor_position, c);
                 app.cursor_position += 1;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_search_mode(app: &mut App, key: KeyCode) {
+        match key {
+            KeyCode::Enter => {
+                app.perform_search();
+                app.finish_search();
+            }
+            KeyCode::Esc => {
+                app.cancel_search();
+            }
+            KeyCode::Backspace => {
+                if app.cursor_position > 0 {
+                    app.search_query.remove(app.cursor_position - 1);
+                    app.cursor_position -= 1;
+                    // Perform live search as user types
+                    app.perform_search();
+                }
+            }
+            KeyCode::Delete => {
+                if app.cursor_position < app.search_query.len() {
+                    app.search_query.remove(app.cursor_position);
+                    // Perform live search as user types
+                    app.perform_search();
+                }
+            }
+            KeyCode::Left => {
+                if app.cursor_position > 0 {
+                    app.cursor_position -= 1;
+                }
+            }
+            KeyCode::Right => {
+                if app.cursor_position < app.search_query.len() {
+                    app.cursor_position += 1;
+                }
+            }
+            KeyCode::Home => {
+                app.cursor_position = 0;
+            }
+            KeyCode::End => {
+                app.cursor_position = app.search_query.len();
+            }
+            KeyCode::Down | KeyCode::Char('n') => {
+                // Navigate to next search result while searching
+                app.next_search_result();
+            }
+            KeyCode::Up | KeyCode::Char('p') => {
+                // Navigate to previous search result while searching
+                app.previous_search_result();
+            }
+            KeyCode::Char(c) => {
+                app.search_query.insert(app.cursor_position, c);
+                app.cursor_position += 1;
+                // Perform live search as user types
+                app.perform_search();
             }
             _ => {}
         }

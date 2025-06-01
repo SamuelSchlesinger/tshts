@@ -134,17 +134,6 @@ impl Spreadsheet {
     /// * `data` - Cell data to store
     fn set_cell_internal(&mut self, row: usize, col: usize, data: CellData) {
         self.cells.insert((row, col), data.clone());
-        
-        let current_width = self.get_column_width(col);
-        let value_width = data.value.len();
-        let formula_width = data.formula.as_ref().map(|f| f.len()).unwrap_or(0);
-        let content_width = value_width.max(formula_width);
-        let header_width = Self::column_label(col).len();
-        let needed_width = content_width.max(header_width).max(3).min(50);
-        
-        if needed_width > current_width {
-            self.set_column_width(col, needed_width);
-        }
     }
 
     /// Sets the cell data at the specified coordinates.
@@ -223,6 +212,25 @@ impl Spreadsheet {
                 self.dependents.entry(dep).or_insert_with(HashSet::new).insert(cell_pos);
             }
         }
+    }
+
+    /// Clears the cell at the specified coordinates, removing both value and formula.
+    ///
+    /// This will also remove any dependencies and trigger recalculation of dependent cells.
+    ///
+    /// # Arguments
+    ///
+    /// * `row` - Zero-based row index
+    /// * `col` - Zero-based column index
+    pub fn clear_cell(&mut self, row: usize, col: usize) {
+        // Remove dependencies for this cell
+        self.remove_cell_dependencies(row, col);
+        
+        // Remove the cell from the cells map
+        self.cells.remove(&(row, col));
+        
+        // Recalculate cells that depend on this cell
+        self.recalculate_dependents(row, col);
     }
 
     /// Recalculates all cells that depend on the given cell.
@@ -605,7 +613,7 @@ mod tests {
     }
 
     #[test]
-    fn test_set_cell_adjusts_column_width() {
+    fn test_set_cell_no_auto_resize() {
         let mut sheet = Spreadsheet::default();
         let initial_width = sheet.get_column_width(0);
         
@@ -616,7 +624,7 @@ mod tests {
         sheet.set_cell(0, 0, long_cell);
         
         let new_width = sheet.get_column_width(0);
-        assert!(new_width > initial_width);
+        assert_eq!(new_width, initial_width); // No automatic resizing
     }
 
     #[test]
@@ -730,8 +738,9 @@ mod tests {
     }
 
     #[test]
-    fn test_formula_cell_with_auto_resize() {
+    fn test_formula_cell_no_auto_resize() {
         let mut sheet = Spreadsheet::default();
+        let initial_width = sheet.get_column_width(0);
         
         let formula_cell = CellData {
             value: "42".to_string(),
@@ -741,8 +750,8 @@ mod tests {
         sheet.set_cell(0, 0, formula_cell);
         let width = sheet.get_column_width(0);
         
-        // Width should account for both value and formula length
-        assert!(width >= "=SUM(A1:A10)".len());
+        // Width should remain unchanged (no automatic resizing)
+        assert_eq!(width, initial_width);
     }
 
     #[test]

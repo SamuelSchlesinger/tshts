@@ -1,9 +1,10 @@
 # TSHTS - Terminal Spreadsheet
 
-An efficient, lightweight terminal-based spreadsheet application built in Rust. TSHTS brings the power of spreadsheet calculations to your command line with an intuitive interface and essential formula support.
+An efficient, lightweight terminal-based spreadsheet application built in Rust. TSHTS brings the power of spreadsheet calculations to your command line with an intuitive interface, comprehensive formula support, and robust data management capabilities.
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Rust](https://img.shields.io/badge/language-Rust-orange.svg)
+![Edition](https://img.shields.io/badge/rust--edition-2024-orange.svg)
 
 ![TSHTS Screenshot](screenshot.png)
 
@@ -18,6 +19,10 @@ cd tshts
 
 # Build and run
 cargo run --release
+
+# Or build for installation
+cargo build --release
+# Binary will be available at target/release/tshts
 ```
 
 ### First Steps
@@ -25,8 +30,10 @@ cargo run --release
 1. **Navigate**: Use arrow keys or `hjkl` to move between cells
 2. **Edit**: Press `Enter` or `F2` to edit a cell
 3. **Formula**: Start with `=` for formulas (e.g., `=A1+B1`, `=SUM(A1:A10)`)
-4. **Save**: Press `Ctrl+S` to save your spreadsheet
-5. **Help**: Press `F1` or `?` for comprehensive help
+4. **Save**: Press `Ctrl+S` to save your spreadsheet as `.tshts` file
+5. **Export/Import**: Use `Ctrl+E` for CSV export, `Ctrl+I` for CSV import
+6. **Search**: Press `/` to search across all cells and formulas
+7. **Help**: Press `F1` or `?` for comprehensive help
 
 ## ✨ Key Features
 
@@ -42,43 +49,56 @@ cargo run --release
 - **Cell References**: Standard notation (A1, B2, AA123, etc.)
 - **Range Support**: Use ranges like `A1:C3` in functions
 - **Circular Reference Detection**: AST-based analysis prevents infinite loops
+- **Undo/Redo Support**: Full undo/redo functionality with `Ctrl+Z`/`Ctrl+Y`
+- **Cell Range Selection**: Select ranges with `Shift+Arrow` keys
+- **Autofill Functionality**: Copy formulas with relative references using `Ctrl+D`
 
 ### 📊 Smart Interface
 - **Auto-sizing Columns**: Columns automatically adjust to content width
-- **Manual Resize**: Use `=` to auto-resize current column, `+` for all columns
-- **Scrolling Viewport**: Navigate large spreadsheets smoothly
-- **Visual Selection**: Clear indication of current cell
-- **Status Messages**: Real-time feedback for operations
+- **Manual Resize**: Use `+` for all columns, `-`/`_` for individual column adjustment
+- **Scrolling Viewport**: Navigate large spreadsheets smoothly with automatic cursor tracking
+- **Visual Selection**: Clear indication of current cell with range selection support
+- **Status Messages**: Real-time feedback for operations and file status
+- **Search Highlighting**: Visual highlighting of search results with navigation
+- **Multiple View Modes**: Normal, editing, help, file operations, and search modes
 
 ### 💾 File Management
-- **JSON Format**: Human-readable `.tshts` files
-- **Save/Load**: `Ctrl+S` to save, `Ctrl+O` to load
-- **Error Handling**: Graceful handling of file operations
-- **Auto-backup**: Preserves data integrity
+- **Native Format**: Human-readable `.tshts` files in JSON format
+- **Save/Load**: `Ctrl+S` to save, `Ctrl+O` to load spreadsheet files
+- **CSV Support**: `Ctrl+E` to export CSV, `Ctrl+I`/`Ctrl+L` to import CSV
+- **Dependency Tracking**: Automatic rebuilding of formula dependencies on load
+- **Error Handling**: Graceful handling of file operations with clear error messages
+- **Data Integrity**: Preserves formulas, values, column widths, and sheet dimensions
 
-## 🎯 For Early Adopters
+## 🎯 Why Choose TSHTS?
 
-### Why Choose TSHTS?
+**Performance**: Built in Rust for excellent performance and memory efficiency. Handles large spreadsheets smoothly in terminal environments.
 
-**Performance**: Built in Rust for good performance and memory efficiency. Ideal for spreadsheet tasks in terminal environments.
+**Portability**: Cross-platform support (Linux, macOS, Windows) with no GUI dependencies. Perfect for servers, remote work, and headless environments.
 
-**Portability**: Runs anywhere Rust runs - Linux, macOS, Windows. No GUI dependencies, perfect for servers and remote work.
+**Developer-Friendly**: Clean architecture following domain-driven design principles. Comprehensive documentation, extensive test coverage, and modular structure make it easy to extend.
 
-**Developer-Friendly**: Clean architecture with comprehensive documentation and tests. Easy to extend and customize.
+**Modern Workflow**: Git-friendly JSON format, command-line integration, and automation support. Works seamlessly with CI/CD pipelines and version control.
 
-**Modern Workflow**: Integrates seamlessly with version control, automation scripts, and command-line workflows.
+**Rich Feature Set**: Advanced formula engine with web functions (`GET`), string manipulation, logical operations, and mathematical functions. Real-time search, undo/redo, and smart autofill capabilities.
 
 ### Current Capabilities
 
-TSHTS already supports the core functionality needed for most spreadsheet tasks:
+TSHTS provides a comprehensive spreadsheet experience with:
 
-- ✅ Multi-type formula evaluation (numbers and strings) with 25+ operators and functions
-- ✅ String manipulation and text processing capabilities
-- ✅ Cell references and range operations
-- ✅ File persistence with JSON format
-- ✅ Responsive terminal UI with keyboard shortcuts
-- ✅ Comprehensive error handling and user feedback
-- ✅ Auto-sizing and manual column width adjustment
+- ✅ **Formula Engine**: Multi-type evaluation (numbers and strings) with 30+ operators and functions
+- ✅ **Data Types**: Full support for strings, numbers, formulas, and mixed-type operations
+- ✅ **Web Integration**: `GET` function for fetching data from URLs and APIs
+- ✅ **String Processing**: Comprehensive text manipulation with `UPPER`, `LOWER`, `TRIM`, `FIND`, `MID`, etc.
+- ✅ **Mathematical Functions**: `SUM`, `AVERAGE`, `MIN`, `MAX`, `ABS`, `SQRT`, `ROUND`, and more
+- ✅ **Logical Operations**: `IF`, `AND`, `OR`, `NOT` with full boolean logic support
+- ✅ **Range Operations**: Support for cell ranges (`A1:C3`) in all applicable functions
+- ✅ **File Operations**: Native `.tshts` format and CSV import/export
+- ✅ **Smart UI**: Responsive terminal interface with multiple interaction modes
+- ✅ **Search System**: Full-text search across cell values and formulas
+- ✅ **Undo/Redo**: Complete action history with unlimited undo levels
+- ✅ **Selection Tools**: Range selection and autofill with relative reference adjustment
+- ✅ **Error Handling**: Circular reference detection and comprehensive error reporting
 
 ### Roadmap & Contributing
 
@@ -90,7 +110,7 @@ We're actively developing TSHTS with these upcoming features:
 - 📅 **Collaboration**: Real-time sharing capabilities
 - 📅 **Plugins**: Extension system for custom functionality
 
-**Want to contribute?** Check our [issues](https://github.com/yourusername/tshts/issues) for good first contributions. We welcome:
+**Want to contribute?** Check our [issues](https://github.com/SamuelSchlesinger/tshts/issues) for good first contributions. We welcome:
 - Bug reports and feature requests
 - Documentation improvements
 - Performance optimizations
@@ -286,28 +306,34 @@ TSHTS saves files in a clean JSON format that's both human-readable and version-
 
 ## 🏗️ Architecture
 
-TSHTS follows clean architecture principles:
+TSHTS follows clean architecture and domain-driven design principles:
 
 ```
 src/
-├── domain/          # Core business logic
+├── domain/          # Core business logic (no external dependencies)
 │   ├── models.rs    # Data structures (Spreadsheet, CellData)
-│   └── services.rs  # Formula evaluation engine
-├── application/     # Application state management
-│   └── state.rs     # App state and mode handling
-├── infrastructure/ # External integrations
-│   └── persistence.rs # File I/O operations
-├── presentation/   # User interface
-│   ├── ui.rs       # Terminal rendering
-│   └── input.rs    # Keyboard input handling
-└── main.rs         # Application entry point
+│   ├── services.rs  # Formula evaluation engine and CSV operations
+│   └── parser.rs    # Expression parser with formal BNF grammar
+├── application/     # Application orchestration
+│   └── state.rs     # App state, modes, and business workflows
+├── infrastructure/  # External integrations
+│   └── persistence.rs # File I/O operations and serialization
+├── presentation/    # User interface layer
+│   ├── ui.rs        # Terminal rendering with ratatui
+│   └── input.rs     # Keyboard input handling and event processing
+├── lib.rs           # Library interface
+└── main.rs          # Application entry point
 ```
 
-This modular design makes TSHTS:
-- **Testable**: Each layer can be tested independently
-- **Maintainable**: Clear separation of concerns
-- **Extensible**: Easy to add new features
-- **Portable**: Domain logic independent of UI framework
+### Design Benefits
+
+This modular architecture provides:
+- **Testable**: Each layer has comprehensive unit and integration tests
+- **Maintainable**: Clear separation of concerns with well-defined interfaces
+- **Extensible**: Easy to add new functions, operators, and features
+- **Portable**: Domain logic is UI-framework independent
+- **Type-Safe**: Leverages Rust's type system for reliability
+- **Documentation**: Extensive rustdoc comments throughout the codebase
 
 ## 🧪 Testing
 
@@ -333,18 +359,20 @@ Test categories:
 
 ## 📋 System Requirements
 
-- **Operating System**: Linux, macOS, Windows
-- **Terminal**: Any terminal with basic cursor support
-- **Rust**: 1.70+ (for building from source)
-- **Memory**: Small memory footprint
-- **Storage**: Minimal (files are compressed JSON)
+- **Operating System**: Linux, macOS, Windows (anywhere Rust runs)
+- **Terminal**: Any terminal with ANSI color and cursor support
+- **Rust**: 1.70+ with 2024 edition support (for building from source)
+- **Memory**: Minimal footprint (~10MB typical usage)
+- **Storage**: Lightweight JSON files (typically <1MB for large sheets)
+- **Dependencies**: Pure Rust implementation with minimal external dependencies
 
 ## 🤝 Getting Help
 
-- **In-App Help**: Press `F1` or `?` for comprehensive help
-- **Issues**: [GitHub Issues](https://github.com/yourusername/tshts/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/yourusername/tshts/discussions)
-- **Documentation**: This README and inline code documentation
+- **In-App Help**: Press `F1` or `?` for comprehensive help with scrollable documentation
+- **Issues**: [GitHub Issues](https://github.com/SamuelSchlesinger/tshts/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/SamuelSchlesinger/tshts/discussions)
+- **Documentation**: This README and extensive rustdoc documentation (`cargo doc --open`)
+- **Examples**: Sample `.tshts` files and formula examples in the repository
 
 ## 📜 License
 

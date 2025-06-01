@@ -294,6 +294,168 @@ impl<'a> FormulaEvaluator<'a> {
         references
     }
 
+    /// Adjusts formula with relative references when copying to a new position.
+    ///
+    /// This method takes a formula and adjusts all cell references to maintain
+    /// their relative positions when the formula is moved to a new location.
+    ///
+    /// # Arguments
+    ///
+    /// * `formula` - Original formula string (should start with '=')
+    /// * `row_offset` - Row offset (positive = down, negative = up)
+    /// * `col_offset` - Column offset (positive = right, negative = left)
+    ///
+    /// # Returns
+    ///
+    /// Adjusted formula string with updated cell references
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tshts::domain::{Spreadsheet, FormulaEvaluator};
+    ///
+    /// let sheet = Spreadsheet::default();
+    /// let evaluator = FormulaEvaluator::new(&sheet);
+    /// 
+    /// // Moving formula =SUM(B4:B6) one column to the right
+    /// let adjusted = evaluator.adjust_formula_references("=SUM(B4:B6)", 0, 1);
+    /// assert_eq!(adjusted, "=SUM(C4:C6)");
+    /// 
+    /// // Moving formula =A1+B1 one row down
+    /// let adjusted = evaluator.adjust_formula_references("=A1+B1", 1, 0);
+    /// assert_eq!(adjusted, "=A2+B2");
+    /// ```
+    pub fn adjust_formula_references(&self, formula: &str, row_offset: i32, col_offset: i32) -> String {
+        if !formula.starts_with('=') {
+            return formula.to_string();
+        }
+        
+        let expr = &formula[1..];
+        match Parser::new(expr) {
+            Ok(mut parser) => {
+                match parser.parse() {
+                    Ok(ast) => {
+                        let adjusted_ast = self.adjust_ast_references(&ast, row_offset, col_offset);
+                        format!("={}", self.ast_to_string(&adjusted_ast))
+                    }
+                    Err(_) => formula.to_string(),
+                }
+            }
+            Err(_) => formula.to_string(),
+        }
+    }
+
+    /// Adjusts cell references in an AST with the given offsets.
+    fn adjust_ast_references(&self, expr: &Expr, row_offset: i32, col_offset: i32) -> Expr {
+        match expr {
+            Expr::String(s) => Expr::String(s.clone()),
+            Expr::CellRef(cell_ref) => {
+                if let Some((row, col)) = Spreadsheet::parse_cell_reference(cell_ref) {
+                    let new_row = (row as i32 + row_offset).max(0) as usize;
+                    let new_col = (col as i32 + col_offset).max(0) as usize;
+                    let new_ref = format!("{}{}", Spreadsheet::column_label(new_col), new_row + 1);
+                    Expr::CellRef(new_ref)
+                } else {
+                    expr.clone()
+                }
+            }
+            Expr::Range(start_ref, end_ref) => {
+                let new_start = if let Some((row, col)) = Spreadsheet::parse_cell_reference(start_ref) {
+                    let new_row = (row as i32 + row_offset).max(0) as usize;
+                    let new_col = (col as i32 + col_offset).max(0) as usize;
+                    format!("{}{}", Spreadsheet::column_label(new_col), new_row + 1)
+                } else {
+                    start_ref.clone()
+                };
+                let new_end = if let Some((row, col)) = Spreadsheet::parse_cell_reference(end_ref) {
+                    let new_row = (row as i32 + row_offset).max(0) as usize;
+                    let new_col = (col as i32 + col_offset).max(0) as usize;
+                    format!("{}{}", Spreadsheet::column_label(new_col), new_row + 1)
+                } else {
+                    end_ref.clone()
+                };
+                Expr::Range(new_start, new_end)
+            }
+            Expr::Binary { left, operator, right } => {
+                Expr::Binary {
+                    left: Box::new(self.adjust_ast_references(left, row_offset, col_offset)),
+                    operator: operator.clone(),
+                    right: Box::new(self.adjust_ast_references(right, row_offset, col_offset)),
+                }
+            }
+            Expr::Unary { operator, operand } => {
+                Expr::Unary {
+                    operator: operator.clone(),
+                    operand: Box::new(self.adjust_ast_references(operand, row_offset, col_offset)),
+                }
+            }
+            Expr::FunctionCall { name, args } => {
+                let adjusted_args: Vec<Expr> = args.iter()
+                    .map(|arg| self.adjust_ast_references(arg, row_offset, col_offset))
+                    .collect();
+                Expr::FunctionCall {
+                    name: name.clone(),
+                    args: adjusted_args,
+                }
+            }
+            Expr::Number(n) => Expr::Number(*n),
+        }
+    }
+
+    /// Converts an AST back to a formula string.
+    fn ast_to_string(&self, expr: &Expr) -> String {
+        match expr {
+            Expr::String(s) => format!("\"{}\"", s.replace("\"", "\"\"")),
+            Expr::CellRef(cell_ref) => cell_ref.clone(),
+            Expr::Range(start_ref, end_ref) => format!("{}:{}", start_ref, end_ref),
+            Expr::Binary { left, operator, right } => {
+                format!("{}{}{}",
+                    self.ast_to_string(left),
+                    self.binary_op_to_string(operator),
+                    self.ast_to_string(right))
+            }
+            Expr::Unary { operator, operand } => {
+                format!("{}{}", self.unary_op_to_string(operator), self.ast_to_string(operand))
+            }
+            Expr::FunctionCall { name, args } => {
+                let arg_strs: Vec<String> = args.iter()
+                    .map(|arg| self.ast_to_string(arg))
+                    .collect();
+                format!("{}({})", name, arg_strs.join(","))
+            }
+            Expr::Number(n) => n.to_string(),
+        }
+    }
+
+    /// Converts a binary operator enum back to a string.
+    fn binary_op_to_string(&self, op: &super::parser::BinaryOp) -> &'static str {
+        use super::parser::BinaryOp;
+        match op {
+            BinaryOp::Add => "+",
+            BinaryOp::Subtract => "-",
+            BinaryOp::Multiply => "*",
+            BinaryOp::Divide => "/",
+            BinaryOp::Power => "**",
+            BinaryOp::Modulo => "%",
+            BinaryOp::Equal => "=",
+            BinaryOp::NotEqual => "<>",
+            BinaryOp::Less => "<",
+            BinaryOp::LessEqual => "<=",
+            BinaryOp::Greater => ">",
+            BinaryOp::GreaterEqual => ">=",
+            BinaryOp::Concatenate => "&",
+        }
+    }
+
+    /// Converts a unary operator enum back to a string.
+    fn unary_op_to_string(&self, op: &super::parser::UnaryOp) -> &'static str {
+        use super::parser::UnaryOp;
+        match op {
+            UnaryOp::Minus => "-",
+            UnaryOp::Plus => "+",
+        }
+    }
+
 }
 
 /// CSV export service for converting spreadsheets to CSV format.
@@ -1377,5 +1539,87 @@ Break""#).expect("Failed to write to temp file");
         assert!(imported.get_cell(1, 1).formula.is_none());
         assert!(imported.get_cell(2, 0).formula.is_none());
         assert!(imported.get_cell(2, 1).formula.is_none());
+    }
+
+    #[test]
+    fn test_adjust_formula_references_horizontal() {
+        let sheet = Spreadsheet::default();
+        let evaluator = FormulaEvaluator::new(&sheet);
+        
+        // Test moving formula one column to the right
+        let adjusted = evaluator.adjust_formula_references("=A1+B1", 0, 1);
+        assert_eq!(adjusted, "=B1+C1");
+        
+        // Test moving formula two columns to the right
+        let adjusted = evaluator.adjust_formula_references("=SUM(A1:B3)", 0, 2);
+        assert_eq!(adjusted, "=SUM(C1:D3)");
+        
+        // Test moving formula with multiple references
+        let adjusted = evaluator.adjust_formula_references("=A1*B2+C3", 0, 1);
+        assert_eq!(adjusted, "=B1*C2+D3");
+    }
+
+    #[test]
+    fn test_adjust_formula_references_vertical() {
+        let sheet = Spreadsheet::default();
+        let evaluator = FormulaEvaluator::new(&sheet);
+        
+        // Test moving formula one row down
+        let adjusted = evaluator.adjust_formula_references("=A1+A2", 1, 0);
+        assert_eq!(adjusted, "=A2+A3");
+        
+        // Test moving formula two rows down with range
+        let adjusted = evaluator.adjust_formula_references("=SUM(A1:C1)", 2, 0);
+        assert_eq!(adjusted, "=SUM(A3:C3)");
+        
+        // Test moving formula with mixed references
+        let adjusted = evaluator.adjust_formula_references("=A1*B2+SUM(C3:D4)", 1, 0);
+        assert_eq!(adjusted, "=A2*B3+SUM(C4:D5)");
+    }
+
+    #[test]
+    fn test_adjust_formula_references_diagonal() {
+        let sheet = Spreadsheet::default();
+        let evaluator = FormulaEvaluator::new(&sheet);
+        
+        // Test moving formula diagonally (down and right)
+        let adjusted = evaluator.adjust_formula_references("=A1+B2", 1, 1);
+        assert_eq!(adjusted, "=B2+C3");
+        
+        // Test range adjustment diagonally
+        let adjusted = evaluator.adjust_formula_references("=SUM(A1:B2)", 2, 3);
+        assert_eq!(adjusted, "=SUM(D3:E4)");
+    }
+
+    #[test]
+    fn test_adjust_formula_references_complex() {
+        let sheet = Spreadsheet::default();
+        let evaluator = FormulaEvaluator::new(&sheet);
+        
+        // Test complex formula with multiple functions and references
+        let adjusted = evaluator.adjust_formula_references("=IF(A1>B1,SUM(C1:C3),AVERAGE(D1:E2))", 1, 1);
+        assert_eq!(adjusted, "=IF(B2>C2,SUM(D2:D4),AVERAGE(E2:F3))");
+        
+        // Test formula with string literals (should not be affected)
+        let adjusted = evaluator.adjust_formula_references("=CONCAT(A1,\"test\",B1)", 0, 1);
+        assert_eq!(adjusted, "=CONCAT(B1,\"test\",C1)");
+    }
+
+    #[test]
+    fn test_adjust_formula_references_edge_cases() {
+        let sheet = Spreadsheet::default();
+        let evaluator = FormulaEvaluator::new(&sheet);
+        
+        // Test non-formula (should return unchanged)
+        let adjusted = evaluator.adjust_formula_references("Hello World", 1, 1);
+        assert_eq!(adjusted, "Hello World");
+        
+        // Test formula with no cell references
+        let adjusted = evaluator.adjust_formula_references("=5+10", 1, 1);
+        assert_eq!(adjusted, "=5+10");
+        
+        // Test negative offsets (moving up/left) - should not go below A1
+        let adjusted = evaluator.adjust_formula_references("=A1+B1", -1, -1);
+        assert_eq!(adjusted, "=A1+A1");
     }
 }

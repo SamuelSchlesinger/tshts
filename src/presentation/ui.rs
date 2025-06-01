@@ -7,7 +7,7 @@ use ratatui::{
     Frame,
 };
 
-pub fn render_ui(f: &mut Frame, app: &App) {
+pub fn render_ui(f: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -36,7 +36,7 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(header, area);
 }
 
-fn render_spreadsheet(f: &mut Frame, app: &App, area: Rect) {
+fn render_spreadsheet(f: &mut Frame, app: &mut App, area: Rect) {
     let visible_rows = area.height as usize - 1;
     
     let mut total_width = 4;
@@ -51,6 +51,9 @@ fn render_spreadsheet(f: &mut Frame, app: &App, area: Rect) {
         total_width += col_width + 1;
         visible_cols += 1;
     }
+    
+    // Update viewport size for scrolling calculations
+    app.update_viewport_size(visible_rows, visible_cols);
     
     let mut headers = vec![Cell::from("")];
     for col in app.scroll_col..app.scroll_col + visible_cols {
@@ -79,7 +82,21 @@ fn render_spreadsheet(f: &mut Frame, app: &App, area: Rect) {
             let cell_value = if cell_data.value.is_empty() { " ".to_string() } else { cell_data.value };
             
             let style = if row == app.selected_row && col == app.selected_col {
+                // Current cursor cell (highest priority)
                 Style::default().bg(Color::Blue).fg(Color::White)
+            } else if app.is_cell_selected(row, col) {
+                // Selected range cells
+                Style::default().bg(Color::LightBlue).fg(Color::Black)
+            } else if app.search_results.contains(&(row, col)) {
+                // Highlight search result cells
+                if matches!(app.mode, AppMode::Search) && 
+                   app.search_results.get(app.search_result_index) == Some(&(row, col)) {
+                    // Current search result (more prominent highlight)
+                    Style::default().bg(Color::Yellow).fg(Color::Black)
+                } else {
+                    // Other search results (subtle highlight)
+                    Style::default().bg(Color::DarkGray).fg(Color::White)
+                }
             } else {
                 Style::default()
             };
@@ -108,7 +125,18 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
                 status.clone()
             } else {
                 let filename = app.filename.as_ref().map(|f| f.as_str()).unwrap_or("unsaved");
-                format!("File: {} | Ctrl+S: save | Ctrl+O: load | Ctrl+E: export CSV | Ctrl+L: import CSV | F1/?: help | q: quit", filename)
+                let selection_info = if let Some(((start_row, start_col), (end_row, end_col))) = app.get_selection_range() {
+                    if start_row == end_row && start_col == end_col {
+                        String::new()
+                    } else {
+                        let rows = end_row - start_row + 1;
+                        let cols = end_col - start_col + 1;
+                        format!(" | Selection: {}x{} cells", rows, cols)
+                    }
+                } else {
+                    String::new()
+                };
+                format!("File: {}{} | Shift+arrows: select | Ctrl+D: autofill | Ctrl+S: save | Ctrl+O: load | F1/?: help | q: quit", filename, selection_info)
             }
         }
         AppMode::Editing => format!("Editing: {} (Enter to save, Esc to cancel)", app.input),
@@ -117,6 +145,18 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
         AppMode::LoadFile => format!("Load file: {} (Enter to load, Esc to cancel)", app.filename_input),
         AppMode::ExportCsv => format!("Export CSV as: {} (Enter to export, Esc to cancel)", app.filename_input),
         AppMode::ImportCsv => format!("Import CSV from: {} (Enter to import, Esc to cancel)", app.filename_input),
+        AppMode::Search => {
+            let results_info = if app.search_results.is_empty() {
+                if app.search_query.is_empty() {
+                    "".to_string()
+                } else {
+                    " (no results)".to_string()
+                }
+            } else {
+                format!(" ({}/{} results)", app.search_result_index + 1, app.search_results.len())
+            };
+            format!("Search: {}{} (Enter to finish, Esc to cancel, ↑↓/np: navigate)", app.search_query, results_info)
+        }
     };
 
     let input = Paragraph::new(input_text)
@@ -129,6 +169,7 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
             AppMode::LoadFile => Style::default().fg(Color::Yellow),
             AppMode::ExportCsv => Style::default().fg(Color::Magenta),
             AppMode::ImportCsv => Style::default().fg(Color::Green),
+            AppMode::Search => Style::default().fg(Color::LightYellow),
         });
     f.render_widget(input, area);
 }
@@ -268,6 +309,15 @@ Mixed Type Examples:
 =IF(AVERAGE(A1:A10)>50,"PASS","FAIL") Grade based on average
 =CONCAT("Row ",ROW()," Value: ",A1)    Dynamic labels
 
+=== SEARCH FUNCTIONALITY ===
+/               Start text search across all cells
+                Search is case-insensitive and searches both cell values and formulas
+                Live search: results update as you type
+                ↑↓ or n/p   Navigate through search results while searching
+                Enter       Finish search and return to normal mode
+                Esc         Cancel search and return to normal mode
+                n/N         Navigate search results in normal mode (after search)
+
 === FILE OPERATIONS ===
 Ctrl+S          Save spreadsheet to file
 Ctrl+O          Load spreadsheet from file
@@ -279,12 +329,27 @@ Ctrl+L          Import data from CSV file
 
 === NAVIGATION SHORTCUTS ===
 F1 or ?         Show this help (scroll with ↑↓, PgUp/PgDn, Home)
-Enter/F2        Edit selected cell
+Enter/F2        Edit selected cell (moves down after editing)
 Arrow keys      Navigate cells (hjkl also work)
-= key           Auto-resize column to fit content
+Shift+arrows    Select range of cells (hold Shift while navigating)
+Backspace       Delete cell contents
 + key           Auto-resize all columns to fit content
 - / _ keys      Manually shrink/grow column width
+Ctrl+Z          Undo last action
+Ctrl+Y          Redo last undone action
+/               Start text search
+n               Next search result
+N (Shift+n)     Previous search result
+Esc             Clear selection
 q               Quit application
+
+=== SELECTION AND AUTOFILL ===
+Shift+arrows    Select a range of cells by holding Shift and using arrow keys
+Ctrl+D          Autofill: Copy formula from top-left cell of selection to all
+                selected cells, automatically adjusting cell references
+                Example: =SUM(B4:B6) becomes =SUM(C4:C6), =SUM(D4:D6), etc.
+                when dragged right, or =SUM(B5:B7), =SUM(B6:B8), etc. when
+                dragged down. Works with any formula containing cell references.
 
 === HELP NAVIGATION ===
 ↑↓ or j/k       Scroll help text up/down one line

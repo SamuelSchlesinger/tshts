@@ -4,6 +4,7 @@
 //! for the terminal user interface.
 
 use crate::domain::{Spreadsheet, CellData, FormulaEvaluator};
+use std::collections::VecDeque;
 
 /// Represents the current mode of the application.
 ///
@@ -25,6 +26,20 @@ pub enum AppMode {
     ExportCsv,
     /// CSV import dialog is open
     ImportCsv,
+    /// Search mode - user is typing a search query
+    Search,
+}
+
+/// Represents an action that can be undone/redone.
+#[derive(Debug, Clone)]
+pub enum UndoAction {
+    /// Cell was modified (row, col, old_value, new_value)
+    CellModified {
+        row: usize,
+        col: usize,
+        old_cell: Option<CellData>,
+        new_cell: Option<CellData>,
+    },
 }
 
 /// Main application state containing the spreadsheet and UI state.
@@ -67,6 +82,26 @@ pub struct App {
     pub status_message: Option<String>,
     /// Input buffer for filename entry
     pub filename_input: String,
+    /// Undo stack for tracking changes
+    pub undo_stack: VecDeque<UndoAction>,
+    /// Redo stack for tracking undone changes
+    pub redo_stack: VecDeque<UndoAction>,
+    /// Search query input buffer
+    pub search_query: String,
+    /// Search results as (row, col) coordinates
+    pub search_results: Vec<(usize, usize)>,
+    /// Current search result index
+    pub search_result_index: usize,
+    /// Selection start position (row, col)
+    pub selection_start: Option<(usize, usize)>,
+    /// Selection end position (row, col) 
+    pub selection_end: Option<(usize, usize)>,
+    /// Whether we're in drag selection mode
+    pub selecting: bool,
+    /// Viewport height in rows (for scrolling calculations)
+    pub viewport_rows: usize,
+    /// Viewport width in columns (for scrolling calculations) 
+    pub viewport_cols: usize,
 }
 
 impl Default for App {
@@ -84,6 +119,16 @@ impl Default for App {
             help_scroll: 0,
             status_message: None,
             filename_input: String::new(),
+            undo_stack: VecDeque::new(),
+            redo_stack: VecDeque::new(),
+            search_query: String::new(),
+            search_results: Vec::new(),
+            search_result_index: 0,
+            selection_start: None,
+            selection_end: None,
+            selecting: false,
+            viewport_rows: 20,  // Default reasonable size
+            viewport_cols: 8,   // Default reasonable size
         }
     }
 }
@@ -119,7 +164,13 @@ impl App {
             cell_data.value = self.input.clone();
         }
 
-        self.spreadsheet.set_cell(self.selected_row, self.selected_col, cell_data);
+        self.set_cell_with_undo(self.selected_row, self.selected_col, cell_data);
+        
+        // Move down one cell after editing
+        if self.selected_row < self.spreadsheet.rows - 1 {
+            self.selected_row += 1;
+        }
+        
         self.mode = AppMode::Normal;
         self.input.clear();
         self.cursor_position = 0;
@@ -350,6 +401,367 @@ impl App {
         self.filename_input.clear();
         self.cursor_position = 0;
     }
+
+    /// Records an action for undo/redo functionality.
+    ///
+    /// Adds the action to the undo stack and clears the redo stack.
+    /// Limits the undo stack to 100 actions.
+    fn record_action(&mut self, action: UndoAction) {
+        const MAX_UNDO_STACK_SIZE: usize = 100;
+        
+        // Add to undo stack
+        self.undo_stack.push_back(action);
+        
+        // Limit stack size
+        if self.undo_stack.len() > MAX_UNDO_STACK_SIZE {
+            self.undo_stack.pop_front();
+        }
+        
+        // Clear redo stack since we made a new change
+        self.redo_stack.clear();
+    }
+
+    /// Performs an undo operation.
+    ///
+    /// Reverts the last action and moves it to the redo stack.
+    pub fn undo(&mut self) {
+        if let Some(action) = self.undo_stack.pop_back() {
+            match action.clone() {
+                UndoAction::CellModified { row, col, old_cell, new_cell: _ } => {
+                    // Apply the old cell value
+                    if let Some(old_data) = old_cell {
+                        self.spreadsheet.set_cell(row, col, old_data);
+                    } else {
+                        self.spreadsheet.clear_cell(row, col);
+                    }
+                }
+            }
+            
+            // Add to redo stack
+            self.redo_stack.push_back(action);
+        }
+    }
+
+    /// Performs a redo operation.
+    ///
+    /// Reapplies the last undone action and moves it back to the undo stack.
+    pub fn redo(&mut self) {
+        if let Some(action) = self.redo_stack.pop_back() {
+            match action.clone() {
+                UndoAction::CellModified { row, col, old_cell: _, new_cell } => {
+                    // Apply the new cell value
+                    if let Some(new_data) = new_cell {
+                        self.spreadsheet.set_cell(row, col, new_data);
+                    } else {
+                        self.spreadsheet.clear_cell(row, col);
+                    }
+                }
+            }
+            
+            // Add back to undo stack
+            self.undo_stack.push_back(action);
+        }
+    }
+
+    /// Sets a cell value and records the action for undo/redo.
+    ///
+    /// This is a wrapper around the spreadsheet's set_cell method that also
+    /// tracks the change for undo functionality.
+    pub fn set_cell_with_undo(&mut self, row: usize, col: usize, new_data: CellData) {
+        // Get the old cell data
+        let old_cell = if self.spreadsheet.cells.contains_key(&(row, col)) {
+            Some(self.spreadsheet.get_cell(row, col))
+        } else {
+            None
+        };
+        
+        // Record the action
+        let action = UndoAction::CellModified {
+            row,
+            col,
+            old_cell,
+            new_cell: Some(new_data.clone()),
+        };
+        self.record_action(action);
+        
+        // Apply the change
+        self.spreadsheet.set_cell(row, col, new_data);
+    }
+
+    /// Clears a cell and records the action for undo/redo.
+    ///
+    /// This is a wrapper around the spreadsheet's clear_cell method that also
+    /// tracks the change for undo functionality.
+    pub fn clear_cell_with_undo(&mut self, row: usize, col: usize) {
+        // Get the old cell data
+        let old_cell = if self.spreadsheet.cells.contains_key(&(row, col)) {
+            Some(self.spreadsheet.get_cell(row, col))
+        } else {
+            None
+        };
+        
+        // Only record if there was actually a cell to clear
+        if old_cell.is_some() {
+            let action = UndoAction::CellModified {
+                row,
+                col,
+                old_cell,
+                new_cell: None,
+            };
+            self.record_action(action);
+        }
+        
+        // Apply the change
+        self.spreadsheet.clear_cell(row, col);
+    }
+
+    /// Starts search mode and initializes search state.
+    pub fn start_search(&mut self) {
+        self.mode = AppMode::Search;
+        self.search_query.clear();
+        self.search_results.clear();
+        self.search_result_index = 0;
+        self.cursor_position = 0;
+        self.status_message = None;
+    }
+
+    /// Cancels search mode and returns to normal mode.
+    pub fn cancel_search(&mut self) {
+        self.mode = AppMode::Normal;
+        self.search_query.clear();
+        self.search_results.clear();
+        self.search_result_index = 0;
+        self.cursor_position = 0;
+    }
+
+    /// Performs a search across all cells and updates search results.
+    pub fn perform_search(&mut self) {
+        self.search_results.clear();
+        self.search_result_index = 0;
+
+        if self.search_query.is_empty() {
+            return;
+        }
+
+        let query_lower = self.search_query.to_lowercase();
+
+        // Search through all cells
+        for row in 0..self.spreadsheet.rows {
+            for col in 0..self.spreadsheet.cols {
+                let cell = self.spreadsheet.get_cell(row, col);
+                
+                // Search in both value and formula (if present)
+                let value_matches = cell.value.to_lowercase().contains(&query_lower);
+                let formula_matches = cell.formula
+                    .as_ref()
+                    .map(|f| f.to_lowercase().contains(&query_lower))
+                    .unwrap_or(false);
+
+                if value_matches || formula_matches {
+                    self.search_results.push((row, col));
+                }
+            }
+        }
+
+        // Move to first result if any found
+        if !self.search_results.is_empty() {
+            self.go_to_current_search_result();
+        }
+    }
+
+    /// Moves to the next search result.
+    pub fn next_search_result(&mut self) {
+        if !self.search_results.is_empty() {
+            self.search_result_index = (self.search_result_index + 1) % self.search_results.len();
+            self.go_to_current_search_result();
+        }
+    }
+
+    /// Moves to the previous search result.
+    pub fn previous_search_result(&mut self) {
+        if !self.search_results.is_empty() {
+            if self.search_result_index == 0 {
+                self.search_result_index = self.search_results.len() - 1;
+            } else {
+                self.search_result_index -= 1;
+            }
+            self.go_to_current_search_result();
+        }
+    }
+
+    /// Moves the cursor to the current search result.
+    fn go_to_current_search_result(&mut self) {
+        if let Some(&(row, col)) = self.search_results.get(self.search_result_index) {
+            self.selected_row = row;
+            self.selected_col = col;
+            self.ensure_cursor_visible();
+        }
+    }
+
+    /// Finishes search and returns to normal mode while keeping the current selection.
+    pub fn finish_search(&mut self) {
+        self.mode = AppMode::Normal;
+        
+        let num_results = self.search_results.len();
+        if num_results > 0 {
+            self.status_message = Some(format!(
+                "Search completed: {} result{} found for '{}'", 
+                num_results,
+                if num_results == 1 { "" } else { "s" },
+                self.search_query
+            ));
+        } else {
+            self.status_message = Some(format!("No results found for '{}'", self.search_query));
+        }
+        
+        self.search_query.clear();
+        self.search_results.clear();
+        self.search_result_index = 0;
+        self.cursor_position = 0;
+    }
+
+    /// Starts selection at the current position
+    pub fn start_selection(&mut self) {
+        self.selection_start = Some((self.selected_row, self.selected_col));
+        self.selection_end = Some((self.selected_row, self.selected_col));
+        self.selecting = true;
+    }
+
+    /// Updates the selection end position
+    pub fn update_selection(&mut self, row: usize, col: usize) {
+        if self.selecting {
+            self.selection_end = Some((row, col));
+        }
+    }
+
+    /// Ends selection mode
+    pub fn end_selection(&mut self) {
+        self.selecting = false;
+    }
+
+    /// Clears the current selection
+    pub fn clear_selection(&mut self) {
+        self.selection_start = None;
+        self.selection_end = None;
+        self.selecting = false;
+    }
+
+    /// Gets the normalized selection range (top-left to bottom-right)
+    pub fn get_selection_range(&self) -> Option<((usize, usize), (usize, usize))> {
+        if let (Some(start), Some(end)) = (self.selection_start, self.selection_end) {
+            let min_row = start.0.min(end.0);
+            let max_row = start.0.max(end.0);
+            let min_col = start.1.min(end.1);
+            let max_col = start.1.max(end.1);
+            Some(((min_row, min_col), (max_row, max_col)))
+        } else {
+            None
+        }
+    }
+
+    /// Checks if a cell is within the current selection
+    pub fn is_cell_selected(&self, row: usize, col: usize) -> bool {
+        if let Some(((min_row, min_col), (max_row, max_col))) = self.get_selection_range() {
+            row >= min_row && row <= max_row && col >= min_col && col <= max_col
+        } else {
+            false
+        }
+    }
+
+    /// Updates the viewport size for proper scrolling calculations.
+    pub fn update_viewport_size(&mut self, rows: usize, cols: usize) {
+        self.viewport_rows = rows;
+        self.viewport_cols = cols;
+    }
+
+    /// Ensures the selected cell is visible by adjusting scroll position.
+    pub fn ensure_cursor_visible(&mut self) {
+        // Vertical scrolling
+        if self.selected_row < self.scroll_row {
+            self.scroll_row = self.selected_row;
+        } else if self.selected_row >= self.scroll_row + self.viewport_rows {
+            self.scroll_row = self.selected_row.saturating_sub(self.viewport_rows - 1);
+        }
+        
+        // Horizontal scrolling
+        if self.selected_col < self.scroll_col {
+            self.scroll_col = self.selected_col;
+        } else if self.selected_col >= self.scroll_col + self.viewport_cols {
+            self.scroll_col = self.selected_col.saturating_sub(self.viewport_cols - 1);
+        }
+    }
+
+    /// Performs autofill operation on the current selection.
+    ///
+    /// Copies the formula from the top-left cell of the selection to all other
+    /// cells in the selection, adjusting cell references relatively.
+    pub fn autofill_selection(&mut self) {
+        if let Some(((start_row, start_col), (end_row, end_col))) = self.get_selection_range() {
+            // Get the source cell (top-left of selection)
+            let source_cell = self.spreadsheet.get_cell(start_row, start_col);
+            
+            // Only proceed if the source cell has content
+            if source_cell.value.is_empty() && source_cell.formula.is_none() {
+                return;
+            }
+
+            // Collect all the changes first to avoid borrowing conflicts
+            let mut changes = Vec::new();
+            
+            // Fill each cell in the selection
+            for row in start_row..=end_row {
+                for col in start_col..=end_col {
+                    // Skip the source cell
+                    if row == start_row && col == start_col {
+                        continue;
+                    }
+                    
+                    let row_offset = row as i32 - start_row as i32;
+                    let col_offset = col as i32 - start_col as i32;
+                    
+                    let new_cell_data = if let Some(ref formula) = source_cell.formula {
+                        use crate::domain::services::FormulaEvaluator;
+                        let evaluator = FormulaEvaluator::new(&self.spreadsheet);
+                        
+                        // Adjust the formula with relative references
+                        let adjusted_formula = evaluator.adjust_formula_references(formula, row_offset, col_offset);
+                        
+                        // Check for circular references
+                        if evaluator.would_create_circular_reference(&adjusted_formula, (row, col)) {
+                            continue; // Skip this cell to avoid circular reference
+                        }
+                        
+                        let new_value = evaluator.evaluate_formula(&adjusted_formula);
+                        CellData {
+                            value: new_value,
+                            formula: Some(adjusted_formula),
+                        }
+                    } else {
+                        // Simple value copy (no formula)
+                        CellData {
+                            value: source_cell.value.clone(),
+                            formula: None,
+                        }
+                    };
+                    
+                    changes.push((row, col, new_cell_data));
+                }
+            }
+            
+            // Apply all changes
+            for (row, col, cell_data) in changes {
+                self.set_cell_with_undo(row, col, cell_data);
+            }
+            
+            self.status_message = Some(format!(
+                "Autofilled {} cells from {}{}",
+                (end_row - start_row + 1) * (end_col - start_col + 1) - 1,
+                Spreadsheet::column_label(start_col),
+                start_row + 1
+            ));
+        }
+    }
+
 }
 
 #[cfg(test)]
@@ -760,5 +1172,149 @@ mod tests {
         
         assert!(matches!(app.mode, AppMode::Normal));
         assert!(app.status_message.as_ref().unwrap().contains("Import failed: File not found"));
+    }
+
+    #[test]
+    fn test_selection_functionality() {
+        let mut app = App::default();
+        
+        // Initially no selection
+        assert!(app.get_selection_range().is_none());
+        assert!(!app.is_cell_selected(0, 0));
+        
+        // Start selection
+        app.start_selection();
+        assert_eq!(app.get_selection_range(), Some(((0, 0), (0, 0))));
+        assert!(app.is_cell_selected(0, 0));
+        
+        // Update selection
+        app.update_selection(1, 2);
+        assert_eq!(app.get_selection_range(), Some(((0, 0), (1, 2))));
+        assert!(app.is_cell_selected(0, 1));
+        assert!(app.is_cell_selected(1, 2));
+        assert!(!app.is_cell_selected(2, 0));
+        
+        // Clear selection
+        app.clear_selection();
+        assert!(app.get_selection_range().is_none());
+        assert!(!app.is_cell_selected(0, 0));
+    }
+
+    #[test]
+    fn test_autofill_simple_values() {
+        let mut app = App::default();
+        
+        // Set up a simple value in A1
+        app.set_cell_with_undo(0, 0, CellData {
+            value: "Hello".to_string(),
+            formula: None,
+        });
+        
+        // Select A1:B2
+        app.selection_start = Some((0, 0));
+        app.selection_end = Some((1, 1));
+        
+        // Autofill
+        app.autofill_selection();
+        
+        // Check that the value was copied
+        assert_eq!(app.spreadsheet.get_cell(0, 1).value, "Hello");
+        assert_eq!(app.spreadsheet.get_cell(1, 0).value, "Hello");
+        assert_eq!(app.spreadsheet.get_cell(1, 1).value, "Hello");
+    }
+
+    #[test]
+    fn test_autofill_formula_horizontal() {
+        let mut app = App::default();
+        
+        // Set up cells with values
+        app.set_cell_with_undo(0, 1, CellData { value: "10".to_string(), formula: None }); // B1 = 10
+        app.set_cell_with_undo(1, 1, CellData { value: "20".to_string(), formula: None }); // B2 = 20
+        
+        // Set up a formula in A1 that references B1:B2
+        app.set_cell_with_undo(0, 0, CellData {
+            value: "30".to_string(),
+            formula: Some("=SUM(B1:B2)".to_string()),
+        });
+        
+        // Select A1:C1 (horizontal autofill)
+        app.selection_start = Some((0, 0));
+        app.selection_end = Some((0, 2));
+        
+        // Autofill
+        app.autofill_selection();
+        
+        // Check that formulas were adjusted horizontally
+        let b1_cell = app.spreadsheet.get_cell(0, 1);
+        assert_eq!(b1_cell.formula, Some("=SUM(C1:C2)".to_string()));
+        
+        let c1_cell = app.spreadsheet.get_cell(0, 2);
+        assert_eq!(c1_cell.formula, Some("=SUM(D1:D2)".to_string()));
+    }
+
+    #[test]
+    fn test_viewport_and_scrolling() {
+        let mut app = App::default();
+        
+        // Test initial viewport size
+        assert_eq!(app.viewport_rows, 20);
+        assert_eq!(app.viewport_cols, 8);
+        
+        // Test updating viewport size
+        app.update_viewport_size(15, 10);
+        assert_eq!(app.viewport_rows, 15);
+        assert_eq!(app.viewport_cols, 10);
+        
+        // Test ensure_cursor_visible - cursor within viewport
+        app.selected_row = 5;
+        app.selected_col = 3;
+        app.scroll_row = 0;
+        app.scroll_col = 0;
+        app.ensure_cursor_visible();
+        assert_eq!(app.scroll_row, 0);  // No need to scroll
+        assert_eq!(app.scroll_col, 0);
+        
+        // Test ensure_cursor_visible - cursor beyond bottom/right
+        app.selected_row = 20;  // Beyond viewport (15 rows)
+        app.selected_col = 12;  // Beyond viewport (10 cols)
+        app.ensure_cursor_visible();
+        assert_eq!(app.scroll_row, 6);  // 20 - 15 + 1 = 6
+        assert_eq!(app.scroll_col, 3);  // 12 - 10 + 1 = 3
+        
+        // Test ensure_cursor_visible - cursor before top/left
+        app.selected_row = 2;
+        app.selected_col = 1;
+        app.ensure_cursor_visible();
+        assert_eq!(app.scroll_row, 2);  // Scroll to show cursor
+        assert_eq!(app.scroll_col, 1);
+    }
+
+    #[test]
+    fn test_autofill_formula_vertical() {
+        let mut app = App::default();
+        
+        // Set up cells with values
+        app.set_cell_with_undo(1, 0, CellData { value: "10".to_string(), formula: None }); // A2 = 10
+        app.set_cell_with_undo(1, 1, CellData { value: "20".to_string(), formula: None }); // B2 = 20
+        
+        // Set up a formula in A1 that references A2+B2
+        app.set_cell_with_undo(0, 0, CellData {
+            value: "30".to_string(),
+            formula: Some("=A2+B2".to_string()),
+        });
+        
+        // Select A1:A3 (vertical autofill)
+        app.selection_start = Some((0, 0));
+        app.selection_end = Some((2, 0));
+        
+        // Autofill
+        app.autofill_selection();
+        
+        // Check that formulas were adjusted vertically
+        let a2_cell = app.spreadsheet.get_cell(1, 0);
+        assert_eq!(a2_cell.formula, Some("=A3+B3".to_string()));
+        
+        let a3_cell = app.spreadsheet.get_cell(2, 0);
+        assert_eq!(a3_cell.formula, Some("=A4+B4".to_string()));
     }
 }
