@@ -5,7 +5,7 @@
 //! arithmetic operations, and built-in functions.
 
 use super::models::Spreadsheet;
-use super::parser::{Parser, ExpressionEvaluator, FunctionRegistry, Expr};
+use super::parser::{Parser, ExpressionEvaluator, FunctionRegistry, Expr, Value};
 use std::collections::HashSet;
 use std::fs::File;
 
@@ -152,7 +152,7 @@ impl<'a> FormulaEvaluator<'a> {
     }
 
     /// Parses and evaluates an expression using the new parser.
-    fn parse_and_evaluate(&self, expr: &str) -> Result<f64, String> {
+    fn parse_and_evaluate(&self, expr: &str) -> Result<Value, String> {
         let mut parser = Parser::new(expr)?;
         let ast = parser.parse()?;
         
@@ -164,6 +164,7 @@ impl<'a> FormulaEvaluator<'a> {
     /// Checks for circular references in an AST.
     fn check_circular_reference_in_ast(&self, expr: &Expr, target_cell: (usize, usize), visited: &mut HashSet<(usize, usize)>) -> bool {
         match expr {
+            Expr::String(_) => false,
             Expr::CellRef(cell_ref) => {
                 if let Some((row, col)) = Spreadsheet::parse_cell_reference(cell_ref) {
                     if (row, col) == target_cell {
@@ -259,6 +260,7 @@ impl<'a> FormulaEvaluator<'a> {
         let mut references = Vec::new();
         
         match expr {
+            Expr::String(_) => {},
             Expr::CellRef(cell_ref) => {
                 if let Some((row, col)) = Spreadsheet::parse_cell_reference(cell_ref) {
                     references.push((row, col));
@@ -695,6 +697,301 @@ mod tests {
         // Test functions work correctly
         assert_eq!(evaluator.evaluate_formula("=SUM(A1,B1)"), "30"); // 10+20
         assert_eq!(evaluator.evaluate_formula("=SUM(A1:B1)"), "30"); // 10+20
+    }
+
+    #[test]
+    fn test_string_literals() {
+        let sheet = create_test_spreadsheet();
+        let evaluator = FormulaEvaluator::new(&sheet);
+        
+        assert_eq!(evaluator.evaluate_formula("=\"Hello World\""), "Hello World");
+        assert_eq!(evaluator.evaluate_formula("=\"\""), "");
+        assert_eq!(evaluator.evaluate_formula("=\"Test\""), "Test");
+    }
+
+    #[test]
+    fn test_string_concatenation() {
+        let sheet = create_test_spreadsheet();
+        let evaluator = FormulaEvaluator::new(&sheet);
+        
+        assert_eq!(evaluator.evaluate_formula("=\"Hello\" & \" \" & \"World\""), "Hello World");
+        assert_eq!(evaluator.evaluate_formula("=\"Number: \" & 42"), "Number: 42");
+        assert_eq!(evaluator.evaluate_formula("=\"Result: \" & (2 + 3)"), "Result: 5");
+    }
+
+    #[test]
+    fn test_string_functions() {
+        let sheet = create_test_spreadsheet();
+        let evaluator = FormulaEvaluator::new(&sheet);
+        
+        // Test LEN function
+        assert_eq!(evaluator.evaluate_formula("=LEN(\"Hello\")"), "5");
+        assert_eq!(evaluator.evaluate_formula("=LEN(\"\")"), "0");
+        
+        // Test UPPER/LOWER functions
+        assert_eq!(evaluator.evaluate_formula("=UPPER(\"hello\")"), "HELLO");
+        assert_eq!(evaluator.evaluate_formula("=LOWER(\"WORLD\")"), "world");
+        
+        // Test TRIM function
+        assert_eq!(evaluator.evaluate_formula("=TRIM(\"  spaces  \")"), "spaces");
+        
+        // Test LEFT/RIGHT functions
+        assert_eq!(evaluator.evaluate_formula("=LEFT(\"Hello World\", 5)"), "Hello");
+        assert_eq!(evaluator.evaluate_formula("=RIGHT(\"Hello World\", 5)"), "World");
+        
+        // Test MID function (0-based indexing)
+        assert_eq!(evaluator.evaluate_formula("=MID(\"Hello World\", 6, 5)"), "World");
+        
+        // Test FIND function (0-based indexing)
+        assert_eq!(evaluator.evaluate_formula("=FIND(\"lo\", \"Hello\")"), "3");
+        assert_eq!(evaluator.evaluate_formula("=FIND(\"World\", \"Hello World\")"), "6");
+        
+        // Test CONCAT function
+        assert_eq!(evaluator.evaluate_formula("=CONCAT(\"A\", \"B\", \"C\")"), "ABC");
+        assert_eq!(evaluator.evaluate_formula("=CONCAT(\"Number: \", 123)"), "Number: 123");
+    }
+
+    #[test]
+    fn test_string_cell_references() {
+        let mut sheet = Spreadsheet::default();
+        sheet.set_cell(0, 0, CellData { value: "Hello".to_string(), formula: None });
+        sheet.set_cell(0, 1, CellData { value: "World".to_string(), formula: None });
+        sheet.set_cell(0, 2, CellData { value: "123".to_string(), formula: None });
+        
+        let evaluator = FormulaEvaluator::new(&sheet);
+        
+        // Test string cell concatenation
+        assert_eq!(evaluator.evaluate_formula("=A1 & \" \" & B1"), "Hello World");
+        
+        // Test string functions with cell references
+        assert_eq!(evaluator.evaluate_formula("=LEN(A1)"), "5");
+        assert_eq!(evaluator.evaluate_formula("=UPPER(A1)"), "HELLO");
+        
+        // Test numeric conversion from string cells
+        assert_eq!(evaluator.evaluate_formula("=C1 + 456"), "579");
+    }
+
+    #[test]
+    fn test_string_equality() {
+        let sheet = create_test_spreadsheet();
+        let evaluator = FormulaEvaluator::new(&sheet);
+        
+        // String equality
+        assert_eq!(evaluator.evaluate_formula("=\"Hello\" = \"Hello\""), "1");
+        assert_eq!(evaluator.evaluate_formula("=\"Hello\" = \"World\""), "0");
+        
+        // String inequality
+        assert_eq!(evaluator.evaluate_formula("=\"Hello\" <> \"World\""), "1");
+        assert_eq!(evaluator.evaluate_formula("=\"Hello\" <> \"Hello\""), "0");
+    }
+
+    #[test]
+    fn test_if_with_strings() {
+        let mut sheet = Spreadsheet::default();
+        sheet.set_cell(0, 0, CellData { value: "Hello".to_string(), formula: None });
+        
+        let evaluator = FormulaEvaluator::new(&sheet);
+        
+        // Test IF with string conditions and results
+        assert_eq!(evaluator.evaluate_formula("=IF(A1=\"Hello\", \"Found\", \"Not Found\")"), "Found");
+        assert_eq!(evaluator.evaluate_formula("=IF(LEN(A1)>3, \"Long\", \"Short\")"), "Long");
+        assert_eq!(evaluator.evaluate_formula("=IF(A1=\"World\", \"Found\", \"Not Found\")"), "Not Found");
+    }
+
+    #[test]
+    fn test_string_function_errors() {
+        let sheet = create_test_spreadsheet();
+        let evaluator = FormulaEvaluator::new(&sheet);
+        
+        // Test FIND with no match
+        assert_eq!(evaluator.evaluate_formula("=FIND(\"xyz\", \"Hello\")"), "#ERROR");
+        
+        // Test functions with wrong argument count
+        assert_eq!(evaluator.evaluate_formula("=LEN()"), "#ERROR");
+        assert_eq!(evaluator.evaluate_formula("=LEN(\"a\", \"b\")"), "#ERROR");
+    }
+
+    #[test]
+    fn test_get_function_basic() {
+        let sheet = create_test_spreadsheet();
+        let evaluator = FormulaEvaluator::new(&sheet);
+        
+        // Test GET function with wrong argument count
+        assert_eq!(evaluator.evaluate_formula("=GET()"), "#ERROR");
+        assert_eq!(evaluator.evaluate_formula("=GET(\"url1\", \"url2\")"), "#ERROR");
+        
+        // Note: We can't easily test actual HTTP requests in unit tests
+        // since they depend on external services. In a real application,
+        // you might want to use dependency injection or mock HTTP clients
+        // for testing. For now, we just test the error cases.
+    }
+
+    #[test]
+    fn test_get_function_invalid_url() {
+        let sheet = create_test_spreadsheet();
+        let evaluator = FormulaEvaluator::new(&sheet);
+        
+        // Test with invalid URL - this should return an error
+        let result = evaluator.evaluate_formula("=GET(\"not-a-valid-url\")");
+        assert_eq!(result, "#ERROR");
+        
+        // Test with empty string URL
+        let result = evaluator.evaluate_formula("=GET(\"\")");
+        assert_eq!(result, "#ERROR");
+    }
+
+    #[test]
+    fn test_get_function_real_http_requests() {
+        let sheet = create_test_spreadsheet();
+        let evaluator = FormulaEvaluator::new(&sheet);
+        
+        // Test fetching crypto price from real API
+        let result = evaluator.evaluate_formula("=GET(\"https://cryptoprices.cc/ADA\")");
+        // The result should be a valid response (not #ERROR) and contain price data
+        assert_ne!(result, "#ERROR");
+        assert!(!result.is_empty());
+        
+        // Test another crypto ticker
+        let result = evaluator.evaluate_formula("=GET(\"https://cryptoprices.cc/BTC\")");
+        assert_ne!(result, "#ERROR");
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn test_nested_get_with_string_functions() {
+        let sheet = create_test_spreadsheet();
+        let evaluator = FormulaEvaluator::new(&sheet);
+        
+        // Test LEN with GET - get length of response
+        let result = evaluator.evaluate_formula("=LEN(GET(\"https://cryptoprices.cc/ADA\"))");
+        assert_ne!(result, "#ERROR");
+        // Should be a positive number (length of response)
+        if let Ok(len) = result.parse::<f64>() {
+            assert!(len > 0.0);
+        } else {
+            panic!("Expected numeric result for LEN(GET(...)), got: {}", result);
+        }
+        
+        // Test UPPER with GET - convert response to uppercase
+        let result = evaluator.evaluate_formula("=UPPER(GET(\"https://cryptoprices.cc/ADA\"))");
+        assert_ne!(result, "#ERROR");
+        assert!(!result.is_empty());
+        
+        // Test TRIM with GET - trim whitespace from response
+        let result = evaluator.evaluate_formula("=TRIM(GET(\"https://cryptoprices.cc/ADA\"))");
+        assert_ne!(result, "#ERROR");
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn test_nested_concat_with_get() {
+        let sheet = create_test_spreadsheet();
+        let evaluator = FormulaEvaluator::new(&sheet);
+        
+        // Test CONCAT with GET results
+        let result = evaluator.evaluate_formula("=CONCAT(\"ADA Price: \", GET(\"https://cryptoprices.cc/ADA\"))");
+        assert_ne!(result, "#ERROR");
+        assert!(result.starts_with("ADA Price: "));
+        
+        // Test concatenating multiple GET requests
+        let result = evaluator.evaluate_formula("=CONCAT(\"ADA: \", GET(\"https://cryptoprices.cc/ADA\"), \" | BTC: \", GET(\"https://cryptoprices.cc/BTC\"))");
+        assert_ne!(result, "#ERROR");
+        assert!(result.contains("ADA: "));
+        assert!(result.contains(" | BTC: "));
+    }
+
+    #[test]
+    fn test_complex_nested_expressions_with_get() {
+        let sheet = create_test_spreadsheet();
+        let evaluator = FormulaEvaluator::new(&sheet);
+        
+        // Test deeply nested: UPPER(CONCAT("Price: ", TRIM(GET(url))))
+        let result = evaluator.evaluate_formula("=UPPER(CONCAT(\"Ada price: \", TRIM(GET(\"https://cryptoprices.cc/ADA\"))))");
+        assert_ne!(result, "#ERROR");
+        assert!(result.starts_with("ADA PRICE: "));
+        
+        // Test conditional with GET: IF(LEN(GET(url)) > 0, "Got data", "No data")
+        let result = evaluator.evaluate_formula("=IF(LEN(GET(\"https://cryptoprices.cc/ADA\"))>0, \"Got data\", \"No data\")");
+        assert_ne!(result, "#ERROR");
+        assert_eq!(result, "Got data");
+        
+        // Test FIND within GET results
+        let result = evaluator.evaluate_formula("=FIND(\".\", GET(\"https://cryptoprices.cc/ADA\"))");
+        // Should find a decimal point in the price response (most crypto prices have decimals)
+        // If no decimal found, it will return #ERROR, but most crypto prices should have decimals
+        if result != "#ERROR" {
+            if let Ok(pos) = result.parse::<f64>() {
+                assert!(pos >= 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn test_get_with_cell_references() {
+        let mut sheet = Spreadsheet::default();
+        // Set up a cell with a URL
+        sheet.set_cell(0, 0, CellData { 
+            value: "https://cryptoprices.cc/ADA".to_string(), 
+            formula: None 
+        });
+        
+        let evaluator = FormulaEvaluator::new(&sheet);
+        
+        // Test GET with cell reference
+        let result = evaluator.evaluate_formula("=GET(A1)");
+        assert_ne!(result, "#ERROR");
+        assert!(!result.is_empty());
+        
+        // Test nested function with cell reference: LEN(GET(A1))
+        let result = evaluator.evaluate_formula("=LEN(GET(A1))");
+        assert_ne!(result, "#ERROR");
+        if let Ok(len) = result.parse::<f64>() {
+            assert!(len > 0.0);
+        }
+        
+        // Test CONCAT with cell reference and GET
+        let result = evaluator.evaluate_formula("=CONCAT(\"Price from \", A1, \": \", GET(A1))");
+        assert_ne!(result, "#ERROR");
+        assert!(result.contains("Price from https://cryptoprices.cc/ADA: "));
+    }
+
+    #[test]
+    fn test_multiple_nested_function_levels() {
+        let sheet = create_test_spreadsheet();
+        let evaluator = FormulaEvaluator::new(&sheet);
+        
+        // Test 4-level nesting: LEFT(UPPER(TRIM(GET(url))), 10)
+        let result = evaluator.evaluate_formula("=LEFT(UPPER(TRIM(GET(\"https://cryptoprices.cc/ADA\"))), 10)");
+        assert_ne!(result, "#ERROR");
+        assert!(!result.is_empty());
+        assert!(result.len() <= 10);
+        
+        // Test 5-level nesting with conditional: IF(LEN(TRIM(GET(url))) > 5, LEFT(UPPER(GET(url)), 20), "Short")
+        let result = evaluator.evaluate_formula("=IF(LEN(TRIM(GET(\"https://cryptoprices.cc/ADA\")))>5, LEFT(UPPER(GET(\"https://cryptoprices.cc/ADA\")), 20), \"Short\")");
+        assert_ne!(result, "#ERROR");
+        // Should not be "Short" since crypto price responses are typically longer than 5 characters
+        assert_ne!(result, "Short");
+    }
+
+    #[test]
+    fn test_error_propagation_in_nested_functions() {
+        let sheet = create_test_spreadsheet();
+        let evaluator = FormulaEvaluator::new(&sheet);
+        
+        // Test that errors in inner functions propagate outward
+        let result = evaluator.evaluate_formula("=LEN(GET(\"invalid-url\"))");
+        assert_eq!(result, "#ERROR");
+        
+        let result = evaluator.evaluate_formula("=CONCAT(\"Price: \", GET(\"invalid-url\"))");
+        assert_eq!(result, "#ERROR");
+        
+        let result = evaluator.evaluate_formula("=IF(LEN(GET(\"invalid-url\"))>0, \"Good\", \"Bad\")");
+        assert_eq!(result, "#ERROR");
+        
+        // Test FIND with invalid search in valid GET
+        let result = evaluator.evaluate_formula("=FIND(\"xyz123notfound\", GET(\"https://cryptoprices.cc/ADA\"))");
+        // This should return #ERROR because the search string likely won't be found
+        assert_eq!(result, "#ERROR");
     }
 
     #[test]

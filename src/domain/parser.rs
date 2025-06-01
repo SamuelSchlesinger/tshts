@@ -43,6 +43,7 @@ use super::models::Spreadsheet;
 pub enum Token {
     // Literals
     Number(f64),
+    String(String),
     CellRef(String),
     Identifier(String),
     
@@ -70,8 +71,44 @@ pub enum Token {
     Comma,
     Colon,
     
+    // String concatenation
+    Ampersand,
+    
     // End of input
     Eof,
+}
+
+/// Represents a value in the spreadsheet system that can be either a number or string.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Value {
+    Number(f64),
+    String(String),
+}
+
+impl Value {
+    /// Converts value to string representation
+    pub fn to_string(&self) -> String {
+        match self {
+            Value::Number(n) => n.to_string(),
+            Value::String(s) => s.clone(),
+        }
+    }
+    
+    /// Attempts to convert value to number, returns 0.0 for non-numeric strings
+    pub fn to_number(&self) -> f64 {
+        match self {
+            Value::Number(n) => *n,
+            Value::String(s) => s.parse::<f64>().unwrap_or(0.0),
+        }
+    }
+    
+    /// Returns true if this value is truthy (non-zero number or non-empty string)
+    pub fn is_truthy(&self) -> bool {
+        match self {
+            Value::Number(n) => *n != 0.0,
+            Value::String(s) => !s.is_empty(),
+        }
+    }
 }
 
 /// Represents an Abstract Syntax Tree node for expressions.
@@ -79,6 +116,7 @@ pub enum Token {
 pub enum Expr {
     // Literals
     Number(f64),
+    String(String),
     CellRef(String),
     Range(String, String), // start_cell, end_cell
     
@@ -125,6 +163,9 @@ pub enum BinaryOp {
     
     // Power (highest precedence among binary)
     Power,
+    
+    // String operations
+    Concatenate, // & operator for string concatenation
 }
 
 /// Unary operators.
@@ -219,6 +260,30 @@ impl Lexer {
         }
         
         identifier
+    }
+    
+    /// Reads a string literal (between quotes).
+    fn read_string(&mut self) -> Result<String, String> {
+        let mut string_value = String::new();
+        
+        while let Some(ch) = self.current_char {
+            if ch == '"' {
+                // Check for escaped quote
+                self.advance();
+                if self.current_char == Some('"') {
+                    string_value.push('"');
+                    self.advance();
+                } else {
+                    // End of string
+                    return Ok(string_value);
+                }
+            } else {
+                string_value.push(ch);
+                self.advance();
+            }
+        }
+        
+        Err("Unterminated string literal".to_string())
     }
     
     /// Determines if an identifier is a cell reference or function name.
@@ -355,6 +420,17 @@ impl Lexer {
                     Ok(Token::Colon)
                 }
                 
+                '&' => {
+                    self.advance();
+                    Ok(Token::Ampersand)
+                }
+                
+                '"' => {
+                    self.advance();
+                    let string_value = self.read_string()?;
+                    Ok(Token::String(string_value))
+                }
+                
                 _ => Err(format!("Unexpected character: '{}'", ch)),
             }
         }
@@ -362,7 +438,7 @@ impl Lexer {
 }
 
 /// Function signature for built-in and user-defined functions.
-pub type FunctionImpl = fn(&[f64]) -> Result<f64, String>;
+pub type FunctionImpl = fn(&[Value]) -> Result<Value, String>;
 
 /// Registry for spreadsheet functions.
 pub struct FunctionRegistry {
@@ -393,51 +469,57 @@ impl FunctionRegistry {
     
     /// Registers all built-in spreadsheet functions.
     fn register_builtin_functions(&mut self) {
+        // Numeric functions
         self.register_function("SUM", |args| {
-            Ok(args.iter().sum())
+            let sum: f64 = args.iter().map(|v| v.to_number()).sum();
+            Ok(Value::Number(sum))
         });
         
         self.register_function("AVERAGE", |args| {
             if args.is_empty() {
                 Err("AVERAGE requires at least one argument".to_string())
             } else {
-                Ok(args.iter().sum::<f64>() / args.len() as f64)
+                let sum: f64 = args.iter().map(|v| v.to_number()).sum();
+                Ok(Value::Number(sum / args.len() as f64))
             }
         });
         
         self.register_function("MIN", |args| {
-            args.iter().fold(None, |acc: Option<f64>, &x| {
+            args.iter().map(|v| v.to_number()).fold(None, |acc: Option<f64>, x| {
                 Some(acc.map_or(x, |a| a.min(x)))
-            }).ok_or_else(|| "MIN requires at least one argument".to_string())
+            }).map(Value::Number).ok_or_else(|| "MIN requires at least one argument".to_string())
         });
         
         self.register_function("MAX", |args| {
-            args.iter().fold(None, |acc: Option<f64>, &x| {
+            args.iter().map(|v| v.to_number()).fold(None, |acc: Option<f64>, x| {
                 Some(acc.map_or(x, |a| a.max(x)))
-            }).ok_or_else(|| "MAX requires at least one argument".to_string())
+            }).map(Value::Number).ok_or_else(|| "MAX requires at least one argument".to_string())
         });
         
         self.register_function("IF", |args| {
             if args.len() != 3 {
                 Err("IF requires exactly 3 arguments".to_string())
             } else {
-                Ok(if args[0] != 0.0 { args[1] } else { args[2] })
+                Ok(if args[0].is_truthy() { args[1].clone() } else { args[2].clone() })
             }
         });
         
         self.register_function("AND", |args| {
-            Ok(if args.iter().all(|&x| x != 0.0) { 1.0 } else { 0.0 })
+            let result = args.iter().all(|v| v.is_truthy());
+            Ok(Value::Number(if result { 1.0 } else { 0.0 }))
         });
         
         self.register_function("OR", |args| {
-            Ok(if args.iter().any(|&x| x != 0.0) { 1.0 } else { 0.0 })
+            let result = args.iter().any(|v| v.is_truthy());
+            Ok(Value::Number(if result { 1.0 } else { 0.0 }))
         });
         
         self.register_function("NOT", |args| {
             if args.len() != 1 {
                 Err("NOT requires exactly 1 argument".to_string())
             } else {
-                Ok(if args[0] == 0.0 { 1.0 } else { 0.0 })
+                let result = !args[0].is_truthy();
+                Ok(Value::Number(if result { 1.0 } else { 0.0 }))
             }
         });
         
@@ -445,29 +527,156 @@ impl FunctionRegistry {
             if args.len() != 1 {
                 Err("ABS requires exactly 1 argument".to_string())
             } else {
-                Ok(args[0].abs())
+                Ok(Value::Number(args[0].to_number().abs()))
             }
         });
         
         self.register_function("SQRT", |args| {
             if args.len() != 1 {
                 Err("SQRT requires exactly 1 argument".to_string())
-            } else if args[0] < 0.0 {
-                Err("SQRT of negative number".to_string())
             } else {
-                Ok(args[0].sqrt())
+                let num = args[0].to_number();
+                if num < 0.0 {
+                    Err("SQRT of negative number".to_string())
+                } else {
+                    Ok(Value::Number(num.sqrt()))
+                }
             }
         });
         
         self.register_function("ROUND", |args| {
             match args.len() {
-                1 => Ok(args[0].round()),
+                1 => Ok(Value::Number(args[0].to_number().round())),
                 2 => {
-                    let places = args[1] as i32;
+                    let num = args[0].to_number();
+                    let places = args[1].to_number() as i32;
                     let multiplier = 10f64.powi(places);
-                    Ok((args[0] * multiplier).round() / multiplier)
+                    Ok(Value::Number((num * multiplier).round() / multiplier))
                 }
                 _ => Err("ROUND requires 1 or 2 arguments".to_string()),
+            }
+        });
+        
+        // String functions
+        self.register_function("CONCAT", |args| {
+            let result = args.iter().map(|v| v.to_string()).collect::<String>();
+            Ok(Value::String(result))
+        });
+        
+        self.register_function("LEN", |args| {
+            if args.len() != 1 {
+                Err("LEN requires exactly 1 argument".to_string())
+            } else {
+                let len = args[0].to_string().chars().count() as f64;
+                Ok(Value::Number(len))
+            }
+        });
+        
+        self.register_function("LEFT", |args| {
+            if args.len() != 2 {
+                Err("LEFT requires exactly 2 arguments".to_string())
+            } else {
+                let text = args[0].to_string();
+                let num_chars = args[1].to_number() as usize;
+                let result = text.chars().take(num_chars).collect::<String>();
+                Ok(Value::String(result))
+            }
+        });
+        
+        self.register_function("RIGHT", |args| {
+            if args.len() != 2 {
+                Err("RIGHT requires exactly 2 arguments".to_string())
+            } else {
+                let text = args[0].to_string();
+                let num_chars = args[1].to_number() as usize;
+                let chars: Vec<char> = text.chars().collect();
+                let start = chars.len().saturating_sub(num_chars);
+                let result = chars[start..].iter().collect::<String>();
+                Ok(Value::String(result))
+            }
+        });
+        
+        self.register_function("MID", |args| {
+            if args.len() != 3 {
+                Err("MID requires exactly 3 arguments".to_string())
+            } else {
+                let text = args[0].to_string();
+                let start = args[1].to_number() as usize; // 0-based indexing
+                let length = args[2].to_number() as usize;
+                let chars: Vec<char> = text.chars().collect();
+                let end = (start + length).min(chars.len());
+                let result = if start < chars.len() {
+                    chars[start..end].iter().collect::<String>()
+                } else {
+                    String::new()
+                };
+                Ok(Value::String(result))
+            }
+        });
+        
+        self.register_function("FIND", |args| {
+            if args.len() < 2 || args.len() > 3 {
+                Err("FIND requires 2 or 3 arguments".to_string())
+            } else {
+                let search_text = args[0].to_string();
+                let within_text = args[1].to_string();
+                let start_pos = if args.len() == 3 {
+                    args[2].to_number() as usize // 0-based indexing
+                } else {
+                    0
+                };
+                
+                let within_chars: Vec<char> = within_text.chars().collect();
+                if start_pos >= within_chars.len() {
+                    return Err("Start position is beyond text length".to_string());
+                }
+                
+                let search_in = within_chars[start_pos..].iter().collect::<String>();
+                match search_in.find(&search_text) {
+                    Some(pos) => Ok(Value::Number((start_pos + pos) as f64)), // 0-based result
+                    None => Err("Search text not found".to_string()),
+                }
+            }
+        });
+        
+        self.register_function("UPPER", |args| {
+            if args.len() != 1 {
+                Err("UPPER requires exactly 1 argument".to_string())
+            } else {
+                Ok(Value::String(args[0].to_string().to_uppercase()))
+            }
+        });
+        
+        self.register_function("LOWER", |args| {
+            if args.len() != 1 {
+                Err("LOWER requires exactly 1 argument".to_string())
+            } else {
+                Ok(Value::String(args[0].to_string().to_lowercase()))
+            }
+        });
+        
+        self.register_function("TRIM", |args| {
+            if args.len() != 1 {
+                Err("TRIM requires exactly 1 argument".to_string())
+            } else {
+                Ok(Value::String(args[0].to_string().trim().to_string()))
+            }
+        });
+        
+        self.register_function("GET", |args| {
+            if args.len() != 1 {
+                Err("GET requires exactly 1 argument (URL)".to_string())
+            } else {
+                let url = args[0].to_string();
+                match reqwest::blocking::get(&url) {
+                    Ok(response) => {
+                        match response.text() {
+                            Ok(content) => Ok(Value::String(content)),
+                            Err(e) => Err(format!("Failed to read response: {}", e)),
+                        }
+                    }
+                    Err(e) => Err(format!("Failed to fetch URL {}: {}", url, e)),
+                }
             }
         });
     }
@@ -573,7 +782,7 @@ impl Parser {
     
     /// Parses addition and subtraction expressions.
     fn parse_addition(&mut self) -> Result<Expr, String> {
-        let mut left = self.parse_multiplication()?;
+        let mut left = self.parse_concatenation()?;
         
         while matches!(self.current_token, Token::Plus | Token::Minus) {
             let op = match self.current_token {
@@ -582,10 +791,27 @@ impl Parser {
                 _ => unreachable!(),
             };
             self.advance()?;
-            let right = self.parse_multiplication()?;
+            let right = self.parse_concatenation()?;
             left = Expr::Binary {
                 left: Box::new(left),
                 operator: op,
+                right: Box::new(right),
+            };
+        }
+        
+        Ok(left)
+    }
+    
+    /// Parses string concatenation expressions.
+    fn parse_concatenation(&mut self) -> Result<Expr, String> {
+        let mut left = self.parse_multiplication()?;
+        
+        while matches!(self.current_token, Token::Ampersand) {
+            self.advance()?;
+            let right = self.parse_multiplication()?;
+            left = Expr::Binary {
+                left: Box::new(left),
+                operator: BinaryOp::Concatenate,
                 right: Box::new(right),
             };
         }
@@ -663,6 +889,12 @@ impl Parser {
                 let value = *value;
                 self.advance()?;
                 Ok(Expr::Number(value))
+            }
+            
+            Token::String(text) => {
+                let text = text.clone();
+                self.advance()?;
+                Ok(Expr::String(text))
             }
             
             Token::CellRef(cell) => {
@@ -747,15 +979,23 @@ impl<'a> ExpressionEvaluator<'a> {
         }
     }
     
-    /// Evaluates an expression AST to a numeric result.
-    pub fn evaluate(&self, expr: &Expr) -> Result<f64, String> {
+    /// Evaluates an expression AST to a value result.
+    pub fn evaluate(&self, expr: &Expr) -> Result<Value, String> {
         match expr {
-            Expr::Number(value) => Ok(*value),
+            Expr::Number(value) => Ok(Value::Number(*value)),
+            
+            Expr::String(text) => Ok(Value::String(text.clone())),
             
             Expr::CellRef(cell_ref) => {
                 let (row, col) = super::models::Spreadsheet::parse_cell_reference(cell_ref)
                     .ok_or_else(|| format!("Invalid cell reference: {}", cell_ref))?;
-                Ok(self.spreadsheet.get_cell_value_for_formula(row, col))
+                let cell = self.spreadsheet.get_cell(row, col);
+                // Try to parse as number first, otherwise return as string
+                if let Ok(num) = cell.value.parse::<f64>() {
+                    Ok(Value::Number(num))
+                } else {
+                    Ok(Value::String(cell.value))
+                }
             }
             
             Expr::Range(start_cell, end_cell) => {
@@ -768,30 +1008,93 @@ impl<'a> ExpressionEvaluator<'a> {
                 let right_val = self.evaluate(right)?;
                 
                 match operator {
-                    BinaryOp::Add => Ok(left_val + right_val),
-                    BinaryOp::Subtract => Ok(left_val - right_val),
-                    BinaryOp::Multiply => Ok(left_val * right_val),
+                    BinaryOp::Add => {
+                        let left_num = left_val.to_number();
+                        let right_num = right_val.to_number();
+                        Ok(Value::Number(left_num + right_num))
+                    }
+                    BinaryOp::Subtract => {
+                        let left_num = left_val.to_number();
+                        let right_num = right_val.to_number();
+                        Ok(Value::Number(left_num - right_num))
+                    }
+                    BinaryOp::Multiply => {
+                        let left_num = left_val.to_number();
+                        let right_num = right_val.to_number();
+                        Ok(Value::Number(left_num * right_num))
+                    }
                     BinaryOp::Divide => {
-                        if right_val == 0.0 {
+                        let left_num = left_val.to_number();
+                        let right_num = right_val.to_number();
+                        if right_num == 0.0 {
                             Err("Division by zero".to_string())
                         } else {
-                            Ok(left_val / right_val)
+                            Ok(Value::Number(left_num / right_num))
                         }
                     }
                     BinaryOp::Modulo => {
-                        if right_val == 0.0 {
+                        let left_num = left_val.to_number();
+                        let right_num = right_val.to_number();
+                        if right_num == 0.0 {
                             Err("Modulo by zero".to_string())
                         } else {
-                            Ok(left_val % right_val)
+                            Ok(Value::Number(left_num % right_num))
                         }
                     }
-                    BinaryOp::Power => Ok(left_val.powf(right_val)),
-                    BinaryOp::Less => Ok(if left_val < right_val { 1.0 } else { 0.0 }),
-                    BinaryOp::LessEqual => Ok(if left_val <= right_val { 1.0 } else { 0.0 }),
-                    BinaryOp::Greater => Ok(if left_val > right_val { 1.0 } else { 0.0 }),
-                    BinaryOp::GreaterEqual => Ok(if left_val >= right_val { 1.0 } else { 0.0 }),
-                    BinaryOp::Equal => Ok(if (left_val - right_val).abs() < f64::EPSILON { 1.0 } else { 0.0 }),
-                    BinaryOp::NotEqual => Ok(if (left_val - right_val).abs() >= f64::EPSILON { 1.0 } else { 0.0 }),
+                    BinaryOp::Power => {
+                        let left_num = left_val.to_number();
+                        let right_num = right_val.to_number();
+                        Ok(Value::Number(left_num.powf(right_num)))
+                    }
+                    BinaryOp::Concatenate => {
+                        let left_str = left_val.to_string();
+                        let right_str = right_val.to_string();
+                        Ok(Value::String(format!("{}{}", left_str, right_str)))
+                    }
+                    BinaryOp::Less => {
+                        let left_num = left_val.to_number();
+                        let right_num = right_val.to_number();
+                        Ok(Value::Number(if left_num < right_num { 1.0 } else { 0.0 }))
+                    }
+                    BinaryOp::LessEqual => {
+                        let left_num = left_val.to_number();
+                        let right_num = right_val.to_number();
+                        Ok(Value::Number(if left_num <= right_num { 1.0 } else { 0.0 }))
+                    }
+                    BinaryOp::Greater => {
+                        let left_num = left_val.to_number();
+                        let right_num = right_val.to_number();
+                        Ok(Value::Number(if left_num > right_num { 1.0 } else { 0.0 }))
+                    }
+                    BinaryOp::GreaterEqual => {
+                        let left_num = left_val.to_number();
+                        let right_num = right_val.to_number();
+                        Ok(Value::Number(if left_num >= right_num { 1.0 } else { 0.0 }))
+                    }
+                    BinaryOp::Equal => {
+                        // Support both numeric and string equality
+                        let result = match (&left_val, &right_val) {
+                            (Value::Number(l), Value::Number(r)) => (l - r).abs() < f64::EPSILON,
+                            (Value::String(l), Value::String(r)) => l == r,
+                            _ => {
+                                // Mixed types: compare as strings
+                                left_val.to_string() == right_val.to_string()
+                            }
+                        };
+                        Ok(Value::Number(if result { 1.0 } else { 0.0 }))
+                    }
+                    BinaryOp::NotEqual => {
+                        // Support both numeric and string inequality
+                        let result = match (&left_val, &right_val) {
+                            (Value::Number(l), Value::Number(r)) => (l - r).abs() >= f64::EPSILON,
+                            (Value::String(l), Value::String(r)) => l != r,
+                            _ => {
+                                // Mixed types: compare as strings
+                                left_val.to_string() != right_val.to_string()
+                            }
+                        };
+                        Ok(Value::Number(if result { 1.0 } else { 0.0 }))
+                    }
                 }
             }
             
@@ -799,8 +1102,8 @@ impl<'a> ExpressionEvaluator<'a> {
                 let operand_val = self.evaluate(operand)?;
                 
                 match operator {
-                    UnaryOp::Plus => Ok(operand_val),
-                    UnaryOp::Minus => Ok(-operand_val),
+                    UnaryOp::Plus => Ok(Value::Number(operand_val.to_number())),
+                    UnaryOp::Minus => Ok(Value::Number(-operand_val.to_number())),
                 }
             }
             
@@ -815,7 +1118,7 @@ impl<'a> ExpressionEvaluator<'a> {
     }
     
     /// Evaluates function arguments, handling ranges.
-    fn evaluate_function_args(&self, args: &[Expr]) -> Result<Vec<f64>, String> {
+    fn evaluate_function_args(&self, args: &[Expr]) -> Result<Vec<Value>, String> {
         let mut values = Vec::new();
         
         for arg in args {
@@ -828,7 +1131,13 @@ impl<'a> ExpressionEvaluator<'a> {
                     
                     for row in start.0..=end.0 {
                         for col in start.1..=end.1 {
-                            values.push(self.spreadsheet.get_cell_value_for_formula(row, col));
+                            let cell = self.spreadsheet.get_cell(row, col);
+                            // Try to parse as number first, otherwise return as string
+                            if let Ok(num) = cell.value.parse::<f64>() {
+                                values.push(Value::Number(num));
+                            } else {
+                                values.push(Value::String(cell.value));
+                            }
                         }
                     }
                 }
@@ -1143,7 +1452,16 @@ mod tests {
         let evaluator = ExpressionEvaluator::new(&sheet, &registry);
         
         let expr = Expr::Number(42.5);
-        assert_eq!(evaluator.evaluate(&expr).unwrap(), 42.5);
+        match evaluator.evaluate(&expr).unwrap() {
+            Value::Number(n) => assert_eq!(n, 42.5),
+            _ => panic!("Expected number"),
+        }
+        
+        let expr = Expr::String("Hello".to_string());
+        match evaluator.evaluate(&expr).unwrap() {
+            Value::String(s) => assert_eq!(s, "Hello"),
+            _ => panic!("Expected string"),
+        }
     }
 
     #[test]
@@ -1153,10 +1471,41 @@ mod tests {
         let evaluator = ExpressionEvaluator::new(&sheet, &registry);
         
         let expr = Expr::CellRef("A1".to_string());
-        assert_eq!(evaluator.evaluate(&expr).unwrap(), 10.0);
+        match evaluator.evaluate(&expr).unwrap() {
+            Value::Number(n) => assert_eq!(n, 10.0),
+            _ => panic!("Expected number"),
+        }
         
         let expr = Expr::CellRef("B1".to_string());
-        assert_eq!(evaluator.evaluate(&expr).unwrap(), 20.0);
+        match evaluator.evaluate(&expr).unwrap() {
+            Value::Number(n) => assert_eq!(n, 20.0),
+            _ => panic!("Expected number"),
+        }
+    }
+
+    #[test]
+    fn test_expression_evaluator_string_cells() {
+        let mut sheet = Spreadsheet::default();
+        sheet.set_cell(0, 0, CellData { value: "Hello".to_string(), formula: None });
+        sheet.set_cell(0, 1, CellData { value: "World".to_string(), formula: None });
+        sheet.set_cell(0, 2, CellData { value: "123".to_string(), formula: None }); // Number as string
+        
+        let registry = FunctionRegistry::new();
+        let evaluator = ExpressionEvaluator::new(&sheet, &registry);
+        
+        // String cell reference
+        let expr = Expr::CellRef("A1".to_string());
+        match evaluator.evaluate(&expr).unwrap() {
+            Value::String(s) => assert_eq!(s, "Hello"),
+            _ => panic!("Expected string"),
+        }
+        
+        // Numeric string cell reference  
+        let expr = Expr::CellRef("C1".to_string());
+        match evaluator.evaluate(&expr).unwrap() {
+            Value::Number(n) => assert_eq!(n, 123.0),
+            _ => panic!("Expected number"),
+        }
     }
 
     #[test]
@@ -1170,14 +1519,20 @@ mod tests {
             operator: BinaryOp::Add,
             right: Box::new(Expr::Number(5.0)),
         };
-        assert_eq!(evaluator.evaluate(&expr).unwrap(), 15.0);
+        match evaluator.evaluate(&expr).unwrap() {
+            Value::Number(n) => assert_eq!(n, 15.0),
+            _ => panic!("Expected number"),
+        }
         
         let expr = Expr::Binary {
             left: Box::new(Expr::CellRef("A1".to_string())),
             operator: BinaryOp::Multiply,
             right: Box::new(Expr::CellRef("B1".to_string())),
         };
-        assert_eq!(evaluator.evaluate(&expr).unwrap(), 200.0); // 10 * 20
+        match evaluator.evaluate(&expr).unwrap() {
+            Value::Number(n) => assert_eq!(n, 200.0), // 10 * 20
+            _ => panic!("Expected number"),
+        }
     }
 
     #[test]
@@ -1190,14 +1545,20 @@ mod tests {
             operator: UnaryOp::Minus,
             operand: Box::new(Expr::Number(5.0)),
         };
-        assert_eq!(evaluator.evaluate(&expr).unwrap(), -5.0);
+        match evaluator.evaluate(&expr).unwrap() {
+            Value::Number(n) => assert_eq!(n, -5.0),
+            _ => panic!("Expected number"),
+        }
         
         // NOT is now a function, not a unary operator
         let expr = Expr::FunctionCall {
             name: "NOT".to_string(),
             args: vec![Expr::Number(0.0)],
         };
-        assert_eq!(evaluator.evaluate(&expr).unwrap(), 1.0);
+        match evaluator.evaluate(&expr).unwrap() {
+            Value::Number(n) => assert_eq!(n, 1.0),
+            _ => panic!("Expected number"),
+        }
     }
 
     #[test]
@@ -1213,7 +1574,10 @@ mod tests {
                 Expr::CellRef("B1".to_string()),
             ],
         };
-        assert_eq!(evaluator.evaluate(&expr).unwrap(), 30.0); // 10 + 20
+        match evaluator.evaluate(&expr).unwrap() {
+            Value::Number(n) => assert_eq!(n, 30.0),
+            _ => panic!("Expected number"),
+        }
         
         let expr = Expr::FunctionCall {
             name: "IF".to_string(),
@@ -1223,7 +1587,134 @@ mod tests {
                 Expr::Number(200.0),
             ],
         };
-        assert_eq!(evaluator.evaluate(&expr).unwrap(), 100.0);
+        match evaluator.evaluate(&expr).unwrap() {
+            Value::Number(n) => assert_eq!(n, 100.0),
+            _ => panic!("Expected number"),
+        }
+    }
+
+    #[test]
+    fn test_expression_evaluator_string_functions() {
+        let sheet = create_test_spreadsheet();
+        let registry = FunctionRegistry::new();
+        let evaluator = ExpressionEvaluator::new(&sheet, &registry);
+        
+        // Test CONCAT function
+        let expr = Expr::FunctionCall {
+            name: "CONCAT".to_string(),
+            args: vec![
+                Expr::String("Hello".to_string()),
+                Expr::String(" ".to_string()),
+                Expr::String("World".to_string()),
+            ],
+        };
+        match evaluator.evaluate(&expr).unwrap() {
+            Value::String(s) => assert_eq!(s, "Hello World"),
+            _ => panic!("Expected string"),
+        }
+        
+        // Test LEN function
+        let expr = Expr::FunctionCall {
+            name: "LEN".to_string(),
+            args: vec![Expr::String("Hello".to_string())],
+        };
+        match evaluator.evaluate(&expr).unwrap() {
+            Value::Number(n) => assert_eq!(n, 5.0),
+            _ => panic!("Expected number"),
+        }
+        
+        // Test UPPER function
+        let expr = Expr::FunctionCall {
+            name: "UPPER".to_string(),
+            args: vec![Expr::String("hello".to_string())],
+        };
+        match evaluator.evaluate(&expr).unwrap() {
+            Value::String(s) => assert_eq!(s, "HELLO"),
+            _ => panic!("Expected string"),
+        }
+        
+        // Test LEFT function
+        let expr = Expr::FunctionCall {
+            name: "LEFT".to_string(),
+            args: vec![
+                Expr::String("Hello World".to_string()),
+                Expr::Number(5.0),
+            ],
+        };
+        match evaluator.evaluate(&expr).unwrap() {
+            Value::String(s) => assert_eq!(s, "Hello"),
+            _ => panic!("Expected string"),
+        }
+        
+        // Test FIND function
+        let expr = Expr::FunctionCall {
+            name: "FIND".to_string(),
+            args: vec![
+                Expr::String("lo".to_string()),
+                Expr::String("Hello".to_string()),
+            ],
+        };
+        match evaluator.evaluate(&expr).unwrap() {
+            Value::Number(n) => assert_eq!(n, 3.0), // 0-based indexing - "lo" found at position 3
+            _ => panic!("Expected number"),
+        }
+    }
+
+    #[test]
+    fn test_expression_evaluator_string_concatenation() {
+        let sheet = create_test_spreadsheet();
+        let registry = FunctionRegistry::new();
+        let evaluator = ExpressionEvaluator::new(&sheet, &registry);
+        
+        let expr = Expr::Binary {
+            left: Box::new(Expr::String("Hello".to_string())),
+            operator: BinaryOp::Concatenate,
+            right: Box::new(Expr::String(" World".to_string())),
+        };
+        match evaluator.evaluate(&expr).unwrap() {
+            Value::String(s) => assert_eq!(s, "Hello World"),
+            _ => panic!("Expected string"),
+        }
+        
+        // Test mixed concatenation
+        let expr = Expr::Binary {
+            left: Box::new(Expr::String("Number: ".to_string())),
+            operator: BinaryOp::Concatenate,
+            right: Box::new(Expr::Number(42.0)),
+        };
+        match evaluator.evaluate(&expr).unwrap() {
+            Value::String(s) => assert_eq!(s, "Number: 42"),
+            _ => panic!("Expected string"),
+        }
+    }
+
+    #[test]
+    fn test_expression_evaluator_string_equality() {
+        let sheet = create_test_spreadsheet();
+        let registry = FunctionRegistry::new();
+        let evaluator = ExpressionEvaluator::new(&sheet, &registry);
+        
+        // String equality
+        let expr = Expr::Binary {
+            left: Box::new(Expr::String("Hello".to_string())),
+            operator: BinaryOp::Equal,
+            right: Box::new(Expr::String("Hello".to_string())),
+        };
+        match evaluator.evaluate(&expr).unwrap() {
+            Value::Number(n) => assert_eq!(n, 1.0),
+            _ => panic!("Expected number"),
+        }
+        
+        // String inequality
+        let expr = Expr::Binary {
+            left: Box::new(Expr::String("Hello".to_string())),
+            operator: BinaryOp::NotEqual,
+            right: Box::new(Expr::String("World".to_string())),
+        };
+        match evaluator.evaluate(&expr).unwrap() {
+            Value::Number(n) => assert_eq!(n, 1.0),
+            _ => panic!("Expected number"),
+        }
     }
 
     #[test]
@@ -1236,13 +1727,19 @@ mod tests {
             name: "SUM".to_string(),
             args: vec![Expr::Range("A1".to_string(), "B1".to_string())],
         };
-        assert_eq!(evaluator.evaluate(&expr).unwrap(), 30.0); // 10 + 20
+        match evaluator.evaluate(&expr).unwrap() {
+            Value::Number(n) => assert_eq!(n, 30.0),
+            _ => panic!("Expected number"),
+        }
         
         let expr = Expr::FunctionCall {
             name: "AVERAGE".to_string(),
             args: vec![Expr::Range("A1".to_string(), "C1".to_string())],
         };
-        assert_eq!(evaluator.evaluate(&expr).unwrap(), 20.0); // (10 + 20 + 30) / 3
+        match evaluator.evaluate(&expr).unwrap() {
+            Value::Number(n) => assert_eq!(n, 20.0),
+            _ => panic!("Expected number"),
+        }
     }
 
     #[test]
@@ -1266,7 +1763,7 @@ mod tests {
         // Test registering custom function
         registry.register_function("DOUBLE", |args| {
             if args.len() == 1 {
-                Ok(args[0] * 2.0)
+                Ok(Value::Number(args[0].to_number() * 2.0))
             } else {
                 Err("DOUBLE requires exactly 1 argument".to_string())
             }
@@ -1274,7 +1771,10 @@ mod tests {
         
         assert!(registry.get_function("DOUBLE").is_some());
         let double_func = registry.get_function("DOUBLE").unwrap();
-        assert_eq!(double_func(&[5.0]).unwrap(), 10.0);
+        match double_func(&[Value::Number(5.0)]).unwrap() {
+            Value::Number(n) => assert_eq!(n, 10.0),
+            _ => panic!("Expected number"),
+        }
     }
 
     #[test]
@@ -1289,19 +1789,28 @@ mod tests {
         let result = evaluator.evaluate(&ast).unwrap();
         
         // SUM(A1:B1) = 10 + 20 = 30, which is > 25, so we take MAX(A1:C1) = 30
-        assert_eq!(result, 30.0);
+        match result {
+            Value::Number(n) => assert_eq!(n, 30.0),
+            _ => panic!("Expected number"),
+        }
         
         // Test arithmetic with functions: SUM(A1:B1) + 5
         let mut parser = Parser::new("SUM(A1:B1) + 5").unwrap();
         let ast = parser.parse().unwrap();
         let result = evaluator.evaluate(&ast).unwrap();
-        assert_eq!(result, 35.0); // (10 + 20) + 5
+        match result {
+            Value::Number(n) => assert_eq!(n, 35.0),
+            _ => panic!("Expected number"),
+        }
         
         // Test power operations: 2 ** 3 + 1
         let mut parser = Parser::new("2 ** 3 + 1").unwrap();
         let ast = parser.parse().unwrap();
         let result = evaluator.evaluate(&ast).unwrap();
-        assert_eq!(result, 9.0); // 8 + 1
+        match result {
+            Value::Number(n) => assert_eq!(n, 9.0),
+            _ => panic!("Expected number"),
+        }
     }
 
     #[test]
@@ -1331,9 +1840,70 @@ mod tests {
     }
 
     #[test]
+    fn test_lexer_strings() {
+        let mut lexer = Lexer::new("\"Hello World\"");
+        assert_eq!(lexer.next_token().unwrap(), Token::String("Hello World".to_string()));
+        assert_eq!(lexer.next_token().unwrap(), Token::Eof);
+        
+        let mut lexer = Lexer::new("\"\"");
+        assert_eq!(lexer.next_token().unwrap(), Token::String("".to_string()));
+        assert_eq!(lexer.next_token().unwrap(), Token::Eof);
+        
+        let mut lexer = Lexer::new("\"Quote\"\"Test\"");
+        assert_eq!(lexer.next_token().unwrap(), Token::String("Quote\"Test".to_string()));
+        assert_eq!(lexer.next_token().unwrap(), Token::Eof);
+    }
+
+    #[test]
+    fn test_lexer_ampersand() {
+        let mut lexer = Lexer::new("&");
+        assert_eq!(lexer.next_token().unwrap(), Token::Ampersand);
+        assert_eq!(lexer.next_token().unwrap(), Token::Eof);
+    }
+
+    #[test]
     fn test_lexer_error_handling() {
         let mut lexer = Lexer::new("@#$");
         assert!(lexer.next_token().is_err());
+    }
+
+    #[test]
+    fn test_parser_string_literals() {
+        let mut parser = Parser::new("\"Hello\"").unwrap();
+        let expr = parser.parse().unwrap();
+        assert_eq!(expr, Expr::String("Hello".to_string()));
+        
+        let mut parser = Parser::new("\"\"").unwrap();
+        let expr = parser.parse().unwrap();
+        assert_eq!(expr, Expr::String("".to_string()));
+    }
+
+    #[test]
+    fn test_parser_string_concatenation() {
+        let mut parser = Parser::new("\"Hello\" & \"World\"").unwrap();
+        let expr = parser.parse().unwrap();
+        match expr {
+            Expr::Binary { left, operator, right } => {
+                assert!(matches!(left.as_ref(), &Expr::String(ref s) if s == "Hello"));
+                assert_eq!(operator, BinaryOp::Concatenate);
+                assert!(matches!(right.as_ref(), &Expr::String(ref s) if s == "World"));
+            }
+            _ => panic!("Expected binary expression"),
+        }
+    }
+
+    #[test]
+    fn test_parser_mixed_concatenation() {
+        let mut parser = Parser::new("\"Number: \" & 42").unwrap();
+        let expr = parser.parse().unwrap();
+        match expr {
+            Expr::Binary { left, operator, right } => {
+                assert!(matches!(left.as_ref(), &Expr::String(ref s) if s == "Number: "));
+                assert_eq!(operator, BinaryOp::Concatenate);
+                assert!(matches!(right.as_ref(), &Expr::Number(42.0)));
+            }
+            _ => panic!("Expected binary expression"),
+        }
     }
 
     #[test]
@@ -1351,5 +1921,193 @@ mod tests {
         // Test invalid function call
         let mut parser = Parser::new("SUM(").unwrap();
         assert!(parser.parse().is_err());
+        
+        // Test unterminated string
+        let result = Parser::new("\"Hello");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parser_complex_nested_functions() {
+        // Test parsing of deeply nested function calls
+        let mut parser = Parser::new("UPPER(CONCAT(\"Price: \", TRIM(GET(\"https://example.com\"))))").unwrap();
+        let expr = parser.parse().unwrap();
+        
+        // Verify the AST structure for nested functions
+        match expr {
+            Expr::FunctionCall { name, args } => {
+                assert_eq!(name, "UPPER");
+                assert_eq!(args.len(), 1);
+                
+                // Check that the inner argument is a CONCAT function
+                match &args[0] {
+                    Expr::FunctionCall { name: inner_name, args: inner_args } => {
+                        assert_eq!(inner_name, "CONCAT");
+                        assert_eq!(inner_args.len(), 2);
+                        
+                        // First arg should be string literal "Price: "
+                        assert!(matches!(inner_args[0], Expr::String(ref s) if s == "Price: "));
+                        
+                        // Second arg should be TRIM function
+                        match &inner_args[1] {
+                            Expr::FunctionCall { name: trim_name, args: trim_args } => {
+                                assert_eq!(trim_name, "TRIM");
+                                assert_eq!(trim_args.len(), 1);
+                                
+                                // TRIM's arg should be GET function
+                                match &trim_args[0] {
+                                    Expr::FunctionCall { name: get_name, args: get_args } => {
+                                        assert_eq!(get_name, "GET");
+                                        assert_eq!(get_args.len(), 1);
+                                        assert!(matches!(get_args[0], Expr::String(ref s) if s == "https://example.com"));
+                                    }
+                                    _ => panic!("Expected GET function call"),
+                                }
+                            }
+                            _ => panic!("Expected TRIM function call"),
+                        }
+                    }
+                    _ => panic!("Expected CONCAT function call"),
+                }
+            }
+            _ => panic!("Expected function call at top level"),
+        }
+    }
+
+    #[test]
+    fn test_parser_multiple_nested_levels() {
+        // Test 5-level nesting: IF(LEN(TRIM(GET(url))) > 5, LEFT(UPPER(GET(url)), 20), "Short")
+        let mut parser = Parser::new("IF(LEN(TRIM(GET(\"https://api.com\")))>5, LEFT(UPPER(GET(\"https://api.com\")), 20), \"Short\")").unwrap();
+        let expr = parser.parse().unwrap();
+        
+        // Verify this parses correctly as an IF function
+        match expr {
+            Expr::FunctionCall { name, args } => {
+                assert_eq!(name, "IF");
+                assert_eq!(args.len(), 3);
+                
+                // First argument should be a comparison (LEN(...) > 5)
+                match &args[0] {
+                    Expr::Binary { left, operator, right } => {
+                        assert_eq!(*operator, BinaryOp::Greater);
+                        assert!(matches!(right.as_ref(), &Expr::Number(5.0)));
+                        
+                        // Left side should be LEN(TRIM(GET(...)))
+                        match left.as_ref() {
+                            Expr::FunctionCall { name: len_name, args: len_args } => {
+                                assert_eq!(len_name, "LEN");
+                                assert_eq!(len_args.len(), 1);
+                                
+                                // LEN's arg should be TRIM(GET(...))
+                                match &len_args[0] {
+                                    Expr::FunctionCall { name: trim_name, args: trim_args } => {
+                                        assert_eq!(trim_name, "TRIM");
+                                        assert_eq!(trim_args.len(), 1);
+                                        
+                                        // TRIM's arg should be GET(...)
+                                        match &trim_args[0] {
+                                            Expr::FunctionCall { name: get_name, .. } => {
+                                                assert_eq!(get_name, "GET");
+                                            }
+                                            _ => panic!("Expected GET function"),
+                                        }
+                                    }
+                                    _ => panic!("Expected TRIM function"),
+                                }
+                            }
+                            _ => panic!("Expected LEN function"),
+                        }
+                    }
+                    _ => panic!("Expected comparison expression"),
+                }
+                
+                // Second argument should be LEFT(UPPER(GET(...)), 20)
+                match &args[1] {
+                    Expr::FunctionCall { name: left_name, args: left_args } => {
+                        assert_eq!(left_name, "LEFT");
+                        assert_eq!(left_args.len(), 2);
+                        
+                        // First arg should be UPPER(GET(...))
+                        match &left_args[0] {
+                            Expr::FunctionCall { name: upper_name, args: upper_args } => {
+                                assert_eq!(upper_name, "UPPER");
+                                assert_eq!(upper_args.len(), 1);
+                                
+                                // UPPER's arg should be GET(...)
+                                match &upper_args[0] {
+                                    Expr::FunctionCall { name: get_name, .. } => {
+                                        assert_eq!(get_name, "GET");
+                                    }
+                                    _ => panic!("Expected GET function"),
+                                }
+                            }
+                            _ => panic!("Expected UPPER function"),
+                        }
+                        
+                        // Second arg should be number 20
+                        assert!(matches!(left_args[1], Expr::Number(20.0)));
+                    }
+                    _ => panic!("Expected LEFT function"),
+                }
+                
+                // Third argument should be string "Short"
+                assert!(matches!(args[2], Expr::String(ref s) if s == "Short"));
+            }
+            _ => panic!("Expected IF function call"),
+        }
+    }
+
+    #[test]
+    fn test_parser_mixed_operators_and_functions() {
+        // Test expression mixing operators and functions: GET(A1) & " - " & UPPER(GET(B1))
+        let mut parser = Parser::new("GET(A1) & \" - \" & UPPER(GET(B1))").unwrap();
+        let expr = parser.parse().unwrap();
+        
+        // Should parse as nested concatenation operations
+        match expr {
+            Expr::Binary { left, operator: op1, right } => {
+                assert_eq!(op1, BinaryOp::Concatenate);
+                
+                // Left side should be another concatenation: GET(A1) & " - "
+                match left.as_ref() {
+                    Expr::Binary { left: inner_left, operator: op2, right: inner_right } => {
+                        assert_eq!(*op2, BinaryOp::Concatenate);
+                        
+                        // Inner left should be GET(A1)
+                        match inner_left.as_ref() {
+                            Expr::FunctionCall { name, args } => {
+                                assert_eq!(name, "GET");
+                                assert_eq!(args.len(), 1);
+                                assert!(matches!(args[0], Expr::CellRef(ref s) if s == "A1"));
+                            }
+                            _ => panic!("Expected GET function call"),
+                        }
+                        
+                        // Inner right should be " - "
+                        assert!(matches!(inner_right.as_ref(), &Expr::String(ref s) if s == " - "));
+                    }
+                    _ => panic!("Expected concatenation expression"),
+                }
+                
+                // Right side should be UPPER(GET(B1))
+                match right.as_ref() {
+                    Expr::FunctionCall { name: upper_name, args: upper_args } => {
+                        assert_eq!(upper_name, "UPPER");
+                        assert_eq!(upper_args.len(), 1);
+                        
+                        match &upper_args[0] {
+                            Expr::FunctionCall { name: get_name, args: get_args } => {
+                                assert_eq!(get_name, "GET");
+                                assert_eq!(get_args.len(), 1);
+                                assert!(matches!(get_args[0], Expr::CellRef(ref s) if s == "B1"));
+                            }
+                            _ => panic!("Expected GET function call"),
+                        }
+                    }
+                    _ => panic!("Expected UPPER function call"),
+                }
+            }
+            _ => panic!("Expected concatenation expression at top level"),
+        }
     }
 }

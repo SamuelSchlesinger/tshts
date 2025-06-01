@@ -170,7 +170,9 @@ fn get_help_text() -> String {
 • All formulas start with = (equals sign)
 • Cell references use column letter + row number (A1, B2, Z99, AA1, etc.)
 • Numbers can be integers or decimals (42, 3.14, -5.5)
+• Strings use double quotes ("Hello World", "", "Quote""Test")
 • Case insensitive for functions and cell references
+• Supports both numbers and strings with automatic type conversion
 
 === ARITHMETIC OPERATORS ===
 +       Addition                    =5+3 → 8, =A1+B1
@@ -181,40 +183,90 @@ fn get_help_text() -> String {
 ^       Power (same as **)          =3^2 → 9, =A1^B1
 %       Modulo (remainder)          =10%3 → 1, =A1%B1
 
+=== STRING OPERATORS ===
+&       Concatenation               ="Hello" & " " & "World" → Hello World
+                                   ="Number: " & 42 → Number: 42
+""      String literals             ="Hello World", =""
+                                   Use "" for quotes: "Quote""Test" → Quote"Test
+
 === COMPARISON OPERATORS ===
-<       Less than                   =A1<B1 → 1 or 0
->       Greater than                =A1>B1 → 1 or 0
-<=      Less than or equal          =A1<=B1 → 1 or 0
->=      Greater than or equal       =A1>=B1 → 1 or 0
-<>      Not equal                   =A1<>B1 → 1 or 0
+<       Less than                   =A1<B1 → 1 or 0 (works with numbers only)
+>       Greater than                =A1>B1 → 1 or 0 (works with numbers only)
+<=      Less than or equal          =A1<=B1 → 1 or 0 (works with numbers only)
+>=      Greater than or equal       =A1>=B1 → 1 or 0 (works with numbers only)
+=       Equal                       =A1=B1 → 1 or 0 (works with strings and numbers)
+<>      Not equal                   =A1<>B1 → 1 or 0 (works with strings and numbers)
 
 Note: Comparisons return 1 for true, 0 for false
 
-=== BASIC FUNCTIONS ===
+=== NUMERIC FUNCTIONS ===
 SUM(...)        Sum of values           =SUM(A1,B1,C1) or =SUM(A1:C1)
 AVERAGE(...)    Average of values       =AVERAGE(A1:A10)
 MIN(...)        Minimum value           =MIN(A1,B1,C1,5)
 MAX(...)        Maximum value           =MAX(A1:C3)
+ABS(value)      Absolute value          =ABS(-5) → 5
+SQRT(value)     Square root             =SQRT(16) → 4
+ROUND(num)      Round to integer        =ROUND(3.14) → 3
+ROUND(num,places) Round to decimals     =ROUND(3.14159,2) → 3.14
+
+=== STRING FUNCTIONS ===
+LEN(text)       String length           =LEN("Hello") → 5
+UPPER(text)     Convert to uppercase    =UPPER("hello") → HELLO
+LOWER(text)     Convert to lowercase    =LOWER("WORLD") → world
+TRIM(text)      Remove leading/trailing spaces  =TRIM("  hi  ") → hi
+LEFT(text,num)  First N characters      =LEFT("Hello World",5) → Hello
+RIGHT(text,num) Last N characters       =RIGHT("Hello World",5) → World
+MID(text,start,len) Substring           =MID("Hello World",6,5) → World
+FIND(search,text) Find position         =FIND("lo","Hello") → 3
+FIND(search,text,start) Find from pos   =FIND("l","Hello",2) → 3
+CONCAT(...)     Concatenate values      =CONCAT("A","B","C") → ABC
+
+=== WEB FUNCTIONS ===
+GET(url)        Fetch content from URL  =GET("https://api.example.com/data")
+                                       =GET("https://raw.githubusercontent.com/...")
+
+Note: String functions use 0-based indexing (positions start at 0)
 
 === LOGICAL FUNCTIONS ===
-IF(cond,true,false) Conditional         =IF(A1>5,100,0)
+IF(cond,true,false) Conditional         =IF(A1>5,"High","Low")
+                                       =IF(A1="Hello","Found","Not Found")
 AND(...)        All values true         =AND(A1>0,B1<10)
-OR(...)         Any value true          =OR(A1=0,B1=0)
+OR(...)         Any value true          =OR(A1="",A1="N/A")
 NOT(value)      Logical not             =NOT(A1>5)
 
-Note: 0 is false, anything else is true
+Note: For logical tests: 0 and empty strings are false, everything else is true
 
 === CELL RANGES ===
 A1:C3           Rectangle from A1 to C3
 A1:A10          Column A, rows 1-10
 B2:D2           Row 2, columns B-D
 
-=== EXAMPLES ===
+=== TYPE CONVERSION ===
+• Numbers in strings are automatically converted: "123" + 1 → 124
+• Numbers in string operations: 42 & " items" → "42 items"
+• Invalid strings become 0 in math: "hello" + 1 → 1
+• String comparisons are case-sensitive: "Hello" <> "hello" → 1
+
+=== FORMULA EXAMPLES ===
+
+Numeric Examples:
 =A1+B1*2        Math with precedence
 =IF(A1>0,A1*2,0) Conditional calculation
 =SUM(A1:A5)/5   Same as AVERAGE(A1:A5)
 =MAX(A1:C3)     Largest in 3x3 range
 =A1**2+B1**2    Pythagorean calculation
+
+String Examples:
+=UPPER(A1) & " - " & LOWER(B1)     Combined formatted text
+=IF(LEN(A1)>0,A1,"Empty")          Check for non-empty strings
+=LEFT(A1,FIND(" ",A1)-1)           Extract first word
+="Hello " & A1 & ", you scored " & B1 & "%"   Dynamic messages
+=IF(AND(LEN(A1)>3,A1<>""),"Valid","Invalid")  Validate input
+
+Mixed Type Examples:
+="Total: " & SUM(A1:A10) & " items"   Numeric result with description
+=IF(AVERAGE(A1:A10)>50,"PASS","FAIL") Grade based on average
+=CONCAT("Row ",ROW()," Value: ",A1)    Dynamic labels
 
 === FILE OPERATIONS ===
 Ctrl+S          Save spreadsheet to file
@@ -239,6 +291,11 @@ q               Quit application
 Page Up/Down    Scroll help text up/down 5 lines
 Home            Jump to top of help text
 Esc/F1/?/q      Close this help window
+
+=== ERROR HANDLING ===
+#ERROR          Displayed when formula evaluation fails
+                Common causes: division by zero, invalid functions,
+                circular references, invalid FIND operations
 
 Note: Your spreadsheet is automatically saved when you use Ctrl+S.
 Use Ctrl+O to load the saved spreadsheet on next session."#.to_string()

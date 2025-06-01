@@ -31,10 +31,14 @@ cargo run --release
 ## ✨ Key Features
 
 ### 🧮 Powerful Formula Engine
+- **Multi-Type System**: Full support for both numbers and strings
 - **Arithmetic Operations**: `+`, `-`, `*`, `/`, `**` (power), `%` (modulo)
-- **Comparison Operators**: `<`, `>`, `<=`, `>=`, `=`, `<>` (not equal)
-- **Essential Functions**: `SUM`, `AVERAGE`, `MIN`, `MAX`, `IF`, `AND`, `OR`, `NOT`, `ABS`, `SQRT`, `ROUND`
-- **Function-Based Logic**: All logical operations use clean function syntax
+- **String Operations**: `&` (concatenation), string literals with `"quotes"`
+- **Comparison Operators**: `<`, `>`, `<=`, `>=`, `=`, `<>` (works with strings and numbers)
+- **Numeric Functions**: `SUM`, `AVERAGE`, `MIN`, `MAX`, `ABS`, `SQRT`, `ROUND`
+- **String Functions**: `CONCAT`, `LEN`, `UPPER`, `LOWER`, `TRIM`, `LEFT`, `RIGHT`, `MID`, `FIND`
+- **Web Functions**: `GET` (fetch content from URLs)
+- **Logical Functions**: `IF`, `AND`, `OR`, `NOT` (work with strings and numbers)
 - **Cell References**: Standard notation (A1, B2, AA123, etc.)
 - **Range Support**: Use ranges like `A1:C3` in functions
 - **Circular Reference Detection**: AST-based analysis prevents infinite loops
@@ -68,7 +72,8 @@ cargo run --release
 
 TSHTS already supports the core functionality needed for most spreadsheet tasks:
 
-- ✅ Full formula evaluation with 15+ operators and functions
+- ✅ Multi-type formula evaluation (numbers and strings) with 25+ operators and functions
+- ✅ String manipulation and text processing capabilities
 - ✅ Cell references and range operations
 - ✅ File persistence with JSON format
 - ✅ Responsive terminal UI with keyboard shortcuts
@@ -92,42 +97,143 @@ We're actively developing TSHTS with these upcoming features:
 - New formula functions
 - Platform-specific enhancements
 
-## 📖 Formula Reference
+## 📖 Comprehensive Formula Reference
 
-### Basic Arithmetic
+TSHTS supports a powerful multi-type formula system that handles both numbers and strings seamlessly.
+
+### 🔢 Numeric Operations
+
+#### Basic Arithmetic
 ```
-=2+3          → 8
+=2+3          → 5
+=10-4         → 6
 =A1*B1        → Multiplies values in A1 and B1
+=15/3         → 5
 =2**3         → 8 (2 to the power of 3)
 =10%3         → 1 (10 modulo 3)
 ```
 
-### Cell References
-```
-=A1           → Value from cell A1
-=A1+B1        → Sum of A1 and B1
-=SUM(A1:A10)  → Sum of range A1 through A10
-=AVERAGE(B1:B5) → Average of B1 through B5
-```
-
-### Functions
+#### Numeric Functions
 ```
 =SUM(A1,B1,C1)        → Sum of individual cells
+=SUM(A1:A10)          → Sum of range A1 through A10
 =AVERAGE(A1:A10)      → Average of range
 =MIN(A1:C3)           → Minimum value in range
 =MAX(A1:C3)           → Maximum value in range
-=IF(A1>10,1,0)        → Conditional logic
-=AND(A1>0,B1<10)      → Logical AND
-=OR(A1=0,B1=0)        → Logical OR
-=NOT(A1>5)            → Logical NOT
+=ABS(-5)              → 5 (absolute value)
+=SQRT(16)             → 4 (square root)
+=ROUND(3.14159)       → 3 (round to integer)
+=ROUND(3.14159, 2)    → 3.14 (round to 2 decimal places)
 ```
 
-### Comparisons
+### 🔤 String Operations
+
+#### String Literals and Concatenation
 ```
-=A1<B1        → 1 if A1 less than B1, 0 otherwise
-=A1>=B1       → 1 if A1 greater than or equal to B1
-=A1<>B1       → 1 if A1 not equal to B1
+="Hello World"        → Hello World
+=""                   → (empty string)
+="Hello" & " " & "World"  → Hello World
+="Number: " & 42      → Number: 42
+="Result: " & (2+3)   → Result: 5
 ```
+
+#### String Functions
+```
+=LEN("Hello")         → 5 (string length)
+=UPPER("hello")       → HELLO (convert to uppercase)
+=LOWER("WORLD")       → world (convert to lowercase)
+=TRIM("  spaces  ")   → spaces (remove leading/trailing spaces)
+```
+
+#### String Extraction (0-based indexing)
+```
+=LEFT("Hello World", 5)    → Hello (first 5 characters)
+=RIGHT("Hello World", 5)   → World (last 5 characters)
+=MID("Hello World", 6, 5)  → World (5 chars starting at position 6)
+=FIND("lo", "Hello")       → 3 (position of "lo" in "Hello")
+=FIND("World", "Hello World")  → 6 (position of "World")
+```
+
+#### Advanced String Operations
+```
+=CONCAT("A", "B", "C")      → ABC (concatenate multiple values)
+=CONCAT("Number: ", 123)    → Number: 123
+=FIND("text", A1, 3)        → Find "text" in A1 starting from position 3
+```
+
+### 🌐 Web Functions
+```
+=GET("https://api.example.com/data")     → Fetch raw content from API
+=GET("https://jsonplaceholder.typicode.com/posts/1") → Get JSON data
+=GET("https://raw.githubusercontent.com/user/repo/main/data.csv") → Fetch CSV
+=LEN(GET("https://example.com"))         → Get length of web content
+=UPPER(GET("https://api.service.com"))   → Convert fetched content to uppercase
+```
+
+### 🔍 Comparisons (Work with Numbers and Strings)
+```
+=5<10             → 1 (true)
+=A1>=B1           → 1 if A1 ≥ B1, 0 otherwise
+="Hello"="Hello"  → 1 (string equality)
+="Hello"<>"World" → 1 (string inequality)
+=A1<>B1           → 1 if values are different
+```
+
+### 🧠 Logical Functions
+```
+=IF(A1>10, "High", "Low")     → Conditional with string results
+=IF(A1="Hello", "Found", "Not Found")  → String condition
+=AND(A1>0, B1<10)             → 1 if both conditions true
+=OR(A1=0, B1=0)               → 1 if either condition true
+=NOT(A1>5)                    → 1 if A1 ≤ 5
+```
+
+### 📊 Cell References and Ranges
+```
+=A1               → Value from cell A1 (auto-detects number vs string)
+=A1+B1            → Sum if numeric, concatenation if mixed types
+=SUM(A1:A10)      → Sum of range A1 through A10
+=AVERAGE(B1:B5)   → Average of range B1 through B5
+=CONCAT(A1:A3)    → Concatenate all values in range A1:A3
+```
+
+### 🔄 Type Conversion
+TSHTS automatically handles type conversion:
+- **Numeric operations**: Strings are converted to numbers (empty/invalid = 0)
+- **String operations**: Numbers are converted to strings
+- **Comparisons**: Like types compared directly, mixed types compared as strings
+- **Cell values**: Auto-detected based on content
+
+### 📝 Formula Examples
+
+#### Data Processing
+```
+=UPPER(A1) & " - " & LOWER(B1)           → Combine formatted strings
+=IF(LEN(A1)>0, A1, "Empty")              → Check for non-empty strings
+=LEFT(A1, FIND(" ", A1)-1)               → Extract first word
+=MID(A1, FIND(" ", A1)+1, LEN(A1))      → Extract everything after first space
+```
+
+#### Data Validation
+```
+=IF(AND(LEN(A1)>3, A1<>""), "Valid", "Invalid")  → Validate string length
+=IF(OR(A1="", A1="N/A"), "Missing", A1)          → Handle missing data
+```
+
+#### Complex Calculations
+```
+=SUM(A1:A10) & " total items"            → Numeric result with description
+=IF(AVERAGE(A1:A10)>50, "PASS", "FAIL")  → Grade based on average
+=CONCAT("Hello ", A1, ", you scored ", B1, "%")  → Dynamic messages
+```
+
+### ⚠️ Important Notes
+
+- **String Indexing**: All string functions use 0-based indexing (FIND, MID, etc.)
+- **Case Sensitivity**: String comparisons are case-sensitive
+- **Error Handling**: Invalid operations return `#ERROR`
+- **Empty Strings**: `""` is considered different from empty cells
+- **Quotes in Strings**: Use double quotes to escape: `"Quote""Test"` → `Quote"Test`
 
 ## ⌨️ Keyboard Shortcuts
 
