@@ -691,75 +691,231 @@ impl App {
         }
     }
 
-    /// Performs autofill operation on the current selection.
+    /// Performs autofill operation on the current selection with pattern recognition.
     ///
-    /// Copies the formula from the top-left cell of the selection to all other
-    /// cells in the selection, adjusting cell references relatively.
+    /// Analyzes non-empty cells in the selection to detect patterns (arithmetic sequences,
+    /// text with numbers, days/months, etc.) and fills empty cells with the continuation
+    /// of the detected pattern. For cells containing formulas, adjusts cell references
+    /// relatively (original behavior).
+    ///
+    /// Fill direction is determined by selection shape:
+    /// - Tall selection (rows > cols): Fill down (column-wise pattern)
+    /// - Wide selection (cols > rows): Fill right (row-wise pattern)
+    /// - Square: Default to fill down
     pub fn autofill_selection(&mut self) {
         if let Some(((start_row, start_col), (end_row, end_col))) = self.get_selection_range() {
-            // Get the source cell (top-left of selection)
-            let source_cell = self.spreadsheet.get_cell(start_row, start_col);
-            
-            // Only proceed if the source cell has content
-            if source_cell.value.is_empty() && source_cell.formula.is_none() {
-                return;
-            }
+            let num_rows = end_row - start_row + 1;
+            let num_cols = end_col - start_col + 1;
 
-            // Collect all the changes first to avoid borrowing conflicts
+            // Determine fill direction: true = fill down (by rows), false = fill right (by cols)
+            let fill_down = num_rows >= num_cols;
+
+            // Collect cells along the fill direction
+            // For fill_down: iterate through rows for each column
+            // For fill_right: iterate through columns for each row
             let mut changes = Vec::new();
-            
-            // Fill each cell in the selection
-            for row in start_row..=end_row {
+            let mut pattern_desc = String::new();
+
+            if fill_down {
+                // Process each column independently
                 for col in start_col..=end_col {
-                    // Skip the source cell
-                    if row == start_row && col == start_col {
-                        continue;
+                    let (filled, desc) = self.autofill_column(start_row, end_row, col);
+                    changes.extend(filled);
+                    if pattern_desc.is_empty() && !desc.is_empty() {
+                        pattern_desc = desc;
                     }
-                    
-                    let row_offset = row as i32 - start_row as i32;
-                    let col_offset = col as i32 - start_col as i32;
-                    
-                    let new_cell_data = if let Some(ref formula) = source_cell.formula {
-                        use crate::domain::services::FormulaEvaluator;
-                        let evaluator = FormulaEvaluator::new(&self.spreadsheet);
-                        
-                        // Adjust the formula with relative references
-                        let adjusted_formula = evaluator.adjust_formula_references(formula, row_offset, col_offset);
-                        
-                        // Check for circular references
-                        if evaluator.would_create_circular_reference(&adjusted_formula, (row, col)) {
-                            continue; // Skip this cell to avoid circular reference
-                        }
-                        
-                        let new_value = evaluator.evaluate_formula(&adjusted_formula);
-                        CellData {
-                            value: new_value,
-                            formula: Some(adjusted_formula),
-                        }
-                    } else {
-                        // Simple value copy (no formula)
-                        CellData {
-                            value: source_cell.value.clone(),
-                            formula: None,
-                        }
-                    };
-                    
-                    changes.push((row, col, new_cell_data));
+                }
+            } else {
+                // Process each row independently
+                for row in start_row..=end_row {
+                    let (filled, desc) = self.autofill_row(row, start_col, end_col);
+                    changes.extend(filled);
+                    if pattern_desc.is_empty() && !desc.is_empty() {
+                        pattern_desc = desc;
+                    }
                 }
             }
-            
+
             // Apply all changes
+            let num_changes = changes.len();
             for (row, col, cell_data) in changes {
                 self.set_cell_with_undo(row, col, cell_data);
             }
-            
-            self.status_message = Some(format!(
-                "Autofilled {} cells from {}{}",
-                (end_row - start_row + 1) * (end_col - start_col + 1) - 1,
-                Spreadsheet::column_label(start_col),
-                start_row + 1
-            ));
+
+            if num_changes > 0 {
+                self.status_message = Some(format!(
+                    "Autofilled {} cells using {}",
+                    num_changes,
+                    pattern_desc
+                ));
+            } else {
+                self.status_message = Some("No cells to fill".to_string());
+            }
         }
+    }
+
+    /// Autofill a single column from start_row to end_row.
+    /// Returns the changes to apply and the pattern description.
+    fn autofill_column(&self, start_row: usize, end_row: usize, col: usize) -> (Vec<(usize, usize, CellData)>, String) {
+        use crate::domain::services::{FormulaEvaluator, AutofillPattern};
+
+        let mut changes = Vec::new();
+
+        // Collect non-empty cells (pattern cells) and empty cells (target cells)
+        let mut pattern_cells: Vec<(usize, CellData)> = Vec::new();
+        let mut target_rows: Vec<usize> = Vec::new();
+
+        for row in start_row..=end_row {
+            let cell = self.spreadsheet.get_cell(row, col);
+            if !cell.value.is_empty() || cell.formula.is_some() {
+                pattern_cells.push((row, cell.clone()));
+            } else {
+                target_rows.push(row);
+            }
+        }
+
+        // If no pattern cells or no targets, nothing to do
+        if pattern_cells.is_empty() || target_rows.is_empty() {
+            return (changes, String::new());
+        }
+
+        // Check if any pattern cell has a formula - if so, use formula-based fill
+        let has_formula = pattern_cells.iter().any(|(_, cell)| cell.formula.is_some());
+
+        if has_formula {
+            // Use the first cell with a formula as source, adjust references for targets
+            let (source_row, source_cell) = pattern_cells.iter()
+                .find(|(_, cell)| cell.formula.is_some())
+                .unwrap();
+
+            let evaluator = FormulaEvaluator::new(&self.spreadsheet);
+
+            for target_row in &target_rows {
+                let row_offset = *target_row as i32 - *source_row as i32;
+
+                if let Some(ref formula) = source_cell.formula {
+                    let adjusted_formula = evaluator.adjust_formula_references(formula, row_offset, 0);
+
+                    if evaluator.would_create_circular_reference(&adjusted_formula, (*target_row, col)) {
+                        continue;
+                    }
+
+                    let new_value = evaluator.evaluate_formula(&adjusted_formula);
+                    changes.push((*target_row, col, CellData {
+                        value: new_value,
+                        formula: Some(adjusted_formula),
+                    }));
+                }
+            }
+
+            return (changes, "formula".to_string());
+        }
+
+        // Extract values from pattern cells for pattern detection
+        let values: Vec<String> = pattern_cells.iter()
+            .map(|(_, cell)| cell.value.clone())
+            .collect();
+
+        let pattern = AutofillPattern::detect(&values);
+        let pattern_desc = pattern.description();
+
+        // Generate values for target cells
+        // The pattern index for targets continues from where pattern cells left off
+        let pattern_len = pattern_cells.len();
+
+        for (i, target_row) in target_rows.iter().enumerate() {
+            let pattern_index = pattern_len + i;
+            let generated_value = pattern.generate(pattern_index);
+
+            changes.push((*target_row, col, CellData {
+                value: generated_value,
+                formula: None,
+            }));
+        }
+
+        (changes, pattern_desc)
+    }
+
+    /// Autofill a single row from start_col to end_col.
+    /// Returns the changes to apply and the pattern description.
+    fn autofill_row(&self, row: usize, start_col: usize, end_col: usize) -> (Vec<(usize, usize, CellData)>, String) {
+        use crate::domain::services::{FormulaEvaluator, AutofillPattern};
+
+        let mut changes = Vec::new();
+
+        // Collect non-empty cells (pattern cells) and empty cells (target cells)
+        let mut pattern_cells: Vec<(usize, CellData)> = Vec::new();
+        let mut target_cols: Vec<usize> = Vec::new();
+
+        for col in start_col..=end_col {
+            let cell = self.spreadsheet.get_cell(row, col);
+            if !cell.value.is_empty() || cell.formula.is_some() {
+                pattern_cells.push((col, cell.clone()));
+            } else {
+                target_cols.push(col);
+            }
+        }
+
+        // If no pattern cells or no targets, nothing to do
+        if pattern_cells.is_empty() || target_cols.is_empty() {
+            return (changes, String::new());
+        }
+
+        // Check if any pattern cell has a formula - if so, use formula-based fill
+        let has_formula = pattern_cells.iter().any(|(_, cell)| cell.formula.is_some());
+
+        if has_formula {
+            // Use the first cell with a formula as source, adjust references for targets
+            let (source_col, source_cell) = pattern_cells.iter()
+                .find(|(_, cell)| cell.formula.is_some())
+                .unwrap();
+
+            let evaluator = FormulaEvaluator::new(&self.spreadsheet);
+
+            for target_col in &target_cols {
+                let col_offset = *target_col as i32 - *source_col as i32;
+
+                if let Some(ref formula) = source_cell.formula {
+                    let adjusted_formula = evaluator.adjust_formula_references(formula, 0, col_offset);
+
+                    if evaluator.would_create_circular_reference(&adjusted_formula, (row, *target_col)) {
+                        continue;
+                    }
+
+                    let new_value = evaluator.evaluate_formula(&adjusted_formula);
+                    changes.push((row, *target_col, CellData {
+                        value: new_value,
+                        formula: Some(adjusted_formula),
+                    }));
+                }
+            }
+
+            return (changes, "formula".to_string());
+        }
+
+        // Extract values from pattern cells for pattern detection
+        let values: Vec<String> = pattern_cells.iter()
+            .map(|(_, cell)| cell.value.clone())
+            .collect();
+
+        let pattern = AutofillPattern::detect(&values);
+        let pattern_desc = pattern.description();
+
+        // Generate values for target cells
+        // The pattern index for targets continues from where pattern cells left off
+        let pattern_len = pattern_cells.len();
+
+        for (i, target_col) in target_cols.iter().enumerate() {
+            let pattern_index = pattern_len + i;
+            let generated_value = pattern.generate(pattern_index);
+
+            changes.push((row, *target_col, CellData {
+                value: generated_value,
+                formula: None,
+            }));
+        }
+
+        (changes, pattern_desc)
     }
 
 }
@@ -1203,53 +1359,57 @@ mod tests {
     #[test]
     fn test_autofill_simple_values() {
         let mut app = App::default();
-        
-        // Set up a simple value in A1
+
+        // Set up a simple value in A1 (pattern cell)
         app.set_cell_with_undo(0, 0, CellData {
             value: "Hello".to_string(),
             formula: None,
         });
-        
-        // Select A1:B2
+
+        // Select A1:A3 (vertical selection, A1 has value, A2-A3 are empty)
         app.selection_start = Some((0, 0));
-        app.selection_end = Some((1, 1));
-        
+        app.selection_end = Some((2, 0));
+
         // Autofill
         app.autofill_selection();
-        
-        // Check that the value was copied
-        assert_eq!(app.spreadsheet.get_cell(0, 1).value, "Hello");
-        assert_eq!(app.spreadsheet.get_cell(1, 0).value, "Hello");
-        assert_eq!(app.spreadsheet.get_cell(1, 1).value, "Hello");
+
+        // Check that the value was copied to empty cells only
+        assert_eq!(app.spreadsheet.get_cell(0, 0).value, "Hello"); // Original
+        assert_eq!(app.spreadsheet.get_cell(1, 0).value, "Hello"); // Filled
+        assert_eq!(app.spreadsheet.get_cell(2, 0).value, "Hello"); // Filled
     }
 
     #[test]
     fn test_autofill_formula_horizontal() {
         let mut app = App::default();
-        
-        // Set up cells with values
+
+        // Set up cells with values for reference
         app.set_cell_with_undo(0, 1, CellData { value: "10".to_string(), formula: None }); // B1 = 10
         app.set_cell_with_undo(1, 1, CellData { value: "20".to_string(), formula: None }); // B2 = 20
-        
+        app.set_cell_with_undo(0, 2, CellData { value: "30".to_string(), formula: None }); // C1 = 30
+        app.set_cell_with_undo(1, 2, CellData { value: "40".to_string(), formula: None }); // C2 = 40
+
         // Set up a formula in A1 that references B1:B2
         app.set_cell_with_undo(0, 0, CellData {
             value: "30".to_string(),
             formula: Some("=SUM(B1:B2)".to_string()),
         });
-        
-        // Select A1:C1 (horizontal autofill)
+
+        // Select A1:D1 (horizontal autofill, A1 has formula, B1 has value, C1 has value, D1 is empty)
         app.selection_start = Some((0, 0));
-        app.selection_end = Some((0, 2));
-        
-        // Autofill
+        app.selection_end = Some((0, 3));
+
+        // Autofill - should only fill D1 since it's the only empty cell
         app.autofill_selection();
-        
-        // Check that formulas were adjusted horizontally
-        let b1_cell = app.spreadsheet.get_cell(0, 1);
-        assert_eq!(b1_cell.formula, Some("=SUM(C1:C2)".to_string()));
-        
-        let c1_cell = app.spreadsheet.get_cell(0, 2);
-        assert_eq!(c1_cell.formula, Some("=SUM(D1:D2)".to_string()));
+
+        // Check that only the empty cell D1 got the adjusted formula
+        let d1_cell = app.spreadsheet.get_cell(0, 3);
+        // The formula from A1 is adjusted by 3 columns: B->E, so =SUM(E1:E2)
+        assert_eq!(d1_cell.formula, Some("=SUM(E1:E2)".to_string()));
+
+        // Verify B1 and C1 still have their original values (not overwritten)
+        assert_eq!(app.spreadsheet.get_cell(0, 1).value, "10");
+        assert_eq!(app.spreadsheet.get_cell(0, 2).value, "30");
     }
 
     #[test]
@@ -1292,29 +1452,206 @@ mod tests {
     #[test]
     fn test_autofill_formula_vertical() {
         let mut app = App::default();
-        
-        // Set up cells with values
+
+        // Set up cells with values for reference
         app.set_cell_with_undo(1, 0, CellData { value: "10".to_string(), formula: None }); // A2 = 10
         app.set_cell_with_undo(1, 1, CellData { value: "20".to_string(), formula: None }); // B2 = 20
-        
+        app.set_cell_with_undo(2, 0, CellData { value: "30".to_string(), formula: None }); // A3 = 30
+        app.set_cell_with_undo(2, 1, CellData { value: "40".to_string(), formula: None }); // B3 = 40
+
         // Set up a formula in A1 that references A2+B2
         app.set_cell_with_undo(0, 0, CellData {
             value: "30".to_string(),
             formula: Some("=A2+B2".to_string()),
         });
-        
-        // Select A1:A3 (vertical autofill)
+
+        // Select A1:A4 (vertical autofill, A1 has formula, A2-A3 have values, A4 is empty)
         app.selection_start = Some((0, 0));
-        app.selection_end = Some((2, 0));
-        
+        app.selection_end = Some((3, 0));
+
+        // Autofill - should only fill A4 since it's the only empty cell
+        app.autofill_selection();
+
+        // Check that only the empty cell A4 got the adjusted formula
+        let a4_cell = app.spreadsheet.get_cell(3, 0);
+        // The formula from A1 is adjusted by 3 rows: A2->A5, B2->B5, so =A5+B5
+        assert_eq!(a4_cell.formula, Some("=A5+B5".to_string()));
+
+        // Verify A2 and A3 still have their original values (not overwritten)
+        assert_eq!(app.spreadsheet.get_cell(1, 0).value, "10");
+        assert_eq!(app.spreadsheet.get_cell(2, 0).value, "30");
+    }
+
+    #[test]
+    fn test_autofill_pattern_arithmetic() {
+        let mut app = App::default();
+
+        // Set up arithmetic pattern: 1, 2, 3
+        app.set_cell_with_undo(0, 0, CellData { value: "1".to_string(), formula: None });
+        app.set_cell_with_undo(1, 0, CellData { value: "2".to_string(), formula: None });
+        app.set_cell_with_undo(2, 0, CellData { value: "3".to_string(), formula: None });
+
+        // Select A1:A6 (A1-A3 have values, A4-A6 are empty)
+        app.selection_start = Some((0, 0));
+        app.selection_end = Some((5, 0));
+
         // Autofill
         app.autofill_selection();
-        
-        // Check that formulas were adjusted vertically
-        let a2_cell = app.spreadsheet.get_cell(1, 0);
-        assert_eq!(a2_cell.formula, Some("=A3+B3".to_string()));
-        
-        let a3_cell = app.spreadsheet.get_cell(2, 0);
-        assert_eq!(a3_cell.formula, Some("=A4+B4".to_string()));
+
+        // Check pattern continuation
+        assert_eq!(app.spreadsheet.get_cell(3, 0).value, "4");
+        assert_eq!(app.spreadsheet.get_cell(4, 0).value, "5");
+        assert_eq!(app.spreadsheet.get_cell(5, 0).value, "6");
+    }
+
+    #[test]
+    fn test_autofill_pattern_days() {
+        let mut app = App::default();
+
+        // Set up days pattern: Mon, Tue
+        app.set_cell_with_undo(0, 0, CellData { value: "Mon".to_string(), formula: None });
+        app.set_cell_with_undo(1, 0, CellData { value: "Tue".to_string(), formula: None });
+
+        // Select A1:A5 (A1-A2 have values, A3-A5 are empty)
+        app.selection_start = Some((0, 0));
+        app.selection_end = Some((4, 0));
+
+        // Autofill
+        app.autofill_selection();
+
+        // Check pattern continuation
+        assert_eq!(app.spreadsheet.get_cell(2, 0).value, "Wed");
+        assert_eq!(app.spreadsheet.get_cell(3, 0).value, "Thu");
+        assert_eq!(app.spreadsheet.get_cell(4, 0).value, "Fri");
+    }
+
+    #[test]
+    fn test_autofill_pattern_prefixed() {
+        let mut app = App::default();
+
+        // Set up prefixed pattern: Item1, Item2
+        app.set_cell_with_undo(0, 0, CellData { value: "Item1".to_string(), formula: None });
+        app.set_cell_with_undo(1, 0, CellData { value: "Item2".to_string(), formula: None });
+
+        // Select A1:A5 (A1-A2 have values, A3-A5 are empty)
+        app.selection_start = Some((0, 0));
+        app.selection_end = Some((4, 0));
+
+        // Autofill
+        app.autofill_selection();
+
+        // Check pattern continuation
+        assert_eq!(app.spreadsheet.get_cell(2, 0).value, "Item3");
+        assert_eq!(app.spreadsheet.get_cell(3, 0).value, "Item4");
+        assert_eq!(app.spreadsheet.get_cell(4, 0).value, "Item5");
+    }
+
+    #[test]
+    fn test_autofill_pattern_months_short() {
+        let mut app = App::default();
+
+        // Set up months pattern: Jan, Feb, Mar
+        app.set_cell_with_undo(0, 0, CellData { value: "Jan".to_string(), formula: None });
+        app.set_cell_with_undo(1, 0, CellData { value: "Feb".to_string(), formula: None });
+        app.set_cell_with_undo(2, 0, CellData { value: "Mar".to_string(), formula: None });
+
+        // Select A1:A7 (A1-A3 have values, A4-A7 are empty)
+        app.selection_start = Some((0, 0));
+        app.selection_end = Some((6, 0));
+
+        // Autofill
+        app.autofill_selection();
+
+        // Check pattern continuation
+        assert_eq!(app.spreadsheet.get_cell(3, 0).value, "Apr");
+        assert_eq!(app.spreadsheet.get_cell(4, 0).value, "May");
+        assert_eq!(app.spreadsheet.get_cell(5, 0).value, "Jun");
+        assert_eq!(app.spreadsheet.get_cell(6, 0).value, "Jul");
+    }
+
+    #[test]
+    fn test_autofill_pattern_months_full() {
+        let mut app = App::default();
+
+        // Set up full months pattern: January, February
+        app.set_cell_with_undo(0, 0, CellData { value: "January".to_string(), formula: None });
+        app.set_cell_with_undo(1, 0, CellData { value: "February".to_string(), formula: None });
+
+        // Select A1:A5 (A1-A2 have values, A3-A5 are empty)
+        app.selection_start = Some((0, 0));
+        app.selection_end = Some((4, 0));
+
+        // Autofill
+        app.autofill_selection();
+
+        // Check pattern continuation
+        assert_eq!(app.spreadsheet.get_cell(2, 0).value, "March");
+        assert_eq!(app.spreadsheet.get_cell(3, 0).value, "April");
+        assert_eq!(app.spreadsheet.get_cell(4, 0).value, "May");
+    }
+
+    #[test]
+    fn test_autofill_pattern_quarters() {
+        let mut app = App::default();
+
+        // Set up quarters pattern: Q1, Q2
+        app.set_cell_with_undo(0, 0, CellData { value: "Q1".to_string(), formula: None });
+        app.set_cell_with_undo(1, 0, CellData { value: "Q2".to_string(), formula: None });
+
+        // Select A1:A6 (A1-A2 have values, A3-A6 are empty)
+        app.selection_start = Some((0, 0));
+        app.selection_end = Some((5, 0));
+
+        // Autofill
+        app.autofill_selection();
+
+        // Check pattern continuation with wrap-around
+        assert_eq!(app.spreadsheet.get_cell(2, 0).value, "Q3");
+        assert_eq!(app.spreadsheet.get_cell(3, 0).value, "Q4");
+        assert_eq!(app.spreadsheet.get_cell(4, 0).value, "Q1"); // Wraps
+        assert_eq!(app.spreadsheet.get_cell(5, 0).value, "Q2"); // Wraps
+    }
+
+    #[test]
+    fn test_autofill_pattern_months_wrap() {
+        let mut app = App::default();
+
+        // Set up months pattern starting near end: Oct, Nov, Dec
+        app.set_cell_with_undo(0, 0, CellData { value: "Oct".to_string(), formula: None });
+        app.set_cell_with_undo(1, 0, CellData { value: "Nov".to_string(), formula: None });
+        app.set_cell_with_undo(2, 0, CellData { value: "Dec".to_string(), formula: None });
+
+        // Select A1:A6 (A1-A3 have values, A4-A6 are empty)
+        app.selection_start = Some((0, 0));
+        app.selection_end = Some((5, 0));
+
+        // Autofill
+        app.autofill_selection();
+
+        // Check pattern continuation with wrap-around
+        assert_eq!(app.spreadsheet.get_cell(3, 0).value, "Jan"); // Wraps
+        assert_eq!(app.spreadsheet.get_cell(4, 0).value, "Feb");
+        assert_eq!(app.spreadsheet.get_cell(5, 0).value, "Mar");
+    }
+
+    #[test]
+    fn test_autofill_horizontal_pattern() {
+        let mut app = App::default();
+
+        // Set up arithmetic pattern horizontally: 10, 20 in A1, B1
+        app.set_cell_with_undo(0, 0, CellData { value: "10".to_string(), formula: None });
+        app.set_cell_with_undo(0, 1, CellData { value: "20".to_string(), formula: None });
+
+        // Select A1:E1 (A1-B1 have values, C1-E1 are empty) - wide selection = fill right
+        app.selection_start = Some((0, 0));
+        app.selection_end = Some((0, 4));
+
+        // Autofill
+        app.autofill_selection();
+
+        // Check pattern continuation
+        assert_eq!(app.spreadsheet.get_cell(0, 2).value, "30");
+        assert_eq!(app.spreadsheet.get_cell(0, 3).value, "40");
+        assert_eq!(app.spreadsheet.get_cell(0, 4).value, "50");
     }
 }
