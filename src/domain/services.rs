@@ -161,6 +161,21 @@ impl<'a> FormulaEvaluator<'a> {
         evaluator.evaluate(&ast)
     }
     
+    /// Checks for circular references in a formula string, reusing the visited set.
+    fn check_circular_in_formula(&self, formula: &str, target_cell: (usize, usize), visited: &mut HashSet<(usize, usize)>) -> bool {
+        if !formula.starts_with('=') {
+            return false;
+        }
+        let expr = &formula[1..];
+        match Parser::new(expr) {
+            Ok(mut parser) => match parser.parse() {
+                Ok(ast) => self.check_circular_reference_in_ast(&ast, target_cell, visited),
+                Err(_) => false,
+            },
+            Err(_) => false,
+        }
+    }
+
     /// Checks for circular references in an AST.
     fn check_circular_reference_in_ast(&self, expr: &Expr, target_cell: (usize, usize), visited: &mut HashSet<(usize, usize)>) -> bool {
         match expr {
@@ -170,21 +185,19 @@ impl<'a> FormulaEvaluator<'a> {
                     if (row, col) == target_cell {
                         return true;
                     }
-                    
+
                     if visited.contains(&(row, col)) {
                         return false;
                     }
-                    
+
                     visited.insert((row, col));
-                    
+
                     let cell = self.spreadsheet.get_cell(row, col);
                     if let Some(ref cell_formula) = cell.formula {
-                        if self.would_create_circular_reference(cell_formula, target_cell) {
+                        if self.check_circular_in_formula(cell_formula, target_cell, visited) {
                             return true;
                         }
                     }
-                    
-                    visited.remove(&(row, col));
                 }
                 false
             }
@@ -699,7 +712,11 @@ impl AutofillPattern {
     /// Format a number smartly: show as integer if whole, otherwise as decimal.
     fn format_number(n: f64) -> String {
         if n.fract().abs() < 1e-9 {
-            format!("{}", n as i64)
+            if n.abs() < (i64::MAX as f64) {
+                format!("{}", n as i64)
+            } else {
+                format!("{:.0}", n)
+            }
         } else {
             // Remove trailing zeros
             let s = format!("{}", n);
@@ -2103,5 +2120,22 @@ Break""#).expect("Failed to write to temp file");
         assert_eq!(pattern.generate(3), "Sat");
         assert_eq!(pattern.generate(4), "Sun");
         assert_eq!(pattern.generate(5), "Mon");
+    }
+
+    #[test]
+    fn test_format_number_large_values() {
+        // Values within i64 range should format as integers
+        assert_eq!(AutofillPattern::format_number(1000.0), "1000");
+        assert_eq!(AutofillPattern::format_number(-1000.0), "-1000");
+
+        // Values beyond i64 range should not panic and should format correctly
+        let result = AutofillPattern::format_number(1e19);
+        assert!(!result.is_empty());
+        // Should not produce incorrect i64-saturated value
+        assert!(result.starts_with("1000000000000000000"));
+
+        let result = AutofillPattern::format_number(1e20);
+        assert!(!result.is_empty());
+        assert!(result.starts_with("1000000000000000000"));
     }
 }

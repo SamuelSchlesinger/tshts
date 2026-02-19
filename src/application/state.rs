@@ -599,13 +599,14 @@ impl App {
     }
 
     /// Finishes search and returns to normal mode while keeping the current selection.
+    /// Search results are preserved for n/N navigation in normal mode.
     pub fn finish_search(&mut self) {
         self.mode = AppMode::Normal;
-        
+
         let num_results = self.search_results.len();
         if num_results > 0 {
             self.status_message = Some(format!(
-                "Search completed: {} result{} found for '{}'", 
+                "Search completed: {} result{} found for '{}' (n/N to navigate)",
                 num_results,
                 if num_results == 1 { "" } else { "s" },
                 self.search_query
@@ -613,10 +614,9 @@ impl App {
         } else {
             self.status_message = Some(format!("No results found for '{}'", self.search_query));
         }
-        
+
         self.search_query.clear();
-        self.search_results.clear();
-        self.search_result_index = 0;
+        // Don't clear search_results — keep them for n/N navigation
         self.cursor_position = 0;
     }
 

@@ -3,7 +3,7 @@
 //! This module contains the core data structures that represent
 //! spreadsheet cells and the spreadsheet itself.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use serde::{Deserialize, Serialize};
 
 /// Represents the data contained within a single spreadsheet cell.
@@ -233,41 +233,57 @@ impl Spreadsheet {
         self.recalculate_dependents(row, col);
     }
 
-    /// Recalculates all cells that depend on the given cell.
+    /// Recalculates all cells that depend on the given cell using topological ordering.
     fn recalculate_dependents(&mut self, row: usize, col: usize) {
         let cell_pos = (row, col);
-        
-        // Get all cells that depend on this cell
-        if let Some(dependents) = self.dependents.get(&cell_pos).cloned() {
-            // Use a breadth-first approach with cycle detection
-            let mut to_recalc: Vec<_> = dependents.into_iter().collect();
-            let mut visited = HashSet::new();
-            let mut in_progress = HashSet::new();
-            
-            while let Some(dependent) = to_recalc.pop() {
-                if visited.contains(&dependent) {
-                    continue;
+
+        // 1. Collect all transitive dependents
+        let mut to_recalc = HashSet::new();
+        let mut queue = VecDeque::new();
+        if let Some(deps) = self.dependents.get(&cell_pos).cloned() {
+            for dep in deps {
+                queue.push_back(dep);
+            }
+        }
+        while let Some(dep) = queue.pop_front() {
+            if to_recalc.insert(dep) {
+                if let Some(next) = self.dependents.get(&dep).cloned() {
+                    for n in next {
+                        queue.push_back(n);
+                    }
                 }
-                
-                // Check for circular dependency
-                if in_progress.contains(&dependent) {
-                    // Circular dependency detected - skip this cell
-                    continue;
+            }
+        }
+
+        if to_recalc.is_empty() {
+            return;
+        }
+
+        // 2. Compute in-degrees within recalc set
+        let mut in_degree: HashMap<(usize, usize), usize> = to_recalc.iter().map(|&c| (c, 0)).collect();
+        for &cell in &to_recalc {
+            if let Some(deps) = self.dependencies.get(&cell) {
+                for dep in deps {
+                    if to_recalc.contains(dep) {
+                        *in_degree.entry(cell).or_insert(0) += 1;
+                    }
                 }
-                
-                in_progress.insert(dependent);
-                
-                // Recalculate this dependent cell
-                self.recalculate_cell(dependent.0, dependent.1);
-                
-                visited.insert(dependent);
-                in_progress.remove(&dependent);
-                
-                // Add its dependents to the queue
-                if let Some(next_deps) = self.dependents.get(&dependent).cloned() {
-                    for next_dep in next_deps {
-                        if !visited.contains(&next_dep) && !in_progress.contains(&next_dep) {
-                            to_recalc.push(next_dep);
+            }
+        }
+
+        // 3. Process in topological order (Kahn's algorithm)
+        let mut ready: VecDeque<_> = in_degree.iter()
+            .filter(|&(_, d)| *d == 0)
+            .map(|(&c, _)| c)
+            .collect();
+        while let Some(cell) = ready.pop_front() {
+            self.recalculate_cell(cell.0, cell.1);
+            if let Some(deps) = self.dependents.get(&cell).cloned() {
+                for dep in deps {
+                    if let Some(d) = in_degree.get_mut(&dep) {
+                        *d -= 1;
+                        if *d == 0 {
+                            ready.push_back(dep);
                         }
                     }
                 }
@@ -467,9 +483,8 @@ impl Spreadsheet {
     ///
     /// * `col` - Zero-based column index
     pub fn auto_resize_column(&mut self, col: usize) {
-        let current_width = self.get_column_width(col);
-        let mut max_width = Self::column_label(col).len().max(current_width);
-        
+        let mut max_width = Self::column_label(col).len();
+
         for row in 0..self.rows {
             let cell = self.get_cell(row, col);
             let value_width = cell.value.len();
@@ -477,11 +492,9 @@ impl Spreadsheet {
             let content_width = value_width.max(formula_width);
             max_width = max_width.max(content_width);
         }
-        
+
         max_width = max_width.max(3).min(50);
-        if max_width > current_width {
-            self.set_column_width(col, max_width);
-        }
+        self.set_column_width(col, max_width);
     }
 
     /// Automatically resizes all columns to fit their content.
@@ -1043,5 +1056,60 @@ mod tests {
         // Verify that dependent cells were recalculated
         assert_eq!(loaded.get_cell(0, 1).value, "10"); // B1 = 5*2 = 10
         assert_eq!(loaded.get_cell(0, 2).value, "20"); // C1 = 10*2 = 20
+    }
+
+    #[test]
+    fn test_diamond_dependency_recalculation() {
+        let mut sheet = Spreadsheet::default();
+
+        // Diamond pattern: A1 -> B1, A1 -> C1, B1 -> C1
+        // A1 = 10
+        sheet.set_cell(0, 0, CellData { value: "10".to_string(), formula: None });
+        // B1 = A1 * 2
+        sheet.set_cell(0, 1, CellData {
+            value: "20".to_string(),
+            formula: Some("=A1*2".to_string()),
+        });
+        // C1 = A1 + B1 (depends on both A1 and B1)
+        sheet.set_cell(0, 2, CellData {
+            value: "30".to_string(),
+            formula: Some("=A1+B1".to_string()),
+        });
+
+        // Verify initial state
+        assert_eq!(sheet.get_cell(0, 0).value, "10");
+        assert_eq!(sheet.get_cell(0, 1).value, "20");
+        assert_eq!(sheet.get_cell(0, 2).value, "30"); // 10 + 20
+
+        // Change A1 — B1 must update before C1 for correct result
+        sheet.set_cell(0, 0, CellData { value: "5".to_string(), formula: None });
+        assert_eq!(sheet.get_cell(0, 1).value, "10"); // 5*2 = 10
+        assert_eq!(sheet.get_cell(0, 2).value, "15"); // 5 + 10 = 15 (not 5 + 20 = 25)
+    }
+
+    #[test]
+    fn test_auto_resize_column_shrinks() {
+        let mut sheet = Spreadsheet::default();
+
+        // Add wide content and auto-resize
+        sheet.set_cell(0, 0, CellData {
+            value: "This is very wide content".to_string(),
+            formula: None,
+        });
+        sheet.auto_resize_column(0);
+        let wide_width = sheet.get_column_width(0);
+        assert!(wide_width >= "This is very wide content".len());
+
+        // Replace with short content
+        sheet.set_cell(0, 0, CellData {
+            value: "Hi".to_string(),
+            formula: None,
+        });
+        sheet.auto_resize_column(0);
+        let narrow_width = sheet.get_column_width(0);
+
+        // Column should have shrunk
+        assert!(narrow_width < wide_width);
+        assert!(narrow_width >= 3); // minimum width
     }
 }

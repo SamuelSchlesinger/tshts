@@ -155,7 +155,7 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
             } else {
                 format!(" ({}/{} results)", app.search_result_index + 1, app.search_results.len())
             };
-            format!("Search: {}{} (Enter to finish, Esc to cancel, ↑↓/np: navigate)", app.search_query, results_info)
+            format!("Search: {}{} (Enter to finish, Esc to cancel, ↑↓: navigate)", app.search_query, results_info)
         }
     };
 
@@ -307,13 +307,13 @@ String Examples:
 Mixed Type Examples:
 ="Total: " & SUM(A1:A10) & " items"   Numeric result with description
 =IF(AVERAGE(A1:A10)>50,"PASS","FAIL") Grade based on average
-=CONCAT("Row ",ROW()," Value: ",A1)    Dynamic labels
+=CONCAT("Value: ",A1," Total: ",SUM(B1:B5))  Dynamic labels
 
 === SEARCH FUNCTIONALITY ===
 /               Start text search across all cells
                 Search is case-insensitive and searches both cell values and formulas
                 Live search: results update as you type
-                ↑↓ or n/p   Navigate through search results while searching
+                ↑↓          Navigate through search results while searching
                 Enter       Finish search and return to normal mode
                 Esc         Cancel search and return to normal mode
                 n/N         Navigate search results in normal mode (after search)

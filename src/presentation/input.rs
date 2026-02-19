@@ -3,6 +3,17 @@ use crate::infrastructure::FileRepository;
 use crate::domain::CsvExporter;
 use crossterm::event::{KeyCode, KeyModifiers};
 
+fn char_to_byte_pos(s: &str, char_pos: usize) -> usize {
+    s.char_indices()
+        .nth(char_pos)
+        .map(|(byte_idx, _)| byte_idx)
+        .unwrap_or(s.len())
+}
+
+fn char_count(s: &str) -> usize {
+    s.chars().count()
+}
+
 pub struct InputHandler;
 
 impl InputHandler {
@@ -197,13 +208,13 @@ impl InputHandler {
             }
             KeyCode::Backspace => {
                 if app.cursor_position > 0 {
-                    app.input.remove(app.cursor_position - 1);
+                    app.input.remove(char_to_byte_pos(&app.input, app.cursor_position - 1));
                     app.cursor_position -= 1;
                 }
             }
             KeyCode::Delete => {
-                if app.cursor_position < app.input.len() {
-                    app.input.remove(app.cursor_position);
+                if app.cursor_position < char_count(&app.input) {
+                    app.input.remove(char_to_byte_pos(&app.input, app.cursor_position));
                 }
             }
             KeyCode::Left => {
@@ -212,7 +223,7 @@ impl InputHandler {
                 }
             }
             KeyCode::Right => {
-                if app.cursor_position < app.input.len() {
+                if app.cursor_position < char_count(&app.input) {
                     app.cursor_position += 1;
                 }
             }
@@ -220,10 +231,10 @@ impl InputHandler {
                 app.cursor_position = 0;
             }
             KeyCode::End => {
-                app.cursor_position = app.input.len();
+                app.cursor_position = char_count(&app.input);
             }
             KeyCode::Char(c) => {
-                app.input.insert(app.cursor_position, c);
+                app.input.insert(char_to_byte_pos(&app.input, app.cursor_position), c);
                 app.cursor_position += 1;
             }
             _ => {}
@@ -288,13 +299,13 @@ impl InputHandler {
             }
             KeyCode::Backspace => {
                 if app.cursor_position > 0 {
-                    app.filename_input.remove(app.cursor_position - 1);
+                    app.filename_input.remove(char_to_byte_pos(&app.filename_input, app.cursor_position - 1));
                     app.cursor_position -= 1;
                 }
             }
             KeyCode::Delete => {
-                if app.cursor_position < app.filename_input.len() {
-                    app.filename_input.remove(app.cursor_position);
+                if app.cursor_position < char_count(&app.filename_input) {
+                    app.filename_input.remove(char_to_byte_pos(&app.filename_input, app.cursor_position));
                 }
             }
             KeyCode::Left => {
@@ -303,7 +314,7 @@ impl InputHandler {
                 }
             }
             KeyCode::Right => {
-                if app.cursor_position < app.filename_input.len() {
+                if app.cursor_position < char_count(&app.filename_input) {
                     app.cursor_position += 1;
                 }
             }
@@ -311,10 +322,10 @@ impl InputHandler {
                 app.cursor_position = 0;
             }
             KeyCode::End => {
-                app.cursor_position = app.filename_input.len();
+                app.cursor_position = char_count(&app.filename_input);
             }
             KeyCode::Char(c) => {
-                app.filename_input.insert(app.cursor_position, c);
+                app.filename_input.insert(char_to_byte_pos(&app.filename_input, app.cursor_position), c);
                 app.cursor_position += 1;
             }
             _ => {}
@@ -332,15 +343,15 @@ impl InputHandler {
             }
             KeyCode::Backspace => {
                 if app.cursor_position > 0 {
-                    app.search_query.remove(app.cursor_position - 1);
+                    app.search_query.remove(char_to_byte_pos(&app.search_query, app.cursor_position - 1));
                     app.cursor_position -= 1;
                     // Perform live search as user types
                     app.perform_search();
                 }
             }
             KeyCode::Delete => {
-                if app.cursor_position < app.search_query.len() {
-                    app.search_query.remove(app.cursor_position);
+                if app.cursor_position < char_count(&app.search_query) {
+                    app.search_query.remove(char_to_byte_pos(&app.search_query, app.cursor_position));
                     // Perform live search as user types
                     app.perform_search();
                 }
@@ -351,7 +362,7 @@ impl InputHandler {
                 }
             }
             KeyCode::Right => {
-                if app.cursor_position < app.search_query.len() {
+                if app.cursor_position < char_count(&app.search_query) {
                     app.cursor_position += 1;
                 }
             }
@@ -359,18 +370,18 @@ impl InputHandler {
                 app.cursor_position = 0;
             }
             KeyCode::End => {
-                app.cursor_position = app.search_query.len();
+                app.cursor_position = char_count(&app.search_query);
             }
-            KeyCode::Down | KeyCode::Char('n') => {
+            KeyCode::Down => {
                 // Navigate to next search result while searching
                 app.next_search_result();
             }
-            KeyCode::Up | KeyCode::Char('p') => {
+            KeyCode::Up => {
                 // Navigate to previous search result while searching
                 app.previous_search_result();
             }
             KeyCode::Char(c) => {
-                app.search_query.insert(app.cursor_position, c);
+                app.search_query.insert(char_to_byte_pos(&app.search_query, app.cursor_position), c);
                 app.cursor_position += 1;
                 // Perform live search as user types
                 app.perform_search();
