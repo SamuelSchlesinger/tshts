@@ -3,7 +3,7 @@
 //! This module handles saving and loading spreadsheet data to/from JSON files.
 //! It provides a simple file-based storage mechanism for the application.
 
-use crate::domain::Spreadsheet;
+use crate::domain::{Spreadsheet, Workbook};
 use std::fs;
 
 /// Repository for file-based spreadsheet persistence.
@@ -49,6 +49,7 @@ impl FileRepository {
     ///     Err(error) => println!("Save failed: {}", error),
     /// }
     /// ```
+    #[allow(dead_code)] // Used in tests for single-sheet persistence
     pub fn save_spreadsheet(spreadsheet: &Spreadsheet, filename: &str) -> Result<String, String> {
         match serde_json::to_string_pretty(spreadsheet) {
             Ok(json) => {
@@ -86,6 +87,7 @@ impl FileRepository {
     ///     Err(error) => println!("Load failed: {}", error),
     /// }
     /// ```
+    #[allow(dead_code)] // Used in tests for single-sheet persistence
     pub fn load_spreadsheet(filename: &str) -> Result<(Spreadsheet, String), String> {
         match fs::read_to_string(filename) {
             Ok(content) => {
@@ -94,6 +96,44 @@ impl FileRepository {
                         // Rebuild dependencies since they're not serialized
                         spreadsheet.rebuild_dependencies();
                         Ok((spreadsheet, filename.to_string()))
+                    }
+                    Err(e) => Err(format!("Invalid file format - {}", e)),
+                }
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// Saves a workbook to a JSON file.
+    pub fn save_workbook(workbook: &Workbook, filename: &str) -> Result<String, String> {
+        match serde_json::to_string_pretty(workbook) {
+            Ok(json) => {
+                match fs::write(filename, &json) {
+                    Ok(_) => Ok(filename.to_string()),
+                    Err(e) => Err(e.to_string()),
+                }
+            }
+            Err(e) => Err(format!("Serialization failed: {}", e)),
+        }
+    }
+
+    /// Loads a workbook from a JSON file.
+    /// Handles both old Spreadsheet format and new Workbook format.
+    pub fn load_workbook(filename: &str) -> Result<(Workbook, String), String> {
+        match fs::read_to_string(filename) {
+            Ok(content) => {
+                // Try workbook format first
+                if let Ok(mut workbook) = serde_json::from_str::<Workbook>(&content) {
+                    for sheet in &mut workbook.sheets {
+                        sheet.rebuild_dependencies();
+                    }
+                    return Ok((workbook, filename.to_string()));
+                }
+                // Fall back to single spreadsheet format
+                match serde_json::from_str::<Spreadsheet>(&content) {
+                    Ok(mut spreadsheet) => {
+                        spreadsheet.rebuild_dependencies();
+                        Ok((Workbook::from_spreadsheet(spreadsheet), filename.to_string()))
                     }
                     Err(e) => Err(format!("Invalid file format - {}", e)),
                 }
@@ -117,16 +157,22 @@ mod tests {
         sheet.set_cell(0, 0, CellData {
             value: "Hello".to_string(),
             formula: None,
+            format: None,
+            comment: None,
         });
         
         sheet.set_cell(1, 1, CellData {
             value: "42".to_string(),
             formula: Some("=6*7".to_string()),
+            format: None,
+            comment: None,
         });
         
         sheet.set_cell(2, 0, CellData {
             value: "World".to_string(),
             formula: None,
+            format: None,
+            comment: None,
         });
         
         // Set custom column width
@@ -247,11 +293,15 @@ mod tests {
         sheet.set_cell(0, 0, CellData {
             value: "Héllo Wörld! 🌍".to_string(),
             formula: None,
+            format: None,
+            comment: None,
         });
         
         sheet.set_cell(1, 0, CellData {
             value: "100".to_string(),
             formula: Some("=SUM(\"quotes\", 'apostrophes', `backticks`)".to_string()),
+            format: None,
+            comment: None,
         });
         
         let temp_file = NamedTempFile::new().expect("Failed to create temp file");
@@ -287,6 +337,8 @@ mod tests {
                     } else {
                         None
                     },
+                    format: None,
+                    comment: None,
                 });
             }
         }
@@ -352,5 +404,54 @@ mod tests {
         // Verify cells are stored as array format (due to custom serialization)
         let cells = json_value.get("cells").unwrap();
         assert!(cells.is_array());
+    }
+
+    // === Workbook Persistence Tests ===
+
+    #[test]
+    fn test_save_load_workbook_roundtrip() {
+        let mut workbook = Workbook::default();
+        workbook.current_sheet_mut().set_cell(0, 0, CellData {
+            value: "Sheet1".to_string(), formula: None, format: None, comment: None,
+        });
+        workbook.add_sheet("Data".to_string());
+        workbook.active_sheet = 1;
+        workbook.current_sheet_mut().set_cell(0, 0, CellData {
+            value: "Sheet2".to_string(), formula: None, format: None, comment: None,
+        });
+        workbook.active_sheet = 0; // Reset before save
+
+        let temp_file = NamedTempFile::new().expect("Failed to create temp file");
+        let file_path = temp_file.path().to_str().unwrap();
+
+        let save_result = FileRepository::save_workbook(&workbook, file_path);
+        assert!(save_result.is_ok());
+
+        let (loaded, _) = FileRepository::load_workbook(file_path).unwrap();
+        assert_eq!(loaded.sheets.len(), 2);
+        assert_eq!(loaded.sheet_names[0], "Sheet1");
+        assert_eq!(loaded.sheet_names[1], "Data");
+        assert_eq!(loaded.sheets[0].get_cell(0, 0).value, "Sheet1");
+        assert_eq!(loaded.sheets[1].get_cell(0, 0).value, "Sheet2");
+    }
+
+    #[test]
+    fn test_load_workbook_from_old_spreadsheet_format() {
+        // Save a single spreadsheet in old format
+        let mut sheet = Spreadsheet::default();
+        sheet.set_cell(0, 0, CellData {
+            value: "Legacy".to_string(), formula: None, format: None, comment: None,
+        });
+
+        let temp_file = NamedTempFile::new().expect("Failed to create temp file");
+        let file_path = temp_file.path().to_str().unwrap();
+
+        FileRepository::save_spreadsheet(&sheet, file_path).unwrap();
+
+        // Load as workbook - should wrap in a single-sheet workbook
+        let (loaded, _) = FileRepository::load_workbook(file_path).unwrap();
+        assert_eq!(loaded.sheets.len(), 1);
+        assert_eq!(loaded.sheet_names[0], "Sheet1");
+        assert_eq!(loaded.sheets[0].get_cell(0, 0).value, "Legacy");
     }
 }

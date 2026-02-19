@@ -1,11 +1,31 @@
 use crate::application::{App, AppMode};
-use crate::domain::Spreadsheet;
+use crate::domain::{Spreadsheet, TerminalColor, format_cell_value};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table},
     Frame,
 };
+
+fn terminal_color_to_ratatui(color: &TerminalColor) -> Color {
+    match color {
+        TerminalColor::Black => Color::Black,
+        TerminalColor::Red => Color::Red,
+        TerminalColor::Green => Color::Green,
+        TerminalColor::Yellow => Color::Yellow,
+        TerminalColor::Blue => Color::Blue,
+        TerminalColor::Magenta => Color::Magenta,
+        TerminalColor::Cyan => Color::Cyan,
+        TerminalColor::White => Color::White,
+        TerminalColor::DarkGray => Color::DarkGray,
+        TerminalColor::LightRed => Color::LightRed,
+        TerminalColor::LightGreen => Color::LightGreen,
+        TerminalColor::LightYellow => Color::LightYellow,
+        TerminalColor::LightBlue => Color::LightBlue,
+        TerminalColor::LightMagenta => Color::LightMagenta,
+        TerminalColor::LightCyan => Color::LightCyan,
+    }
+}
 
 pub fn render_ui(f: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
@@ -27,10 +47,24 @@ pub fn render_ui(f: &mut Frame, app: &mut App) {
 }
 
 fn render_header(f: &mut Frame, app: &App, area: Rect) {
+    // Build tab bar showing sheet names
+    let mut tabs = String::new();
+    for (i, name) in app.workbook.sheet_names.iter().enumerate() {
+        if i == app.workbook.active_sheet {
+            tabs.push_str(&format!("[{}]", name));
+        } else {
+            tabs.push_str(&format!(" {} ", name));
+        }
+        if i < app.workbook.sheet_names.len() - 1 {
+            tabs.push('|');
+        }
+    }
+
     let header = Paragraph::new(format!(
-        "tshts - Terminal Spreadsheet | Cell: {}{}",
+        "tshts | Cell: {}{} | {}",
         Spreadsheet::column_label(app.selected_col),
-        app.selected_row + 1
+        app.selected_row + 1,
+        tabs
     ))
     .style(Style::default().fg(Color::Cyan));
     f.render_widget(header, area);
@@ -43,8 +77,8 @@ fn render_spreadsheet(f: &mut Frame, app: &mut App, area: Rect) {
     let mut visible_cols = 0;
     let available_width = area.width as usize;
     
-    for col in app.scroll_col..app.spreadsheet.cols {
-        let col_width = app.spreadsheet.get_column_width(col);
+    for col in app.scroll_col..app.workbook.current_sheet().cols {
+        let col_width = app.workbook.current_sheet().get_column_width(col);
         if total_width + col_width + 1 > available_width {
             break;
         }
@@ -69,7 +103,15 @@ fn render_spreadsheet(f: &mut Frame, app: &mut App, area: Rect) {
     
     let mut rows = vec![header_row];
     
-    for row in app.scroll_row..std::cmp::min(app.scroll_row + visible_rows, app.spreadsheet.rows) {
+    let mut rendered_rows = 0;
+    let mut row = app.scroll_row;
+    while row < app.workbook.current_sheet().rows && rendered_rows < visible_rows {
+        // Skip hidden rows (from filtering)
+        if app.hidden_rows.contains(&row) {
+            row += 1;
+            continue;
+        }
+        rendered_rows += 1;
         let row_number_style = if row == app.selected_row {
             Style::default().bg(Color::LightBlue).fg(Color::Black)
         } else {
@@ -78,38 +120,71 @@ fn render_spreadsheet(f: &mut Frame, app: &mut App, area: Rect) {
         let mut cells = vec![Cell::from(format!("{}", row + 1)).style(row_number_style)];
         
         for col in app.scroll_col..app.scroll_col + visible_cols {
-            let cell_data = app.spreadsheet.get_cell(row, col);
-            let cell_value = if cell_data.value.is_empty() { " ".to_string() } else { cell_data.value };
-            
-            let style = if row == app.selected_row && col == app.selected_col {
-                // Current cursor cell (highest priority)
-                Style::default().bg(Color::Blue).fg(Color::White)
-            } else if app.is_cell_selected(row, col) {
-                // Selected range cells
-                Style::default().bg(Color::LightBlue).fg(Color::Black)
-            } else if app.search_results.contains(&(row, col)) {
-                // Highlight search result cells
-                if matches!(app.mode, AppMode::Search) && 
-                   app.search_results.get(app.search_result_index) == Some(&(row, col)) {
-                    // Current search result (more prominent highlight)
-                    Style::default().bg(Color::Yellow).fg(Color::Black)
+            let cell_data = app.workbook.current_sheet().get_cell(row, col);
+            let has_comment = cell_data.comment.is_some();
+            let cell_value = if cell_data.value.is_empty() {
+                if has_comment { "\u{25c6}".to_string() } else { " ".to_string() }
+            } else {
+                let val = if let Some(ref fmt) = cell_data.format {
+                    format_cell_value(&cell_data.value, fmt)
                 } else {
-                    // Other search results (subtle highlight)
-                    Style::default().bg(Color::DarkGray).fg(Color::White)
+                    cell_data.value
+                };
+                if has_comment { format!("{}\u{25c6}", val) } else { val }
+            };
+            
+            // Build base style from cell format (bold, underline, colors)
+            let base_style = if let Some(ref fmt) = cell_data.format {
+                let mut s = Style::default();
+                let mut modifiers = Modifier::empty();
+                if fmt.style.bold {
+                    modifiers |= Modifier::BOLD;
                 }
+                if fmt.style.underline {
+                    modifiers |= Modifier::UNDERLINED;
+                }
+                if !modifiers.is_empty() {
+                    s = s.add_modifier(modifiers);
+                }
+                if let Some(ref fg) = fmt.style.fg_color {
+                    s = s.fg(terminal_color_to_ratatui(fg));
+                }
+                if let Some(ref bg) = fmt.style.bg_color {
+                    s = s.bg(terminal_color_to_ratatui(bg));
+                }
+                s
             } else {
                 Style::default()
+            };
+
+            let style = if row == app.selected_row && col == app.selected_col {
+                // Current cursor cell (highest priority) - override colors but keep modifiers
+                base_style.bg(Color::Blue).fg(Color::White)
+            } else if app.is_cell_selected(row, col) {
+                // Selected range cells
+                base_style.bg(Color::LightBlue).fg(Color::Black)
+            } else if app.search_results.contains(&(row, col)) {
+                // Highlight search result cells
+                if matches!(app.mode, AppMode::Search) &&
+                   app.search_results.get(app.search_result_index) == Some(&(row, col)) {
+                    base_style.bg(Color::Yellow).fg(Color::Black)
+                } else {
+                    base_style.bg(Color::DarkGray).fg(Color::White)
+                }
+            } else {
+                base_style
             };
             
             cells.push(Cell::from(cell_value).style(style));
         }
         
         rows.push(Row::new(cells).height(1));
+        row += 1;
     }
 
     let mut widths = vec![Constraint::Length(4)];
     for col in app.scroll_col..app.scroll_col + visible_cols {
-        widths.push(Constraint::Length(app.spreadsheet.get_column_width(col) as u16));
+        widths.push(Constraint::Length(app.workbook.current_sheet().get_column_width(col) as u16));
     }
     let table = Table::new(rows, widths)
         .block(Block::default().borders(Borders::ALL).title("Spreadsheet"))
@@ -131,12 +206,25 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
                     } else {
                         let rows = end_row - start_row + 1;
                         let cols = end_col - start_col + 1;
-                        format!(" | Selection: {}x{} cells", rows, cols)
+                        let stats = if let Some((sum, avg, count)) = app.get_selection_stats() {
+                            format!(" | SUM={} AVG={:.2} COUNT={}", sum, avg, count)
+                        } else {
+                            String::new()
+                        };
+                        format!(" | Selection: {}x{} cells{}", rows, cols, stats)
                     }
                 } else {
                     String::new()
                 };
-                format!("File: {}{} | Shift+arrows: select | Ctrl+D: autofill | Ctrl+S: save | Ctrl+O: load | F1/?: help | q: quit", filename, selection_info)
+                let comment_info = {
+                    let cell = app.workbook.current_sheet().get_cell(app.selected_row, app.selected_col);
+                    if let Some(ref comment) = cell.comment {
+                        format!(" | Comment: {}", comment)
+                    } else {
+                        String::new()
+                    }
+                };
+                format!("File: {}{}{} | Ctrl+S: save | Ctrl+O: load | F1/?: help | q: quit", filename, selection_info, comment_info)
             }
         }
         AppMode::Editing => format!("Editing: {} (Enter to save, Esc to cancel)", app.input),
@@ -157,6 +245,22 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
             };
             format!("Search: {}{} (Enter to finish, Esc to cancel, ↑↓: navigate)", app.search_query, results_info)
         }
+        AppMode::GoToCell => {
+            format!("Go to cell: {} (Enter to go, Esc to cancel)", app.goto_cell_input)
+        }
+        AppMode::FindReplace => {
+            let field = if app.find_replace_on_replace { "Replace" } else { "Find" };
+            let results_info = if app.find_replace_results.is_empty() {
+                if app.find_replace_search.is_empty() { String::new() } else { " (no results)".to_string() }
+            } else {
+                format!(" ({}/{})", app.find_replace_index + 1, app.find_replace_results.len())
+            };
+            format!("[{}] Find: {} | Replace: {}{} (Tab: switch, Enter: search/replace, Esc: close)",
+                field, app.find_replace_search, app.find_replace_replace, results_info)
+        }
+        AppMode::CommandPalette => {
+            format!(":{} (Enter to execute, Esc to cancel)", app.command_input)
+        }
     };
 
     let input = Paragraph::new(input_text)
@@ -170,6 +274,9 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
             AppMode::ExportCsv => Style::default().fg(Color::Magenta),
             AppMode::ImportCsv => Style::default().fg(Color::Green),
             AppMode::Search => Style::default().fg(Color::LightYellow),
+            AppMode::GoToCell => Style::default().fg(Color::Cyan),
+            AppMode::FindReplace => Style::default().fg(Color::LightYellow),
+            AppMode::CommandPalette => Style::default().fg(Color::Magenta),
         });
     f.render_widget(input, area);
 }

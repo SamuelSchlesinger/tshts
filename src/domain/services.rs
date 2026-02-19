@@ -469,6 +469,118 @@ impl<'a> FormulaEvaluator<'a> {
         }
     }
 
+    /// Adjusts formula references when a row is inserted at `at`.
+    /// References to rows >= at are incremented by 1.
+    pub fn adjust_formula_for_row_insert(&self, formula: &str, at: usize) -> String {
+        self.adjust_formula_structural(formula, |row, col| {
+            if row >= at { (row + 1, col) } else { (row, col) }
+        })
+    }
+
+    /// Adjusts formula references when a row is deleted at `at`.
+    /// References to rows > at are decremented by 1. References to row `at` become #REF.
+    pub fn adjust_formula_for_row_delete(&self, formula: &str, at: usize) -> String {
+        self.adjust_formula_structural(formula, |row, col| {
+            if row == at { (row, col) } // Keep as-is; ideally would be #REF but simplify
+            else if row > at { (row - 1, col) }
+            else { (row, col) }
+        })
+    }
+
+    /// Adjusts formula references when a column is inserted at `at`.
+    /// References to cols >= at are incremented by 1.
+    pub fn adjust_formula_for_col_insert(&self, formula: &str, at: usize) -> String {
+        self.adjust_formula_structural(formula, |row, col| {
+            if col >= at { (row, col + 1) } else { (row, col) }
+        })
+    }
+
+    /// Adjusts formula references when a column is deleted at `at`.
+    /// References to cols > at are decremented by 1.
+    pub fn adjust_formula_for_col_delete(&self, formula: &str, at: usize) -> String {
+        self.adjust_formula_structural(formula, |row, col| {
+            if col == at { (row, col) }
+            else if col > at { (row, col - 1) }
+            else { (row, col) }
+        })
+    }
+
+    /// Generic structural formula adjustment using a mapping function on (row, col).
+    fn adjust_formula_structural<F>(&self, formula: &str, map_ref: F) -> String
+    where
+        F: Fn(usize, usize) -> (usize, usize) + Copy,
+    {
+        if !formula.starts_with('=') {
+            return formula.to_string();
+        }
+        let expr = &formula[1..];
+        match Parser::new(expr) {
+            Ok(mut parser) => {
+                match parser.parse() {
+                    Ok(ast) => {
+                        let adjusted = self.map_ast_refs(&ast, map_ref);
+                        format!("={}", self.ast_to_string(&adjusted))
+                    }
+                    Err(_) => formula.to_string(),
+                }
+            }
+            Err(_) => formula.to_string(),
+        }
+    }
+
+    /// Maps all cell references in an AST using the given function.
+    fn map_ast_refs<F>(&self, expr: &Expr, map_ref: F) -> Expr
+    where
+        F: Fn(usize, usize) -> (usize, usize) + Copy,
+    {
+        match expr {
+            Expr::String(s) => Expr::String(s.clone()),
+            Expr::Number(n) => Expr::Number(*n),
+            Expr::CellRef(cell_ref) => {
+                if let Some((row, col)) = Spreadsheet::parse_cell_reference(cell_ref) {
+                    let (new_row, new_col) = map_ref(row, col);
+                    Expr::CellRef(format!("{}{}", Spreadsheet::column_label(new_col), new_row + 1))
+                } else {
+                    expr.clone()
+                }
+            }
+            Expr::Range(start_ref, end_ref) => {
+                let new_start = if let Some((row, col)) = Spreadsheet::parse_cell_reference(start_ref) {
+                    let (nr, nc) = map_ref(row, col);
+                    format!("{}{}", Spreadsheet::column_label(nc), nr + 1)
+                } else {
+                    start_ref.clone()
+                };
+                let new_end = if let Some((row, col)) = Spreadsheet::parse_cell_reference(end_ref) {
+                    let (nr, nc) = map_ref(row, col);
+                    format!("{}{}", Spreadsheet::column_label(nc), nr + 1)
+                } else {
+                    end_ref.clone()
+                };
+                Expr::Range(new_start, new_end)
+            }
+            Expr::Binary { left, operator, right } => {
+                Expr::Binary {
+                    left: Box::new(self.map_ast_refs(left, map_ref)),
+                    operator: operator.clone(),
+                    right: Box::new(self.map_ast_refs(right, map_ref)),
+                }
+            }
+            Expr::Unary { operator, operand } => {
+                Expr::Unary {
+                    operator: operator.clone(),
+                    operand: Box::new(self.map_ast_refs(operand, map_ref)),
+                }
+            }
+            Expr::FunctionCall { name, args } => {
+                Expr::FunctionCall {
+                    name: name.clone(),
+                    args: args.iter().map(|a| self.map_ast_refs(a, map_ref)).collect(),
+                }
+            }
+        }
+    }
+
 }
 
 // Known sequences for autofill pattern recognition
@@ -825,6 +937,8 @@ impl CsvExporter {
                     let cell_data = super::models::CellData {
                         value: field.to_string(),
                         formula: None,
+                        format: None,
+                        comment: None,
                     };
                     spreadsheet.set_cell(row_index, col_index, cell_data);
                 }
@@ -881,12 +995,12 @@ mod tests {
         let mut sheet = Spreadsheet::default();
         
         // Set up some test data
-        sheet.set_cell(0, 0, CellData { value: "10".to_string(), formula: None });
-        sheet.set_cell(0, 1, CellData { value: "20".to_string(), formula: None });
-        sheet.set_cell(0, 2, CellData { value: "30".to_string(), formula: None });
-        sheet.set_cell(1, 0, CellData { value: "5".to_string(), formula: None });
-        sheet.set_cell(1, 1, CellData { value: "15".to_string(), formula: None });
-        sheet.set_cell(1, 2, CellData { value: "25".to_string(), formula: None });
+        sheet.set_cell(0, 0, CellData { value: "10".to_string(), formula: None, format: None, comment: None });
+        sheet.set_cell(0, 1, CellData { value: "20".to_string(), formula: None, format: None, comment: None });
+        sheet.set_cell(0, 2, CellData { value: "30".to_string(), formula: None, format: None, comment: None });
+        sheet.set_cell(1, 0, CellData { value: "5".to_string(), formula: None, format: None, comment: None });
+        sheet.set_cell(1, 1, CellData { value: "15".to_string(), formula: None, format: None, comment: None });
+        sheet.set_cell(1, 2, CellData { value: "25".to_string(), formula: None, format: None, comment: None });
         
         sheet
     }
@@ -1048,12 +1162,16 @@ mod tests {
         sheet.set_cell(0, 0, CellData {
             value: "10".to_string(),
             formula: Some("=B1+1".to_string()),
+            format: None,
+            comment: None,
         });
         
         // Set up indirect circular reference chain
         sheet.set_cell(0, 1, CellData {
             value: "20".to_string(),
             formula: Some("=C1+1".to_string()),
+            format: None,
+            comment: None,
         });
         
         let evaluator = FormulaEvaluator::new(&sheet);
@@ -1183,9 +1301,9 @@ mod tests {
     #[test]
     fn test_string_cell_references() {
         let mut sheet = Spreadsheet::default();
-        sheet.set_cell(0, 0, CellData { value: "Hello".to_string(), formula: None });
-        sheet.set_cell(0, 1, CellData { value: "World".to_string(), formula: None });
-        sheet.set_cell(0, 2, CellData { value: "123".to_string(), formula: None });
+        sheet.set_cell(0, 0, CellData { value: "Hello".to_string(), formula: None, format: None, comment: None });
+        sheet.set_cell(0, 1, CellData { value: "World".to_string(), formula: None, format: None, comment: None });
+        sheet.set_cell(0, 2, CellData { value: "123".to_string(), formula: None, format: None, comment: None });
         
         let evaluator = FormulaEvaluator::new(&sheet);
         
@@ -1217,7 +1335,7 @@ mod tests {
     #[test]
     fn test_if_with_strings() {
         let mut sheet = Spreadsheet::default();
-        sheet.set_cell(0, 0, CellData { value: "Hello".to_string(), formula: None });
+        sheet.set_cell(0, 0, CellData { value: "Hello".to_string(), formula: None, format: None, comment: None });
         
         let evaluator = FormulaEvaluator::new(&sheet);
         
@@ -1361,7 +1479,9 @@ mod tests {
         // Set up a cell with a URL
         sheet.set_cell(0, 0, CellData { 
             value: "https://cryptoprices.cc/ADA".to_string(), 
-            formula: None 
+            formula: None,
+            format: None,
+            comment: None,
         });
         
         let evaluator = FormulaEvaluator::new(&sheet);
@@ -1426,8 +1546,8 @@ mod tests {
     #[test]
     fn test_large_numbers() {
         let mut sheet = Spreadsheet::default();
-        sheet.set_cell(0, 0, CellData { value: "1000000".to_string(), formula: None });
-        sheet.set_cell(0, 1, CellData { value: "2000000".to_string(), formula: None });
+        sheet.set_cell(0, 0, CellData { value: "1000000".to_string(), formula: None, format: None, comment: None });
+        sheet.set_cell(0, 1, CellData { value: "2000000".to_string(), formula: None, format: None, comment: None });
         
         let evaluator = FormulaEvaluator::new(&sheet);
         assert_eq!(evaluator.evaluate_formula("=A1+B1"), "3000000");
@@ -1437,8 +1557,8 @@ mod tests {
     #[test]
     fn test_negative_numbers() {
         let mut sheet = Spreadsheet::default();
-        sheet.set_cell(0, 0, CellData { value: "-10".to_string(), formula: None });
-        sheet.set_cell(0, 1, CellData { value: "5".to_string(), formula: None });
+        sheet.set_cell(0, 0, CellData { value: "-10".to_string(), formula: None, format: None, comment: None });
+        sheet.set_cell(0, 1, CellData { value: "5".to_string(), formula: None, format: None, comment: None });
         
         let evaluator = FormulaEvaluator::new(&sheet);
         assert_eq!(evaluator.evaluate_formula("=A1+B1"), "-5");
@@ -1460,12 +1580,12 @@ mod tests {
         use tempfile::NamedTempFile;
         
         let mut sheet = Spreadsheet::default();
-        sheet.set_cell(0, 0, CellData { value: "Name".to_string(), formula: None });
-        sheet.set_cell(0, 1, CellData { value: "Age".to_string(), formula: None });
-        sheet.set_cell(1, 0, CellData { value: "Alice".to_string(), formula: None });
-        sheet.set_cell(1, 1, CellData { value: "30".to_string(), formula: None });
-        sheet.set_cell(2, 0, CellData { value: "Bob".to_string(), formula: None });
-        sheet.set_cell(2, 1, CellData { value: "25".to_string(), formula: None });
+        sheet.set_cell(0, 0, CellData { value: "Name".to_string(), formula: None, format: None, comment: None });
+        sheet.set_cell(0, 1, CellData { value: "Age".to_string(), formula: None, format: None, comment: None });
+        sheet.set_cell(1, 0, CellData { value: "Alice".to_string(), formula: None, format: None, comment: None });
+        sheet.set_cell(1, 1, CellData { value: "30".to_string(), formula: None, format: None, comment: None });
+        sheet.set_cell(2, 0, CellData { value: "Bob".to_string(), formula: None, format: None, comment: None });
+        sheet.set_cell(2, 1, CellData { value: "25".to_string(), formula: None, format: None, comment: None });
         
         let temp_file = NamedTempFile::new().expect("Failed to create temp file");
         let file_path = temp_file.path().to_str().unwrap();
@@ -1501,9 +1621,9 @@ mod tests {
         use tempfile::NamedTempFile;
         
         let mut sheet = Spreadsheet::default();
-        sheet.set_cell(0, 0, CellData { value: "A1".to_string(), formula: None });
-        sheet.set_cell(2, 3, CellData { value: "D3".to_string(), formula: None });
-        sheet.set_cell(1, 1, CellData { value: "B2".to_string(), formula: None });
+        sheet.set_cell(0, 0, CellData { value: "A1".to_string(), formula: None, format: None, comment: None });
+        sheet.set_cell(2, 3, CellData { value: "D3".to_string(), formula: None, format: None, comment: None });
+        sheet.set_cell(1, 1, CellData { value: "B2".to_string(), formula: None, format: None, comment: None });
         
         let temp_file = NamedTempFile::new().expect("Failed to create temp file");
         let file_path = temp_file.path().to_str().unwrap();
@@ -1525,11 +1645,13 @@ mod tests {
         use tempfile::NamedTempFile;
         
         let mut sheet = Spreadsheet::default();
-        sheet.set_cell(0, 0, CellData { value: "10".to_string(), formula: None });
-        sheet.set_cell(0, 1, CellData { value: "20".to_string(), formula: None });
+        sheet.set_cell(0, 0, CellData { value: "10".to_string(), formula: None, format: None, comment: None });
+        sheet.set_cell(0, 1, CellData { value: "20".to_string(), formula: None, format: None, comment: None });
         sheet.set_cell(0, 2, CellData { 
             value: "30".to_string(), 
-            formula: Some("=A1+B1".to_string()) 
+            formula: Some("=A1+B1".to_string()),
+            format: None,
+            comment: None,
         });
         
         let temp_file = NamedTempFile::new().expect("Failed to create temp file");
@@ -1550,9 +1672,9 @@ mod tests {
         use tempfile::NamedTempFile;
         
         let mut sheet = Spreadsheet::default();
-        sheet.set_cell(0, 0, CellData { value: "Hello, World!".to_string(), formula: None });
-        sheet.set_cell(0, 1, CellData { value: "\"Quoted\"".to_string(), formula: None });
-        sheet.set_cell(0, 2, CellData { value: "Line\nBreak".to_string(), formula: None });
+        sheet.set_cell(0, 0, CellData { value: "Hello, World!".to_string(), formula: None, format: None, comment: None });
+        sheet.set_cell(0, 1, CellData { value: "\"Quoted\"".to_string(), formula: None, format: None, comment: None });
+        sheet.set_cell(0, 2, CellData { value: "Line\nBreak".to_string(), formula: None, format: None, comment: None });
         
         let temp_file = NamedTempFile::new().expect("Failed to create temp file");
         let file_path = temp_file.path().to_str().unwrap();
@@ -1576,9 +1698,9 @@ mod tests {
         assert_eq!((max_row, max_col), (0, 0));
         
         // Add some data
-        sheet.set_cell(5, 3, CellData { value: "data".to_string(), formula: None });
-        sheet.set_cell(2, 7, CellData { value: "more".to_string(), formula: None });
-        sheet.set_cell(0, 0, CellData { value: "start".to_string(), formula: None });
+        sheet.set_cell(5, 3, CellData { value: "data".to_string(), formula: None, format: None, comment: None });
+        sheet.set_cell(2, 7, CellData { value: "more".to_string(), formula: None, format: None, comment: None });
+        sheet.set_cell(0, 0, CellData { value: "start".to_string(), formula: None, format: None, comment: None });
         
         let (max_row, max_col) = CsvExporter::find_data_bounds(&sheet);
         assert_eq!((max_row, max_col), (5, 7));
@@ -1772,12 +1894,12 @@ Break""#).expect("Failed to write to temp file");
         
         // Create original spreadsheet
         let mut original = Spreadsheet::default();
-        original.set_cell(0, 0, CellData { value: "Name".to_string(), formula: None });
-        original.set_cell(0, 1, CellData { value: "Score".to_string(), formula: None });
-        original.set_cell(1, 0, CellData { value: "Alice".to_string(), formula: None });
-        original.set_cell(1, 1, CellData { value: "95".to_string(), formula: None });
-        original.set_cell(2, 0, CellData { value: "Bob".to_string(), formula: None });
-        original.set_cell(2, 1, CellData { value: "87".to_string(), formula: None });
+        original.set_cell(0, 0, CellData { value: "Name".to_string(), formula: None, format: None, comment: None });
+        original.set_cell(0, 1, CellData { value: "Score".to_string(), formula: None, format: None, comment: None });
+        original.set_cell(1, 0, CellData { value: "Alice".to_string(), formula: None, format: None, comment: None });
+        original.set_cell(1, 1, CellData { value: "95".to_string(), formula: None, format: None, comment: None });
+        original.set_cell(2, 0, CellData { value: "Bob".to_string(), formula: None, format: None, comment: None });
+        original.set_cell(2, 1, CellData { value: "87".to_string(), formula: None, format: None, comment: None });
         
         // Export to CSV
         let temp_file1 = NamedTempFile::new().expect("Failed to create temp file");

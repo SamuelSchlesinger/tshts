@@ -679,6 +679,362 @@ impl FunctionRegistry {
                 }
             }
         });
+
+        // --- Math functions ---
+
+        self.register_function("CEILING", |args| {
+            if args.len() != 1 {
+                Err("CEILING requires exactly 1 argument".to_string())
+            } else {
+                Ok(Value::Number(args[0].to_number().ceil()))
+            }
+        });
+
+        self.register_function("FLOOR", |args| {
+            if args.len() != 1 {
+                Err("FLOOR requires exactly 1 argument".to_string())
+            } else {
+                Ok(Value::Number(args[0].to_number().floor()))
+            }
+        });
+
+        self.register_function("INT", |args| {
+            if args.len() != 1 {
+                Err("INT requires exactly 1 argument".to_string())
+            } else {
+                Ok(Value::Number((args[0].to_number() as i64) as f64))
+            }
+        });
+
+        self.register_function("MOD", |args| {
+            if args.len() != 2 {
+                Err("MOD requires exactly 2 arguments".to_string())
+            } else {
+                let divisor = args[1].to_number();
+                if divisor == 0.0 {
+                    Err("MOD division by zero".to_string())
+                } else {
+                    Ok(Value::Number(args[0].to_number() % divisor))
+                }
+            }
+        });
+
+        self.register_function("LOG", |args| {
+            match args.len() {
+                1 => Ok(Value::Number(args[0].to_number().log10())),
+                2 => {
+                    let base = args[1].to_number();
+                    Ok(Value::Number(args[0].to_number().log(base)))
+                }
+                _ => Err("LOG requires 1 or 2 arguments".to_string()),
+            }
+        });
+
+        self.register_function("LN", |args| {
+            if args.len() != 1 {
+                Err("LN requires exactly 1 argument".to_string())
+            } else {
+                Ok(Value::Number(args[0].to_number().ln()))
+            }
+        });
+
+        self.register_function("EXP", |args| {
+            if args.len() != 1 {
+                Err("EXP requires exactly 1 argument".to_string())
+            } else {
+                Ok(Value::Number(args[0].to_number().exp()))
+            }
+        });
+
+        self.register_function("PI", |args| {
+            if !args.is_empty() {
+                Err("PI takes no arguments".to_string())
+            } else {
+                Ok(Value::Number(std::f64::consts::PI))
+            }
+        });
+
+        self.register_function("RAND", |_args| {
+            use std::time::SystemTime;
+            let seed = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos();
+            Ok(Value::Number(seed as f64 / u32::MAX as f64))
+        });
+
+        self.register_function("RANDBETWEEN", |args| {
+            if args.len() != 2 {
+                Err("RANDBETWEEN requires exactly 2 arguments".to_string())
+            } else {
+                use std::time::SystemTime;
+                let low = args[0].to_number();
+                let high = args[1].to_number();
+                let seed = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .subsec_nanos();
+                let result = (low + (seed as f64 / u32::MAX as f64) * (high - low + 1.0)).floor();
+                Ok(Value::Number(result))
+            }
+        });
+
+        self.register_function("SIGN", |args| {
+            if args.len() != 1 {
+                Err("SIGN requires exactly 1 argument".to_string())
+            } else {
+                let n = args[0].to_number();
+                let result = if n > 0.0 {
+                    1.0
+                } else if n < 0.0 {
+                    -1.0
+                } else {
+                    0.0
+                };
+                Ok(Value::Number(result))
+            }
+        });
+
+        self.register_function("POWER", |args| {
+            if args.len() != 2 {
+                Err("POWER requires exactly 2 arguments".to_string())
+            } else {
+                Ok(Value::Number(args[0].to_number().powf(args[1].to_number())))
+            }
+        });
+
+        // --- String functions ---
+
+        self.register_function("SUBSTITUTE", |args| {
+            if args.len() != 3 {
+                Err("SUBSTITUTE requires exactly 3 arguments".to_string())
+            } else {
+                let text = args[0].to_string();
+                let old = args[1].to_string();
+                let new = args[2].to_string();
+                Ok(Value::String(text.replace(&old, &new)))
+            }
+        });
+
+        self.register_function("REPLACE", |args| {
+            if args.len() != 4 {
+                Err("REPLACE requires exactly 4 arguments".to_string())
+            } else {
+                let text = args[0].to_string();
+                let start = args[1].to_number() as usize; // 1-based
+                let num_chars = args[2].to_number() as usize;
+                let new_text = args[3].to_string();
+                let chars: Vec<char> = text.chars().collect();
+                let start_idx = if start > 0 { start - 1 } else { 0 };
+                let end_idx = (start_idx + num_chars).min(chars.len());
+                let mut result = chars[..start_idx].iter().collect::<String>();
+                result.push_str(&new_text);
+                if end_idx < chars.len() {
+                    result.extend(chars[end_idx..].iter());
+                }
+                Ok(Value::String(result))
+            }
+        });
+
+        self.register_function("REPT", |args| {
+            if args.len() != 2 {
+                Err("REPT requires exactly 2 arguments".to_string())
+            } else {
+                let text = args[0].to_string();
+                let count = args[1].to_number() as usize;
+                Ok(Value::String(text.repeat(count)))
+            }
+        });
+
+        self.register_function("EXACT", |args| {
+            if args.len() != 2 {
+                Err("EXACT requires exactly 2 arguments".to_string())
+            } else {
+                let a = args[0].to_string();
+                let b = args[1].to_string();
+                Ok(Value::Number(if a == b { 1.0 } else { 0.0 }))
+            }
+        });
+
+        self.register_function("PROPER", |args| {
+            if args.len() != 1 {
+                Err("PROPER requires exactly 1 argument".to_string())
+            } else {
+                let text = args[0].to_string();
+                let mut result = String::new();
+                let mut capitalize_next = true;
+                for ch in text.chars() {
+                    if ch.is_whitespace() || ch == '-' || ch == '_' {
+                        result.push(ch);
+                        capitalize_next = true;
+                    } else if capitalize_next {
+                        for upper in ch.to_uppercase() {
+                            result.push(upper);
+                        }
+                        capitalize_next = false;
+                    } else {
+                        for lower in ch.to_lowercase() {
+                            result.push(lower);
+                        }
+                    }
+                }
+                Ok(Value::String(result))
+            }
+        });
+
+        self.register_function("CLEAN", |args| {
+            if args.len() != 1 {
+                Err("CLEAN requires exactly 1 argument".to_string())
+            } else {
+                let text = args[0].to_string();
+                let cleaned: String = text
+                    .chars()
+                    .filter(|c| c.is_ascii_graphic() || *c == ' ')
+                    .collect();
+                Ok(Value::String(cleaned))
+            }
+        });
+
+        self.register_function("CHAR", |args| {
+            if args.len() != 1 {
+                Err("CHAR requires exactly 1 argument".to_string())
+            } else {
+                let n = args[0].to_number() as u8;
+                Ok(Value::String(String::from(char::from(n))))
+            }
+        });
+
+        self.register_function("CODE", |args| {
+            if args.len() != 1 {
+                Err("CODE requires exactly 1 argument".to_string())
+            } else {
+                let text = args[0].to_string();
+                if let Some(ch) = text.chars().next() {
+                    Ok(Value::Number(ch as u32 as f64))
+                } else {
+                    Err("CODE requires a non-empty string".to_string())
+                }
+            }
+        });
+
+        self.register_function("TEXT", |args| {
+            if args.len() < 1 || args.len() > 2 {
+                Err("TEXT requires 1 or 2 arguments".to_string())
+            } else {
+                Ok(Value::String(args[0].to_string()))
+            }
+        });
+
+        self.register_function("VALUE", |args| {
+            if args.len() != 1 {
+                Err("VALUE requires exactly 1 argument".to_string())
+            } else {
+                let text = args[0].to_string();
+                match text.parse::<f64>() {
+                    Ok(n) => Ok(Value::Number(n)),
+                    Err(_) => Err(format!("VALUE: cannot convert '{}' to number", text)),
+                }
+            }
+        });
+
+        self.register_function("NUMBERVALUE", |args| {
+            if args.len() != 1 {
+                Err("NUMBERVALUE requires exactly 1 argument".to_string())
+            } else {
+                let text = args[0].to_string();
+                match text.parse::<f64>() {
+                    Ok(n) => Ok(Value::Number(n)),
+                    Err(_) => Err(format!("NUMBERVALUE: cannot convert '{}' to number", text)),
+                }
+            }
+        });
+
+        // --- Info functions ---
+
+        self.register_function("ISBLANK", |args| {
+            if args.len() != 1 {
+                Err("ISBLANK requires exactly 1 argument".to_string())
+            } else {
+                let is_blank = match &args[0] {
+                    Value::String(s) => s.is_empty(),
+                    Value::Number(_) => false,
+                };
+                Ok(Value::Number(if is_blank { 1.0 } else { 0.0 }))
+            }
+        });
+
+        self.register_function("ISNUMBER", |args| {
+            if args.len() != 1 {
+                Err("ISNUMBER requires exactly 1 argument".to_string())
+            } else {
+                let is_num = matches!(&args[0], Value::Number(_));
+                Ok(Value::Number(if is_num { 1.0 } else { 0.0 }))
+            }
+        });
+
+        self.register_function("ISTEXT", |args| {
+            if args.len() != 1 {
+                Err("ISTEXT requires exactly 1 argument".to_string())
+            } else {
+                let is_text = matches!(&args[0], Value::String(_));
+                Ok(Value::Number(if is_text { 1.0 } else { 0.0 }))
+            }
+        });
+
+        self.register_function("TYPE", |args| {
+            if args.len() != 1 {
+                Err("TYPE requires exactly 1 argument".to_string())
+            } else {
+                let type_num = match &args[0] {
+                    Value::Number(_) => 1.0,
+                    Value::String(_) => 2.0,
+                };
+                Ok(Value::Number(type_num))
+            }
+        });
+
+        // --- Stats functions ---
+
+        self.register_function("COUNT", |args| {
+            let count = args
+                .iter()
+                .filter(|v| matches!(v, Value::Number(_)))
+                .count();
+            Ok(Value::Number(count as f64))
+        });
+
+        self.register_function("COUNTA", |args| {
+            let count = args
+                .iter()
+                .filter(|v| match v {
+                    Value::Number(_) => true,
+                    Value::String(s) => !s.is_empty(),
+                })
+                .count();
+            Ok(Value::Number(count as f64))
+        });
+
+        // --- Visualization functions ---
+
+        self.register_function("SPARKLINE", |args| {
+            if args.is_empty() {
+                return Err("SPARKLINE requires at least one argument".to_string());
+            }
+            let values: Vec<f64> = args.iter().map(|v| v.to_number()).collect();
+            let min = values.iter().cloned().fold(f64::INFINITY, f64::min);
+            let max = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let blocks = [' ', '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}', '\u{2588}'];
+            let range = max - min;
+            let sparkline: String = values.iter().map(|&v| {
+                if range == 0.0 {
+                    blocks[4]
+                } else {
+                    let idx = ((v - min) / range * 8.0).round() as usize;
+                    blocks[idx.min(8)]
+                }
+            }).collect();
+            Ok(Value::String(sparkline))
+        });
     }
 }
 
@@ -1158,12 +1514,12 @@ mod tests {
 
     fn create_test_spreadsheet() -> Spreadsheet {
         let mut sheet = Spreadsheet::default();
-        sheet.set_cell(0, 0, CellData { value: "10".to_string(), formula: None });
-        sheet.set_cell(0, 1, CellData { value: "20".to_string(), formula: None });
-        sheet.set_cell(0, 2, CellData { value: "30".to_string(), formula: None });
-        sheet.set_cell(1, 0, CellData { value: "5".to_string(), formula: None });
-        sheet.set_cell(1, 1, CellData { value: "15".to_string(), formula: None });
-        sheet.set_cell(1, 2, CellData { value: "25".to_string(), formula: None });
+        sheet.set_cell(0, 0, CellData { value: "10".to_string(), formula: None, format: None, comment: None });
+        sheet.set_cell(0, 1, CellData { value: "20".to_string(), formula: None, format: None, comment: None });
+        sheet.set_cell(0, 2, CellData { value: "30".to_string(), formula: None, format: None, comment: None });
+        sheet.set_cell(1, 0, CellData { value: "5".to_string(), formula: None, format: None, comment: None });
+        sheet.set_cell(1, 1, CellData { value: "15".to_string(), formula: None, format: None, comment: None });
+        sheet.set_cell(1, 2, CellData { value: "25".to_string(), formula: None, format: None, comment: None });
         sheet
     }
 
@@ -1486,9 +1842,9 @@ mod tests {
     #[test]
     fn test_expression_evaluator_string_cells() {
         let mut sheet = Spreadsheet::default();
-        sheet.set_cell(0, 0, CellData { value: "Hello".to_string(), formula: None });
-        sheet.set_cell(0, 1, CellData { value: "World".to_string(), formula: None });
-        sheet.set_cell(0, 2, CellData { value: "123".to_string(), formula: None }); // Number as string
+        sheet.set_cell(0, 0, CellData { value: "Hello".to_string(), formula: None, format: None, comment: None });
+        sheet.set_cell(0, 1, CellData { value: "World".to_string(), formula: None, format: None, comment: None });
+        sheet.set_cell(0, 2, CellData { value: "123".to_string(), formula: None, format: None, comment: None }); // Number as string
         
         let registry = FunctionRegistry::new();
         let evaluator = ExpressionEvaluator::new(&sheet, &registry);
@@ -2108,6 +2464,63 @@ mod tests {
                 }
             }
             _ => panic!("Expected concatenation expression at top level"),
+        }
+    }
+
+    #[test]
+    fn test_sparkline_basic() {
+        let mut sheet = Spreadsheet::default();
+        sheet.set_cell(0, 0, CellData { value: "1".to_string(), formula: None, format: None, comment: None });
+        sheet.set_cell(0, 1, CellData { value: "5".to_string(), formula: None, format: None, comment: None });
+        sheet.set_cell(0, 2, CellData { value: "10".to_string(), formula: None, format: None, comment: None });
+
+        let registry = FunctionRegistry::new();
+        let evaluator = ExpressionEvaluator::new(&sheet, &registry);
+        let expr = Parser::new("SPARKLINE(A1:C1)").unwrap().parse().unwrap();
+        let result = evaluator.evaluate(&expr);
+        assert!(result.is_ok());
+        match result.unwrap() {
+            Value::String(val) => assert_eq!(val.chars().count(), 3),
+            _ => panic!("Expected string from SPARKLINE"),
+        }
+    }
+
+    #[test]
+    fn test_sparkline_all_equal() {
+        let mut sheet = Spreadsheet::default();
+        sheet.set_cell(0, 0, CellData { value: "5".to_string(), formula: None, format: None, comment: None });
+        sheet.set_cell(0, 1, CellData { value: "5".to_string(), formula: None, format: None, comment: None });
+        sheet.set_cell(0, 2, CellData { value: "5".to_string(), formula: None, format: None, comment: None });
+
+        let registry = FunctionRegistry::new();
+        let evaluator = ExpressionEvaluator::new(&sheet, &registry);
+        let expr = Parser::new("SPARKLINE(A1:C1)").unwrap().parse().unwrap();
+        let result = evaluator.evaluate(&expr);
+        assert!(result.is_ok());
+        match result.unwrap() {
+            Value::String(val) => {
+                assert_eq!(val.chars().count(), 3);
+                let chars: Vec<char> = val.chars().collect();
+                assert_eq!(chars[0], chars[1]);
+                assert_eq!(chars[1], chars[2]);
+            }
+            _ => panic!("Expected string from SPARKLINE"),
+        }
+    }
+
+    #[test]
+    fn test_sparkline_single_value() {
+        let mut sheet = Spreadsheet::default();
+        sheet.set_cell(0, 0, CellData { value: "7".to_string(), formula: None, format: None, comment: None });
+
+        let registry = FunctionRegistry::new();
+        let evaluator = ExpressionEvaluator::new(&sheet, &registry);
+        let expr = Parser::new("SPARKLINE(A1)").unwrap().parse().unwrap();
+        let result = evaluator.evaluate(&expr);
+        assert!(result.is_ok());
+        match result.unwrap() {
+            Value::String(val) => assert_eq!(val.chars().count(), 1),
+            _ => panic!("Expected string from SPARKLINE"),
         }
     }
 }
