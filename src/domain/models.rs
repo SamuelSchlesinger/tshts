@@ -641,12 +641,13 @@ impl Spreadsheet {
     pub fn auto_resize_column(&mut self, col: usize) {
         let mut max_width = Self::column_label(col).len();
 
-        for row in 0..self.rows {
-            let cell = self.get_cell(row, col);
-            let value_width = cell.value.len();
-            let formula_width = cell.formula.as_ref().map(|f| f.len()).unwrap_or(0);
-            let content_width = value_width.max(formula_width);
-            max_width = max_width.max(content_width);
+        for (&(_, c), cell) in &self.cells {
+            if c == col {
+                let value_width = cell.value.len();
+                let formula_width = cell.formula.as_ref().map(|f| f.len()).unwrap_or(0);
+                let content_width = value_width.max(formula_width);
+                max_width = max_width.max(content_width);
+            }
         }
 
         max_width = max_width.max(3).min(50);
@@ -694,7 +695,13 @@ impl Spreadsheet {
                 let adjusted = evaluator.adjust_formula_for_row_insert(&formula, at);
                 if adjusted != formula {
                     let value = evaluator.evaluate_formula(&adjusted);
-                    updates.push((row, col, CellData { value, formula: Some(adjusted), format: None, comment: None }));
+                    let existing = self.cells.get(&(row, col));
+                    updates.push((row, col, CellData {
+                        value,
+                        formula: Some(adjusted),
+                        format: existing.and_then(|c| c.format.clone()),
+                        comment: existing.and_then(|c| c.comment.clone()),
+                    }));
                 }
             }
             updates
@@ -739,7 +746,13 @@ impl Spreadsheet {
                 let adjusted = evaluator.adjust_formula_for_row_delete(&formula, at);
                 if adjusted != formula {
                     let value = evaluator.evaluate_formula(&adjusted);
-                    updates.push((row, col, CellData { value, formula: Some(adjusted), format: None, comment: None }));
+                    let existing = self.cells.get(&(row, col));
+                    updates.push((row, col, CellData {
+                        value,
+                        formula: Some(adjusted),
+                        format: existing.and_then(|c| c.format.clone()),
+                        comment: existing.and_then(|c| c.comment.clone()),
+                    }));
                 }
             }
             updates
@@ -793,7 +806,13 @@ impl Spreadsheet {
                 let adjusted = evaluator.adjust_formula_for_col_insert(&formula, at);
                 if adjusted != formula {
                     let value = evaluator.evaluate_formula(&adjusted);
-                    updates.push((row, col, CellData { value, formula: Some(adjusted), format: None, comment: None }));
+                    let existing = self.cells.get(&(row, col));
+                    updates.push((row, col, CellData {
+                        value,
+                        formula: Some(adjusted),
+                        format: existing.and_then(|c| c.format.clone()),
+                        comment: existing.and_then(|c| c.comment.clone()),
+                    }));
                 }
             }
             updates
@@ -851,7 +870,13 @@ impl Spreadsheet {
                 let adjusted = evaluator.adjust_formula_for_col_delete(&formula, at);
                 if adjusted != formula {
                     let value = evaluator.evaluate_formula(&adjusted);
-                    updates.push((row, col, CellData { value, formula: Some(adjusted), format: None, comment: None }));
+                    let existing = self.cells.get(&(row, col));
+                    updates.push((row, col, CellData {
+                        value,
+                        formula: Some(adjusted),
+                        format: existing.and_then(|c| c.format.clone()),
+                        comment: existing.and_then(|c| c.comment.clone()),
+                    }));
                 }
             }
             updates

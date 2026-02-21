@@ -702,7 +702,7 @@ impl FunctionRegistry {
             if args.len() != 1 {
                 Err("INT requires exactly 1 argument".to_string())
             } else {
-                Ok(Value::Number((args[0].to_number() as i64) as f64))
+                Ok(Value::Number(args[0].to_number().trunc()))
             }
         });
 
@@ -756,11 +756,11 @@ impl FunctionRegistry {
 
         self.register_function("RAND", |_args| {
             use std::time::SystemTime;
-            let seed = SystemTime::now()
+            let nanos = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap_or_default()
                 .subsec_nanos();
-            Ok(Value::Number(seed as f64 / u32::MAX as f64))
+            Ok(Value::Number(nanos as f64 / 1_000_000_000.0))
         });
 
         self.register_function("RANDBETWEEN", |args| {
@@ -899,8 +899,11 @@ impl FunctionRegistry {
             if args.len() != 1 {
                 Err("CHAR requires exactly 1 argument".to_string())
             } else {
-                let n = args[0].to_number() as u8;
-                Ok(Value::String(String::from(char::from(n))))
+                let n = args[0].to_number() as u32;
+                match char::from_u32(n) {
+                    Some(c) => Ok(Value::String(String::from(c))),
+                    None => Err(format!("CHAR: {} is not a valid character code", n)),
+                }
             }
         });
 

@@ -6,6 +6,21 @@
 use crate::domain::{Spreadsheet, Workbook, CellData, CellFormat, NumberFormat, TerminalColor, FormulaEvaluator};
 use std::collections::{HashSet, VecDeque};
 
+/// Performs case-insensitive string replacement, preserving the replacement text as-is.
+fn case_insensitive_replace(text: &str, search: &str, replacement: &str) -> String {
+    let lower_text = text.to_lowercase();
+    let lower_search = search.to_lowercase();
+    let mut result = String::new();
+    let mut start = 0;
+    while let Some(pos) = lower_text[start..].find(&lower_search) {
+        result.push_str(&text[start..start + pos]);
+        result.push_str(replacement);
+        start += pos + search.len();
+    }
+    result.push_str(&text[start..]);
+    result
+}
+
 /// Represents the current mode of the application.
 ///
 /// The application can be in different modes that determine how user input
@@ -207,7 +222,12 @@ impl App {
     /// Checks for circular references before applying the formula.
     /// Returns to normal mode after completion.
     pub fn finish_editing(&mut self) {
-        let mut cell_data = CellData::default();
+        let existing = self.workbook.current_sheet().get_cell(self.selected_row, self.selected_col);
+        let mut cell_data = CellData {
+            format: existing.format.clone(),
+            comment: existing.comment.clone(),
+            ..CellData::default()
+        };
         
         if self.input.starts_with('=') {
             let evaluator = FormulaEvaluator::new(self.workbook.current_sheet());
@@ -234,7 +254,12 @@ impl App {
 
     /// Completes editing and moves right (for Tab key).
     pub fn finish_editing_move_right(&mut self) {
-        let mut cell_data = CellData::default();
+        let existing = self.workbook.current_sheet().get_cell(self.selected_row, self.selected_col);
+        let mut cell_data = CellData {
+            format: existing.format.clone(),
+            comment: existing.comment.clone(),
+            ..CellData::default()
+        };
 
         if self.input.starts_with('=') {
             let evaluator = FormulaEvaluator::new(self.workbook.current_sheet());
@@ -642,23 +667,19 @@ impl App {
 
         let query_lower = self.search_query.to_lowercase();
 
-        // Search through all cells
-        for row in 0..self.workbook.current_sheet().rows {
-            for col in 0..self.workbook.current_sheet().cols {
-                let cell = self.workbook.current_sheet().get_cell(row, col);
-                
-                // Search in both value and formula (if present)
-                let value_matches = cell.value.to_lowercase().contains(&query_lower);
-                let formula_matches = cell.formula
-                    .as_ref()
-                    .map(|f| f.to_lowercase().contains(&query_lower))
-                    .unwrap_or(false);
+        // Search through populated cells only
+        for (&(row, col), cell) in &self.workbook.current_sheet().cells {
+            let value_matches = cell.value.to_lowercase().contains(&query_lower);
+            let formula_matches = cell.formula
+                .as_ref()
+                .map(|f| f.to_lowercase().contains(&query_lower))
+                .unwrap_or(false);
 
-                if value_matches || formula_matches {
-                    self.search_results.push((row, col));
-                }
+            if value_matches || formula_matches {
+                self.search_results.push((row, col));
             }
         }
+        self.search_results.sort();
 
         // Move to first result if any found
         if !self.search_results.is_empty() {
@@ -908,7 +929,7 @@ impl App {
                     let col_offset = target_col as i32 - (clipboard.source_col + col_off) as i32;
                     let adjusted = evaluator.adjust_formula_references(formula, row_offset, col_offset);
                     let value = evaluator.evaluate_formula(&adjusted);
-                    CellData { value, formula: Some(adjusted), format: None, comment: None }
+                    CellData { value, formula: Some(adjusted), format: cell.format.clone(), comment: cell.comment.clone() }
                 } else {
                     cell.clone()
                 };
@@ -1050,8 +1071,8 @@ impl App {
         let (row, col) = self.find_replace_results[self.find_replace_index];
         let cell = self.workbook.current_sheet().get_cell(row, col);
         if cell.formula.is_some() { return; } // Don't replace in formula cells
-        let new_value = cell.value.replace(&self.find_replace_search, &self.find_replace_replace);
-        let new_cell = CellData { value: new_value, formula: None, format: None, comment: None };
+        let new_value = case_insensitive_replace(&cell.value, &self.find_replace_search, &self.find_replace_replace);
+        let new_cell = CellData { value: new_value, formula: None, format: cell.format.clone(), comment: cell.comment.clone() };
         self.set_cell_with_undo(row, col, new_cell);
         // Re-search and move to next
         self.find_replace_search();
@@ -1066,8 +1087,8 @@ impl App {
             let cell = self.workbook.current_sheet().get_cell(row, col);
             if cell.formula.is_some() { continue; }
             let old_cell = Some(cell.clone());
-            let new_value = cell.value.replace(&self.find_replace_search, &self.find_replace_replace);
-            let new_cell = CellData { value: new_value, formula: None, format: None, comment: None };
+            let new_value = case_insensitive_replace(&cell.value, &self.find_replace_search, &self.find_replace_replace);
+            let new_cell = CellData { value: new_value, formula: None, format: cell.format.clone(), comment: cell.comment.clone() };
             batch.push(UndoAction::CellModified { row, col, old_cell, new_cell: Some(new_cell.clone()) });
             self.workbook.current_sheet_mut().set_cell(row, col, new_cell);
         }
@@ -1254,7 +1275,10 @@ impl App {
             max_row = max_row.max(r);
             max_col = max_col.max(c);
         }
-        if max_row == 0 { return; }
+        if max_row == 0 {
+            self.status_message = Some("Nothing to sort".to_string());
+            return;
+        }
 
         // Collect all rows as Vec of cell data
         let mut rows: Vec<Vec<Option<CellData>>> = Vec::new();
@@ -1341,7 +1365,10 @@ impl App {
                 let mut cell = self.workbook.current_sheet().get_cell(row, col);
                 let format = match &number_format {
                     NumberFormat::General => None,
-                    _ => Some(CellFormat { number_format: number_format.clone(), ..CellFormat::default() }),
+                    _ => {
+                        let existing_style = cell.format.as_ref().map(|f| f.style.clone()).unwrap_or_default();
+                        Some(CellFormat { number_format: number_format.clone(), style: existing_style })
+                    }
                 };
                 cell.format = format;
                 self.workbook.current_sheet_mut().set_cell(row, col, cell);

@@ -202,13 +202,21 @@ impl<'a> FormulaEvaluator<'a> {
                 false
             }
             Expr::Range(start_cell, end_cell) => {
-                // Check both start and end cells of the range
-                if let (Some((start_row, start_col)), Some((end_row, end_col))) = 
+                if let (Some((start_row, start_col)), Some((end_row, end_col))) =
                     (Spreadsheet::parse_cell_reference(start_cell), Spreadsheet::parse_cell_reference(end_cell)) {
                     for row in start_row..=end_row {
                         for col in start_col..=end_col {
                             if (row, col) == target_cell {
                                 return true;
+                            }
+                            if !visited.contains(&(row, col)) {
+                                visited.insert((row, col));
+                                let cell = self.spreadsheet.get_cell(row, col);
+                                if let Some(ref cell_formula) = cell.formula {
+                                    if self.check_circular_in_formula(cell_formula, target_cell, visited) {
+                                        return true;
+                                    }
+                                }
                             }
                         }
                     }
