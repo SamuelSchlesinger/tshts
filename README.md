@@ -165,20 +165,21 @@ TSHTS supports a powerful multi-type formula system that handles both numbers an
 =TRIM("  spaces  ")   → spaces (remove leading/trailing spaces)
 ```
 
-#### String Extraction (0-based indexing)
+#### String Extraction (1-based, Excel-compatible)
 ```
 =LEFT("Hello World", 5)    → Hello (first 5 characters)
 =RIGHT("Hello World", 5)   → World (last 5 characters)
-=MID("Hello World", 6, 5)  → World (5 chars starting at position 6)
-=FIND("lo", "Hello")       → 3 (position of "lo" in "Hello")
-=FIND("World", "Hello World")  → 6 (position of "World")
+=MID("Hello World", 7, 5)  → World (5 chars starting at position 7)
+=FIND("lo", "Hello")       → 4 (case-sensitive; 'l' of "lo" is at position 4)
+=FIND("World", "Hello World")  → 7
+=SEARCH("WORLD", "Hello World") → 7 (case-insensitive FIND)
 ```
 
 #### Advanced String Operations
 ```
 =CONCAT("A", "B", "C")      → ABC (concatenate multiple values)
 =CONCAT("Number: ", 123)    → Number: 123
-=FIND("text", A1, 3)        → Find "text" in A1 starting from position 3
+=FIND("text", A1, 4)        → Find "text" in A1 starting from position 4
 ```
 
 ### 🌐 Web Functions
@@ -217,6 +218,17 @@ TSHTS supports a powerful multi-type formula system that handles both numbers an
 =CONCAT(A1:A3)    → Concatenate all values in range A1:A3
 ```
 
+#### Absolute vs Relative References
+Use `$` to lock a component so it doesn't shift when the formula is copied,
+pasted, or when rows/columns are inserted.
+```
+=A1               → fully relative (both row and column shift)
+=$A1              → column A is locked, row shifts
+=A$1              → row 1 is locked, column shifts
+=$A$1             → both locked — always the same cell
+=SUM($A$1:B2)     → mix of absolute and relative in a range
+```
+
 ### 🔄 Type Conversion
 TSHTS automatically handles type conversion:
 - **Numeric operations**: Strings are converted to numbers (empty/invalid = 0)
@@ -249,8 +261,8 @@ TSHTS automatically handles type conversion:
 
 ### ⚠️ Important Notes
 
-- **String Indexing**: All string functions use 0-based indexing (FIND, MID, etc.)
-- **Case Sensitivity**: String comparisons are case-sensitive
+- **String Indexing**: String functions use 1-based Excel-compatible indexing (position 1 is the first character)
+- **Case Sensitivity**: String comparisons and `FIND` are case-sensitive; use `SEARCH` for case-insensitive matching
 - **Error Handling**: Invalid operations return `#ERROR`
 - **Empty Strings**: `""` is considered different from empty cells
 - **Quotes in Strings**: Use double quotes to escape: `"Quote""Test"` → `Quote"Test`

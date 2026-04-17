@@ -542,25 +542,45 @@ impl Spreadsheet {
     /// assert_eq!(Spreadsheet::parse_cell_reference("invalid"), None);
     /// ```
     pub fn parse_cell_reference(cell_ref: &str) -> Option<(usize, usize)> {
+        Self::parse_cell_reference_abs(cell_ref).map(|(r, c, _, _)| (r, c))
+    }
+
+    /// Parses a cell reference and returns (row, col, abs_row, abs_col).
+    ///
+    /// Accepts optional `$` markers for absolute addressing, e.g. `$A$1`,
+    /// `$A1`, `A$1`, `A1`.
+    pub fn parse_cell_reference_abs(cell_ref: &str) -> Option<(usize, usize, bool, bool)> {
         if cell_ref.is_empty() {
             return None;
         }
-        
-        let mut chars = cell_ref.chars();
+
+        let mut chars = cell_ref.chars().peekable();
         let mut col_str = String::new();
         let mut row_str = String::new();
-        
-        for ch in chars.by_ref() {
+
+        let abs_col = if chars.peek() == Some(&'$') {
+            chars.next();
+            true
+        } else {
+            false
+        };
+
+        while let Some(&ch) = chars.peek() {
             if ch.is_ascii_alphabetic() {
                 col_str.push(ch.to_ascii_uppercase());
-            } else if ch.is_ascii_digit() {
-                row_str.push(ch);
-                break;
+                chars.next();
             } else {
-                return None;
+                break;
             }
         }
-        
+
+        let abs_row = if chars.peek() == Some(&'$') {
+            chars.next();
+            true
+        } else {
+            false
+        };
+
         for ch in chars {
             if ch.is_ascii_digit() {
                 row_str.push(ch);
@@ -568,15 +588,30 @@ impl Spreadsheet {
                 return None;
             }
         }
-        
+
         if col_str.is_empty() || row_str.is_empty() {
             return None;
         }
-        
+
         let col = Self::column_str_to_index(&col_str)?;
         let row = row_str.parse::<usize>().ok()?.checked_sub(1)?;
-        
-        Some((row, col))
+
+        Some((row, col, abs_row, abs_col))
+    }
+
+    /// Formats a cell reference with optional absolute markers.
+    pub fn format_cell_reference(row: usize, col: usize, abs_row: bool, abs_col: bool) -> String {
+        let col_part = Self::column_label(col);
+        let mut out = String::with_capacity(col_part.len() + 4);
+        if abs_col {
+            out.push('$');
+        }
+        out.push_str(&col_part);
+        if abs_row {
+            out.push('$');
+        }
+        out.push_str(&(row + 1).to_string());
+        out
     }
     
     /// Converts a column label string to a zero-based column index.
@@ -638,6 +673,7 @@ impl Spreadsheet {
     /// # Arguments
     ///
     /// * `col` - Zero-based column index
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn auto_resize_column(&mut self, col: usize) {
         let mut max_width = Self::column_label(col).len();
 
@@ -656,10 +692,24 @@ impl Spreadsheet {
 
     /// Automatically resizes all columns to fit their content.
     ///
-    /// Calls `auto_resize_column` for each column in the spreadsheet.
+    /// Single-pass over existing cells rather than O(cols * cells).
     pub fn auto_resize_all_columns(&mut self) {
-        for col in 0..self.cols {
-            self.auto_resize_column(col);
+        let mut max_widths: std::collections::HashMap<usize, usize> =
+            (0..self.cols).map(|c| (c, Self::column_label(c).len())).collect();
+
+        for (&(_, c), cell) in &self.cells {
+            let value_width = cell.value.len();
+            let formula_width = cell.formula.as_ref().map(|f| f.len()).unwrap_or(0);
+            let content_width = value_width.max(formula_width);
+            let entry = max_widths.entry(c).or_insert(0);
+            if content_width > *entry {
+                *entry = content_width;
+            }
+        }
+
+        for (col, width) in max_widths {
+            let w = width.max(3).min(50);
+            self.set_column_width(col, w);
         }
     }
 

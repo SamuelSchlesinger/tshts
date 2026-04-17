@@ -111,6 +111,85 @@ impl Value {
     }
 }
 
+/// Structured formula evaluation error.
+///
+/// Variants map to Excel-style error codes for display (`#DIV/0!`, `#REF!`,
+/// `#VALUE!`, `#NAME?`, `#N/A`, `#ERROR`). Pattern match on the variant to
+/// build richer UI messages.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FormulaError {
+    DivisionByZero,
+    InvalidReference(String),
+    UnknownFunction(String),
+    TypeMismatch(String),
+    NotFound(String),
+    Network(String),
+    Parse(String),
+    Other(String),
+}
+
+impl FormulaError {
+    /// Short Excel-style error code used when rendering to a cell.
+    pub fn code(&self) -> &'static str {
+        match self {
+            FormulaError::DivisionByZero => "#DIV/0!",
+            FormulaError::InvalidReference(_) => "#REF!",
+            FormulaError::UnknownFunction(_) => "#NAME?",
+            FormulaError::TypeMismatch(_) => "#VALUE!",
+            FormulaError::NotFound(_) => "#N/A",
+            FormulaError::Network(_) => "#NETWORK!",
+            FormulaError::Parse(_) => "#ERROR",
+            FormulaError::Other(_) => "#ERROR",
+        }
+    }
+}
+
+impl std::fmt::Display for FormulaError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FormulaError::DivisionByZero => write!(f, "#DIV/0!"),
+            FormulaError::InvalidReference(s) => write!(f, "#REF! ({})", s),
+            FormulaError::UnknownFunction(name) => write!(f, "#NAME? (unknown function {})", name),
+            FormulaError::TypeMismatch(s) => write!(f, "#VALUE! ({})", s),
+            FormulaError::NotFound(s) => write!(f, "#N/A ({})", s),
+            FormulaError::Network(s) => write!(f, "#NETWORK! ({})", s),
+            FormulaError::Parse(s) => write!(f, "#ERROR (parse: {})", s),
+            FormulaError::Other(s) => write!(f, "#ERROR ({})", s),
+        }
+    }
+}
+
+impl std::error::Error for FormulaError {}
+
+impl From<&str> for FormulaError {
+    fn from(s: &str) -> Self {
+        FormulaError::Other(s.into())
+    }
+}
+
+impl From<String> for FormulaError {
+    fn from(s: String) -> Self {
+        FormulaError::Other(s)
+    }
+}
+
+/// Compares two f64 values with user-friendly tolerance, so common rounding
+/// artifacts like `0.1 + 0.2 == 0.3` evaluate true.
+///
+/// Uses a relative tolerance scaled to operand magnitude, plus a small absolute
+/// floor for values near zero. NaN is never equal to anything.
+pub(crate) fn numbers_equal(a: f64, b: f64) -> bool {
+    if a.is_nan() || b.is_nan() {
+        return false;
+    }
+    if a == b {
+        return true;
+    }
+    let diff = (a - b).abs();
+    let scale = a.abs().max(b.abs());
+    diff <= 1e-9_f64.max(scale * 1e-12)
+}
+
 /// Represents an Abstract Syntax Tree node for expressions.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
@@ -247,18 +326,19 @@ impl Lexer {
     }
     
     /// Reads an identifier (function name or cell reference).
+    /// Accepts `$` as part of cell-reference addressing (e.g. `$A$1`).
     fn read_identifier(&mut self) -> String {
         let mut identifier = String::new();
-        
+
         while let Some(ch) = self.current_char {
-            if ch.is_ascii_alphanumeric() || ch == '_' {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '$' {
                 identifier.push(ch.to_ascii_uppercase());
                 self.advance();
             } else {
                 break;
             }
         }
-        
+
         identifier
     }
     
@@ -283,16 +363,27 @@ impl Lexer {
             }
         }
         
-        Err("Unterminated string literal".to_string())
+        Err("Unterminated string literal".into())
     }
     
     /// Determines if an identifier is a cell reference or function name.
     fn classify_identifier(&self, identifier: &str) -> Token {
-        // Check if it's a cell reference (letters followed by numbers)
+        // A cell reference is (optional `$`) letters (optional `$`) digits.
+        // Function / plain identifiers never contain `$`.
+        let has_dollar = identifier.contains('$');
+        if has_dollar {
+            if Spreadsheet::parse_cell_reference_abs(identifier).is_some() {
+                return Token::CellRef(identifier.into());
+            }
+            // A $ in a non-cell-ref identifier is invalid; fall through to Identifier
+            // so the parser can reject it with a sensible error.
+            return Token::Identifier(identifier.into());
+        }
+
         let mut has_letters = false;
         let mut has_numbers = false;
         let mut letters_first = true;
-        
+
         for ch in identifier.chars() {
             if ch.is_ascii_alphabetic() {
                 if has_numbers {
@@ -303,12 +394,11 @@ impl Lexer {
                 has_numbers = true;
             }
         }
-        
-        // Valid cell reference: letters followed by numbers (A1, B2, AA123, etc.)
+
         if has_letters && has_numbers && letters_first {
-            Token::CellRef(identifier.to_string())
+            Token::CellRef(identifier.into())
         } else {
-            Token::Identifier(identifier.to_string())
+            Token::Identifier(identifier.into())
         }
     }
     
@@ -326,10 +416,10 @@ impl Lexer {
                     Ok(Token::Number(number))
                 }
                 
-                // Identifiers and cell references
-                'A'..='Z' | 'a'..='z' => {
+                // Identifiers and cell references (incl. absolute $A$1).
+                'A'..='Z' | 'a'..='z' | '$' => {
                     let identifier = self.read_identifier();
-                    
+
                     // All identifiers are treated as either cell references or function names
                     Ok(self.classify_identifier(&identifier))
                 }
@@ -438,7 +528,7 @@ impl Lexer {
 }
 
 /// Function signature for built-in and user-defined functions.
-pub type FunctionImpl = fn(&[Value]) -> Result<Value, String>;
+pub type FunctionImpl = fn(&[Value]) -> Result<Value, FormulaError>;
 
 /// Registry for spreadsheet functions.
 pub struct FunctionRegistry {
@@ -477,7 +567,7 @@ impl FunctionRegistry {
         
         self.register_function("AVERAGE", |args| {
             if args.is_empty() {
-                Err("AVERAGE requires at least one argument".to_string())
+                Err("AVERAGE requires at least one argument".into())
             } else {
                 let sum: f64 = args.iter().map(|v| v.to_number()).sum();
                 Ok(Value::Number(sum / args.len() as f64))
@@ -487,18 +577,18 @@ impl FunctionRegistry {
         self.register_function("MIN", |args| {
             args.iter().map(|v| v.to_number()).fold(None, |acc: Option<f64>, x| {
                 Some(acc.map_or(x, |a| a.min(x)))
-            }).map(Value::Number).ok_or_else(|| "MIN requires at least one argument".to_string())
+            }).map(Value::Number).ok_or_else(|| "MIN requires at least one argument".into())
         });
         
         self.register_function("MAX", |args| {
             args.iter().map(|v| v.to_number()).fold(None, |acc: Option<f64>, x| {
                 Some(acc.map_or(x, |a| a.max(x)))
-            }).map(Value::Number).ok_or_else(|| "MAX requires at least one argument".to_string())
+            }).map(Value::Number).ok_or_else(|| "MAX requires at least one argument".into())
         });
         
         self.register_function("IF", |args| {
             if args.len() != 3 {
-                Err("IF requires exactly 3 arguments".to_string())
+                Err("IF requires exactly 3 arguments".into())
             } else {
                 Ok(if args[0].is_truthy() { args[1].clone() } else { args[2].clone() })
             }
@@ -516,7 +606,7 @@ impl FunctionRegistry {
         
         self.register_function("NOT", |args| {
             if args.len() != 1 {
-                Err("NOT requires exactly 1 argument".to_string())
+                Err("NOT requires exactly 1 argument".into())
             } else {
                 let result = !args[0].is_truthy();
                 Ok(Value::Number(if result { 1.0 } else { 0.0 }))
@@ -525,7 +615,7 @@ impl FunctionRegistry {
         
         self.register_function("ABS", |args| {
             if args.len() != 1 {
-                Err("ABS requires exactly 1 argument".to_string())
+                Err("ABS requires exactly 1 argument".into())
             } else {
                 Ok(Value::Number(args[0].to_number().abs()))
             }
@@ -533,11 +623,11 @@ impl FunctionRegistry {
         
         self.register_function("SQRT", |args| {
             if args.len() != 1 {
-                Err("SQRT requires exactly 1 argument".to_string())
+                Err("SQRT requires exactly 1 argument".into())
             } else {
                 let num = args[0].to_number();
                 if num < 0.0 {
-                    Err("SQRT of negative number".to_string())
+                    Err("SQRT of negative number".into())
                 } else {
                     Ok(Value::Number(num.sqrt()))
                 }
@@ -553,7 +643,7 @@ impl FunctionRegistry {
                     let multiplier = 10f64.powi(places);
                     Ok(Value::Number((num * multiplier).round() / multiplier))
                 }
-                _ => Err("ROUND requires 1 or 2 arguments".to_string()),
+                _ => Err("ROUND requires 1 or 2 arguments".into()),
             }
         });
         
@@ -565,7 +655,7 @@ impl FunctionRegistry {
         
         self.register_function("LEN", |args| {
             if args.len() != 1 {
-                Err("LEN requires exactly 1 argument".to_string())
+                Err("LEN requires exactly 1 argument".into())
             } else {
                 let len = args[0].to_string().chars().count() as f64;
                 Ok(Value::Number(len))
@@ -574,7 +664,7 @@ impl FunctionRegistry {
         
         self.register_function("LEFT", |args| {
             if args.len() != 2 {
-                Err("LEFT requires exactly 2 arguments".to_string())
+                Err("LEFT requires exactly 2 arguments".into())
             } else {
                 let text = args[0].to_string();
                 let num_chars = args[1].to_number() as usize;
@@ -585,7 +675,7 @@ impl FunctionRegistry {
         
         self.register_function("RIGHT", |args| {
             if args.len() != 2 {
-                Err("RIGHT requires exactly 2 arguments".to_string())
+                Err("RIGHT requires exactly 2 arguments".into())
             } else {
                 let text = args[0].to_string();
                 let num_chars = args[1].to_number() as usize;
@@ -598,13 +688,22 @@ impl FunctionRegistry {
         
         self.register_function("MID", |args| {
             if args.len() != 3 {
-                Err("MID requires exactly 3 arguments".to_string())
+                Err("MID requires exactly 3 arguments".into())
             } else {
+                // Excel-style 1-based start position.
                 let text = args[0].to_string();
-                let start = args[1].to_number() as usize; // 0-based indexing
-                let length = args[2].to_number() as usize;
+                let start_1 = args[1].to_number();
+                let length = args[2].to_number();
+                if start_1 < 1.0 {
+                    return Err("MID start position must be >= 1".into());
+                }
+                if length < 0.0 {
+                    return Err("MID length must be >= 0".into());
+                }
+                let start = (start_1 as usize).saturating_sub(1);
+                let len = length as usize;
                 let chars: Vec<char> = text.chars().collect();
-                let end = (start + length).min(chars.len());
+                let end = start.saturating_add(len).min(chars.len());
                 let result = if start < chars.len() {
                     chars[start..end].iter().collect::<String>()
                 } else {
@@ -613,35 +712,51 @@ impl FunctionRegistry {
                 Ok(Value::String(result))
             }
         });
-        
-        self.register_function("FIND", |args| {
+
+        // Case-sensitive FIND (Excel): 1-based position, errors if not found.
+        fn find_impl(args: &[Value], case_insensitive: bool) -> Result<Value, FormulaError> {
             if args.len() < 2 || args.len() > 3 {
-                Err("FIND requires 2 or 3 arguments".to_string())
-            } else {
-                let search_text = args[0].to_string();
-                let within_text = args[1].to_string();
-                let start_pos = if args.len() == 3 {
-                    args[2].to_number() as usize // 0-based indexing
-                } else {
-                    0
-                };
-                
-                let within_chars: Vec<char> = within_text.chars().collect();
-                if start_pos >= within_chars.len() {
-                    return Err("Start position is beyond text length".to_string());
-                }
-                
-                let search_in = within_chars[start_pos..].iter().collect::<String>();
-                match search_in.find(&search_text) {
-                    Some(pos) => Ok(Value::Number((start_pos + pos) as f64)), // 0-based result
-                    None => Err("Search text not found".to_string()),
-                }
+                return Err("FIND/SEARCH requires 2 or 3 arguments".into());
             }
-        });
+            let needle_raw = args[0].to_string();
+            let haystack_raw = args[1].to_string();
+            let start_1 = if args.len() == 3 { args[2].to_number() } else { 1.0 };
+            if start_1 < 1.0 {
+                return Err("Start position must be >= 1".into());
+            }
+            let start_0 = (start_1 as usize).saturating_sub(1);
+            let haystack_chars: Vec<char> = haystack_raw.chars().collect();
+            if start_0 > haystack_chars.len() {
+                return Err("Start position beyond text length".into());
+            }
+
+            let needle: String = if case_insensitive {
+                needle_raw.to_lowercase()
+            } else {
+                needle_raw
+            };
+            let search_in: String = if case_insensitive {
+                haystack_chars[start_0..].iter().collect::<String>().to_lowercase()
+            } else {
+                haystack_chars[start_0..].iter().collect()
+            };
+
+            match search_in.find(&needle) {
+                Some(byte_pos) => {
+                    // Convert byte offset within search_in back to 1-based char index in original text.
+                    let char_offset = search_in[..byte_pos].chars().count();
+                    Ok(Value::Number((start_0 + char_offset + 1) as f64))
+                }
+                None => Err(FormulaError::NotFound("Search text not found".into())),
+            }
+        }
+
+        self.register_function("FIND", |args| find_impl(args, false));
+        self.register_function("SEARCH", |args| find_impl(args, true));
         
         self.register_function("UPPER", |args| {
             if args.len() != 1 {
-                Err("UPPER requires exactly 1 argument".to_string())
+                Err("UPPER requires exactly 1 argument".into())
             } else {
                 Ok(Value::String(args[0].to_string().to_uppercase()))
             }
@@ -649,7 +764,7 @@ impl FunctionRegistry {
         
         self.register_function("LOWER", |args| {
             if args.len() != 1 {
-                Err("LOWER requires exactly 1 argument".to_string())
+                Err("LOWER requires exactly 1 argument".into())
             } else {
                 Ok(Value::String(args[0].to_string().to_lowercase()))
             }
@@ -657,25 +772,25 @@ impl FunctionRegistry {
         
         self.register_function("TRIM", |args| {
             if args.len() != 1 {
-                Err("TRIM requires exactly 1 argument".to_string())
+                Err("TRIM requires exactly 1 argument".into())
             } else {
-                Ok(Value::String(args[0].to_string().trim().to_string()))
+                Ok(Value::String(args[0].to_string().trim().into()))
             }
         });
         
         self.register_function("GET", |args| {
             if args.len() != 1 {
-                Err("GET requires exactly 1 argument (URL)".to_string())
+                Err("GET requires exactly 1 argument (URL)".into())
             } else {
                 let url = args[0].to_string();
                 match reqwest::blocking::get(&url) {
                     Ok(response) => {
                         match response.text() {
                             Ok(content) => Ok(Value::String(content)),
-                            Err(e) => Err(format!("Failed to read response: {}", e)),
+                            Err(e) => Err(FormulaError::Network(format!("read response: {}", e))),
                         }
                     }
-                    Err(e) => Err(format!("Failed to fetch URL {}: {}", url, e)),
+                    Err(e) => Err(FormulaError::Network(format!("fetch {}: {}", url, e))),
                 }
             }
         });
@@ -684,7 +799,7 @@ impl FunctionRegistry {
 
         self.register_function("CEILING", |args| {
             if args.len() != 1 {
-                Err("CEILING requires exactly 1 argument".to_string())
+                Err("CEILING requires exactly 1 argument".into())
             } else {
                 Ok(Value::Number(args[0].to_number().ceil()))
             }
@@ -692,7 +807,7 @@ impl FunctionRegistry {
 
         self.register_function("FLOOR", |args| {
             if args.len() != 1 {
-                Err("FLOOR requires exactly 1 argument".to_string())
+                Err("FLOOR requires exactly 1 argument".into())
             } else {
                 Ok(Value::Number(args[0].to_number().floor()))
             }
@@ -700,7 +815,7 @@ impl FunctionRegistry {
 
         self.register_function("INT", |args| {
             if args.len() != 1 {
-                Err("INT requires exactly 1 argument".to_string())
+                Err("INT requires exactly 1 argument".into())
             } else {
                 Ok(Value::Number(args[0].to_number().trunc()))
             }
@@ -708,11 +823,11 @@ impl FunctionRegistry {
 
         self.register_function("MOD", |args| {
             if args.len() != 2 {
-                Err("MOD requires exactly 2 arguments".to_string())
+                Err("MOD requires exactly 2 arguments".into())
             } else {
                 let divisor = args[1].to_number();
                 if divisor == 0.0 {
-                    Err("MOD division by zero".to_string())
+                    Err(FormulaError::DivisionByZero)
                 } else {
                     Ok(Value::Number(args[0].to_number() % divisor))
                 }
@@ -726,13 +841,13 @@ impl FunctionRegistry {
                     let base = args[1].to_number();
                     Ok(Value::Number(args[0].to_number().log(base)))
                 }
-                _ => Err("LOG requires 1 or 2 arguments".to_string()),
+                _ => Err("LOG requires 1 or 2 arguments".into()),
             }
         });
 
         self.register_function("LN", |args| {
             if args.len() != 1 {
-                Err("LN requires exactly 1 argument".to_string())
+                Err("LN requires exactly 1 argument".into())
             } else {
                 Ok(Value::Number(args[0].to_number().ln()))
             }
@@ -740,7 +855,7 @@ impl FunctionRegistry {
 
         self.register_function("EXP", |args| {
             if args.len() != 1 {
-                Err("EXP requires exactly 1 argument".to_string())
+                Err("EXP requires exactly 1 argument".into())
             } else {
                 Ok(Value::Number(args[0].to_number().exp()))
             }
@@ -748,7 +863,7 @@ impl FunctionRegistry {
 
         self.register_function("PI", |args| {
             if !args.is_empty() {
-                Err("PI takes no arguments".to_string())
+                Err("PI takes no arguments".into())
             } else {
                 Ok(Value::Number(std::f64::consts::PI))
             }
@@ -765,7 +880,7 @@ impl FunctionRegistry {
 
         self.register_function("RANDBETWEEN", |args| {
             if args.len() != 2 {
-                Err("RANDBETWEEN requires exactly 2 arguments".to_string())
+                Err("RANDBETWEEN requires exactly 2 arguments".into())
             } else {
                 use std::time::SystemTime;
                 let low = args[0].to_number();
@@ -781,7 +896,7 @@ impl FunctionRegistry {
 
         self.register_function("SIGN", |args| {
             if args.len() != 1 {
-                Err("SIGN requires exactly 1 argument".to_string())
+                Err("SIGN requires exactly 1 argument".into())
             } else {
                 let n = args[0].to_number();
                 let result = if n > 0.0 {
@@ -797,7 +912,7 @@ impl FunctionRegistry {
 
         self.register_function("POWER", |args| {
             if args.len() != 2 {
-                Err("POWER requires exactly 2 arguments".to_string())
+                Err("POWER requires exactly 2 arguments".into())
             } else {
                 Ok(Value::Number(args[0].to_number().powf(args[1].to_number())))
             }
@@ -807,7 +922,7 @@ impl FunctionRegistry {
 
         self.register_function("SUBSTITUTE", |args| {
             if args.len() != 3 {
-                Err("SUBSTITUTE requires exactly 3 arguments".to_string())
+                Err("SUBSTITUTE requires exactly 3 arguments".into())
             } else {
                 let text = args[0].to_string();
                 let old = args[1].to_string();
@@ -818,7 +933,7 @@ impl FunctionRegistry {
 
         self.register_function("REPLACE", |args| {
             if args.len() != 4 {
-                Err("REPLACE requires exactly 4 arguments".to_string())
+                Err("REPLACE requires exactly 4 arguments".into())
             } else {
                 let text = args[0].to_string();
                 let start = args[1].to_number() as usize; // 1-based
@@ -838,7 +953,7 @@ impl FunctionRegistry {
 
         self.register_function("REPT", |args| {
             if args.len() != 2 {
-                Err("REPT requires exactly 2 arguments".to_string())
+                Err("REPT requires exactly 2 arguments".into())
             } else {
                 let text = args[0].to_string();
                 let count = args[1].to_number() as usize;
@@ -848,7 +963,7 @@ impl FunctionRegistry {
 
         self.register_function("EXACT", |args| {
             if args.len() != 2 {
-                Err("EXACT requires exactly 2 arguments".to_string())
+                Err("EXACT requires exactly 2 arguments".into())
             } else {
                 let a = args[0].to_string();
                 let b = args[1].to_string();
@@ -858,7 +973,7 @@ impl FunctionRegistry {
 
         self.register_function("PROPER", |args| {
             if args.len() != 1 {
-                Err("PROPER requires exactly 1 argument".to_string())
+                Err("PROPER requires exactly 1 argument".into())
             } else {
                 let text = args[0].to_string();
                 let mut result = String::new();
@@ -884,7 +999,7 @@ impl FunctionRegistry {
 
         self.register_function("CLEAN", |args| {
             if args.len() != 1 {
-                Err("CLEAN requires exactly 1 argument".to_string())
+                Err("CLEAN requires exactly 1 argument".into())
             } else {
                 let text = args[0].to_string();
                 let cleaned: String = text
@@ -897,32 +1012,32 @@ impl FunctionRegistry {
 
         self.register_function("CHAR", |args| {
             if args.len() != 1 {
-                Err("CHAR requires exactly 1 argument".to_string())
+                Err("CHAR requires exactly 1 argument".into())
             } else {
                 let n = args[0].to_number() as u32;
                 match char::from_u32(n) {
                     Some(c) => Ok(Value::String(String::from(c))),
-                    None => Err(format!("CHAR: {} is not a valid character code", n)),
+                    None => Err(FormulaError::TypeMismatch(format!("CHAR: {} is not a valid character code", n))),
                 }
             }
         });
 
         self.register_function("CODE", |args| {
             if args.len() != 1 {
-                Err("CODE requires exactly 1 argument".to_string())
+                Err("CODE requires exactly 1 argument".into())
             } else {
                 let text = args[0].to_string();
                 if let Some(ch) = text.chars().next() {
                     Ok(Value::Number(ch as u32 as f64))
                 } else {
-                    Err("CODE requires a non-empty string".to_string())
+                    Err("CODE requires a non-empty string".into())
                 }
             }
         });
 
         self.register_function("TEXT", |args| {
             if args.len() < 1 || args.len() > 2 {
-                Err("TEXT requires 1 or 2 arguments".to_string())
+                Err("TEXT requires 1 or 2 arguments".into())
             } else {
                 Ok(Value::String(args[0].to_string()))
             }
@@ -930,24 +1045,24 @@ impl FunctionRegistry {
 
         self.register_function("VALUE", |args| {
             if args.len() != 1 {
-                Err("VALUE requires exactly 1 argument".to_string())
+                Err("VALUE requires exactly 1 argument".into())
             } else {
                 let text = args[0].to_string();
                 match text.parse::<f64>() {
                     Ok(n) => Ok(Value::Number(n)),
-                    Err(_) => Err(format!("VALUE: cannot convert '{}' to number", text)),
+                    Err(_) => Err(FormulaError::TypeMismatch(format!("VALUE: cannot convert '{}' to number", text))),
                 }
             }
         });
 
         self.register_function("NUMBERVALUE", |args| {
             if args.len() != 1 {
-                Err("NUMBERVALUE requires exactly 1 argument".to_string())
+                Err("NUMBERVALUE requires exactly 1 argument".into())
             } else {
                 let text = args[0].to_string();
                 match text.parse::<f64>() {
                     Ok(n) => Ok(Value::Number(n)),
-                    Err(_) => Err(format!("NUMBERVALUE: cannot convert '{}' to number", text)),
+                    Err(_) => Err(FormulaError::TypeMismatch(format!("NUMBERVALUE: cannot convert '{}' to number", text))),
                 }
             }
         });
@@ -956,7 +1071,7 @@ impl FunctionRegistry {
 
         self.register_function("ISBLANK", |args| {
             if args.len() != 1 {
-                Err("ISBLANK requires exactly 1 argument".to_string())
+                Err("ISBLANK requires exactly 1 argument".into())
             } else {
                 let is_blank = match &args[0] {
                     Value::String(s) => s.is_empty(),
@@ -968,7 +1083,7 @@ impl FunctionRegistry {
 
         self.register_function("ISNUMBER", |args| {
             if args.len() != 1 {
-                Err("ISNUMBER requires exactly 1 argument".to_string())
+                Err("ISNUMBER requires exactly 1 argument".into())
             } else {
                 let is_num = matches!(&args[0], Value::Number(_));
                 Ok(Value::Number(if is_num { 1.0 } else { 0.0 }))
@@ -977,7 +1092,7 @@ impl FunctionRegistry {
 
         self.register_function("ISTEXT", |args| {
             if args.len() != 1 {
-                Err("ISTEXT requires exactly 1 argument".to_string())
+                Err("ISTEXT requires exactly 1 argument".into())
             } else {
                 let is_text = matches!(&args[0], Value::String(_));
                 Ok(Value::Number(if is_text { 1.0 } else { 0.0 }))
@@ -986,7 +1101,7 @@ impl FunctionRegistry {
 
         self.register_function("TYPE", |args| {
             if args.len() != 1 {
-                Err("TYPE requires exactly 1 argument".to_string())
+                Err("TYPE requires exactly 1 argument".into())
             } else {
                 let type_num = match &args[0] {
                     Value::Number(_) => 1.0,
@@ -1021,7 +1136,7 @@ impl FunctionRegistry {
 
         self.register_function("SPARKLINE", |args| {
             if args.is_empty() {
-                return Err("SPARKLINE requires at least one argument".to_string());
+                return Err("SPARKLINE requires at least one argument".into());
             }
             let values: Vec<f64> = args.iter().map(|v| v.to_number()).collect();
             let min = values.iter().cloned().fold(f64::INFINITY, f64::min);
@@ -1268,7 +1383,7 @@ impl Parser {
                         self.advance()?;
                         Ok(Expr::Range(cell, end_cell))
                     } else {
-                        Err("Expected cell reference after ':'".to_string())
+                        Err("Expected cell reference after ':'".into())
                     }
                 } else {
                     Ok(Expr::CellRef(cell))
@@ -1339,7 +1454,7 @@ impl<'a> ExpressionEvaluator<'a> {
     }
     
     /// Evaluates an expression AST to a value result.
-    pub fn evaluate(&self, expr: &Expr) -> Result<Value, String> {
+    pub fn evaluate(&self, expr: &Expr) -> Result<Value, FormulaError> {
         match expr {
             Expr::Number(value) => Ok(Value::Number(*value)),
             
@@ -1359,7 +1474,7 @@ impl<'a> ExpressionEvaluator<'a> {
             
             Expr::Range(start_cell, end_cell) => {
                 // This shouldn't be called directly - ranges are handled by functions
-                Err(format!("Range {}:{} cannot be evaluated directly", start_cell, end_cell))
+                Err(FormulaError::InvalidReference(format!("Range {}:{} cannot be evaluated directly", start_cell, end_cell)))
             }
             
             Expr::Binary { left, operator, right } => {
@@ -1386,7 +1501,7 @@ impl<'a> ExpressionEvaluator<'a> {
                         let left_num = left_val.to_number();
                         let right_num = right_val.to_number();
                         if right_num == 0.0 {
-                            Err("Division by zero".to_string())
+                            Err(FormulaError::DivisionByZero)
                         } else {
                             Ok(Value::Number(left_num / right_num))
                         }
@@ -1395,7 +1510,7 @@ impl<'a> ExpressionEvaluator<'a> {
                         let left_num = left_val.to_number();
                         let right_num = right_val.to_number();
                         if right_num == 0.0 {
-                            Err("Modulo by zero".to_string())
+                            Err(FormulaError::DivisionByZero)
                         } else {
                             Ok(Value::Number(left_num % right_num))
                         }
@@ -1431,26 +1546,18 @@ impl<'a> ExpressionEvaluator<'a> {
                         Ok(Value::Number(if left_num >= right_num { 1.0 } else { 0.0 }))
                     }
                     BinaryOp::Equal => {
-                        // Support both numeric and string equality
                         let result = match (&left_val, &right_val) {
-                            (Value::Number(l), Value::Number(r)) => (l - r).abs() < f64::EPSILON,
+                            (Value::Number(l), Value::Number(r)) => numbers_equal(*l, *r),
                             (Value::String(l), Value::String(r)) => l == r,
-                            _ => {
-                                // Mixed types: compare as strings
-                                left_val.to_string() == right_val.to_string()
-                            }
+                            _ => left_val.to_string() == right_val.to_string(),
                         };
                         Ok(Value::Number(if result { 1.0 } else { 0.0 }))
                     }
                     BinaryOp::NotEqual => {
-                        // Support both numeric and string inequality
                         let result = match (&left_val, &right_val) {
-                            (Value::Number(l), Value::Number(r)) => (l - r).abs() >= f64::EPSILON,
+                            (Value::Number(l), Value::Number(r)) => !numbers_equal(*l, *r),
                             (Value::String(l), Value::String(r)) => l != r,
-                            _ => {
-                                // Mixed types: compare as strings
-                                left_val.to_string() != right_val.to_string()
-                            }
+                            _ => left_val.to_string() != right_val.to_string(),
                         };
                         Ok(Value::Number(if result { 1.0 } else { 0.0 }))
                     }
@@ -1468,8 +1575,8 @@ impl<'a> ExpressionEvaluator<'a> {
             
             Expr::FunctionCall { name, args } => {
                 let func = self.function_registry.get_function(name)
-                    .ok_or_else(|| format!("Unknown function: {}", name))?;
-                
+                    .ok_or_else(|| FormulaError::UnknownFunction(name.clone()))?;
+
                 let arg_values = self.evaluate_function_args(args)?;
                 func(&arg_values)
             }
@@ -1477,7 +1584,7 @@ impl<'a> ExpressionEvaluator<'a> {
     }
     
     /// Evaluates function arguments, handling ranges.
-    fn evaluate_function_args(&self, args: &[Expr]) -> Result<Vec<Value>, String> {
+    fn evaluate_function_args(&self, args: &[Expr]) -> Result<Vec<Value>, FormulaError> {
         let mut values = Vec::new();
         
         for arg in args {
@@ -1560,14 +1667,14 @@ mod tests {
     fn test_lexer_identifiers_and_keywords() {
         let mut lexer = Lexer::new("SUM AVERAGE AND OR NOT A1 B2 AA123");
         
-        assert_eq!(lexer.next_token().unwrap(), Token::Identifier("SUM".to_string()));
-        assert_eq!(lexer.next_token().unwrap(), Token::Identifier("AVERAGE".to_string()));
-        assert_eq!(lexer.next_token().unwrap(), Token::Identifier("AND".to_string()));
-        assert_eq!(lexer.next_token().unwrap(), Token::Identifier("OR".to_string()));
-        assert_eq!(lexer.next_token().unwrap(), Token::Identifier("NOT".to_string()));
-        assert_eq!(lexer.next_token().unwrap(), Token::CellRef("A1".to_string()));
-        assert_eq!(lexer.next_token().unwrap(), Token::CellRef("B2".to_string()));
-        assert_eq!(lexer.next_token().unwrap(), Token::CellRef("AA123".to_string()));
+        assert_eq!(lexer.next_token().unwrap(), Token::Identifier("SUM".into()));
+        assert_eq!(lexer.next_token().unwrap(), Token::Identifier("AVERAGE".into()));
+        assert_eq!(lexer.next_token().unwrap(), Token::Identifier("AND".into()));
+        assert_eq!(lexer.next_token().unwrap(), Token::Identifier("OR".into()));
+        assert_eq!(lexer.next_token().unwrap(), Token::Identifier("NOT".into()));
+        assert_eq!(lexer.next_token().unwrap(), Token::CellRef("A1".into()));
+        assert_eq!(lexer.next_token().unwrap(), Token::CellRef("B2".into()));
+        assert_eq!(lexer.next_token().unwrap(), Token::CellRef("AA123".into()));
         assert_eq!(lexer.next_token().unwrap(), Token::Eof);
     }
 
@@ -1597,18 +1704,18 @@ mod tests {
     fn test_parser_cell_references() {
         let mut parser = Parser::new("A1").unwrap();
         let expr = parser.parse().unwrap();
-        assert_eq!(expr, Expr::CellRef("A1".to_string()));
+        assert_eq!(expr, Expr::CellRef("A1".into()));
         
         let mut parser = Parser::new("B2").unwrap();
         let expr = parser.parse().unwrap();
-        assert_eq!(expr, Expr::CellRef("B2".to_string()));
+        assert_eq!(expr, Expr::CellRef("B2".into()));
     }
 
     #[test]
     fn test_parser_ranges() {
         let mut parser = Parser::new("A1:C3").unwrap();
         let expr = parser.parse().unwrap();
-        assert_eq!(expr, Expr::Range("A1".to_string(), "C3".to_string()));
+        assert_eq!(expr, Expr::Range("A1".to_string(), "C3".into()));
     }
 
     #[test]
@@ -1728,9 +1835,9 @@ mod tests {
             Expr::FunctionCall { name, args } => {
                 assert_eq!(name, "SUM");
                 assert_eq!(args.len(), 3);
-                assert_eq!(args[0], Expr::CellRef("A1".to_string()));
-                assert_eq!(args[1], Expr::CellRef("B1".to_string()));
-                assert_eq!(args[2], Expr::CellRef("C1".to_string()));
+                assert_eq!(args[0], Expr::CellRef("A1".into()));
+                assert_eq!(args[1], Expr::CellRef("B1".into()));
+                assert_eq!(args[2], Expr::CellRef("C1".into()));
             }
             _ => panic!("Expected function call"),
         }
@@ -1741,7 +1848,7 @@ mod tests {
             Expr::FunctionCall { name, args } => {
                 assert_eq!(name, "SUM");
                 assert_eq!(args.len(), 1);
-                assert_eq!(args[0], Expr::Range("A1".to_string(), "C1".to_string()));
+                assert_eq!(args[0], Expr::Range("A1".to_string(), "C1".into()));
             }
             _ => panic!("Expected function call"),
         }
@@ -1816,7 +1923,7 @@ mod tests {
             _ => panic!("Expected number"),
         }
         
-        let expr = Expr::String("Hello".to_string());
+        let expr = Expr::String("Hello".into());
         match evaluator.evaluate(&expr).unwrap() {
             Value::String(s) => assert_eq!(s, "Hello"),
             _ => panic!("Expected string"),
@@ -1829,13 +1936,13 @@ mod tests {
         let registry = FunctionRegistry::new();
         let evaluator = ExpressionEvaluator::new(&sheet, &registry);
         
-        let expr = Expr::CellRef("A1".to_string());
+        let expr = Expr::CellRef("A1".into());
         match evaluator.evaluate(&expr).unwrap() {
             Value::Number(n) => assert_eq!(n, 10.0),
             _ => panic!("Expected number"),
         }
         
-        let expr = Expr::CellRef("B1".to_string());
+        let expr = Expr::CellRef("B1".into());
         match evaluator.evaluate(&expr).unwrap() {
             Value::Number(n) => assert_eq!(n, 20.0),
             _ => panic!("Expected number"),
@@ -1853,14 +1960,14 @@ mod tests {
         let evaluator = ExpressionEvaluator::new(&sheet, &registry);
         
         // String cell reference
-        let expr = Expr::CellRef("A1".to_string());
+        let expr = Expr::CellRef("A1".into());
         match evaluator.evaluate(&expr).unwrap() {
             Value::String(s) => assert_eq!(s, "Hello"),
             _ => panic!("Expected string"),
         }
         
         // Numeric string cell reference  
-        let expr = Expr::CellRef("C1".to_string());
+        let expr = Expr::CellRef("C1".into());
         match evaluator.evaluate(&expr).unwrap() {
             Value::Number(n) => assert_eq!(n, 123.0),
             _ => panic!("Expected number"),
@@ -1884,9 +1991,9 @@ mod tests {
         }
         
         let expr = Expr::Binary {
-            left: Box::new(Expr::CellRef("A1".to_string())),
+            left: Box::new(Expr::CellRef("A1".into())),
             operator: BinaryOp::Multiply,
-            right: Box::new(Expr::CellRef("B1".to_string())),
+            right: Box::new(Expr::CellRef("B1".into())),
         };
         match evaluator.evaluate(&expr).unwrap() {
             Value::Number(n) => assert_eq!(n, 200.0), // 10 * 20
@@ -1929,8 +2036,8 @@ mod tests {
         let expr = Expr::FunctionCall {
             name: "SUM".to_string(),
             args: vec![
-                Expr::CellRef("A1".to_string()),
-                Expr::CellRef("B1".to_string()),
+                Expr::CellRef("A1".into()),
+                Expr::CellRef("B1".into()),
             ],
         };
         match evaluator.evaluate(&expr).unwrap() {
@@ -1962,9 +2069,9 @@ mod tests {
         let expr = Expr::FunctionCall {
             name: "CONCAT".to_string(),
             args: vec![
-                Expr::String("Hello".to_string()),
-                Expr::String(" ".to_string()),
-                Expr::String("World".to_string()),
+                Expr::String("Hello".into()),
+                Expr::String(" ".into()),
+                Expr::String("World".into()),
             ],
         };
         match evaluator.evaluate(&expr).unwrap() {
@@ -1975,7 +2082,7 @@ mod tests {
         // Test LEN function
         let expr = Expr::FunctionCall {
             name: "LEN".to_string(),
-            args: vec![Expr::String("Hello".to_string())],
+            args: vec![Expr::String("Hello".into())],
         };
         match evaluator.evaluate(&expr).unwrap() {
             Value::Number(n) => assert_eq!(n, 5.0),
@@ -1985,7 +2092,7 @@ mod tests {
         // Test UPPER function
         let expr = Expr::FunctionCall {
             name: "UPPER".to_string(),
-            args: vec![Expr::String("hello".to_string())],
+            args: vec![Expr::String("hello".into())],
         };
         match evaluator.evaluate(&expr).unwrap() {
             Value::String(s) => assert_eq!(s, "HELLO"),
@@ -1996,7 +2103,7 @@ mod tests {
         let expr = Expr::FunctionCall {
             name: "LEFT".to_string(),
             args: vec![
-                Expr::String("Hello World".to_string()),
+                Expr::String("Hello World".into()),
                 Expr::Number(5.0),
             ],
         };
@@ -2009,12 +2116,12 @@ mod tests {
         let expr = Expr::FunctionCall {
             name: "FIND".to_string(),
             args: vec![
-                Expr::String("lo".to_string()),
-                Expr::String("Hello".to_string()),
+                Expr::String("lo".into()),
+                Expr::String("Hello".into()),
             ],
         };
         match evaluator.evaluate(&expr).unwrap() {
-            Value::Number(n) => assert_eq!(n, 3.0), // 0-based indexing - "lo" found at position 3
+            Value::Number(n) => assert_eq!(n, 4.0), // 1-based indexing - "lo" begins at position 4 in "Hello"
             _ => panic!("Expected number"),
         }
     }
@@ -2026,9 +2133,9 @@ mod tests {
         let evaluator = ExpressionEvaluator::new(&sheet, &registry);
         
         let expr = Expr::Binary {
-            left: Box::new(Expr::String("Hello".to_string())),
+            left: Box::new(Expr::String("Hello".into())),
             operator: BinaryOp::Concatenate,
-            right: Box::new(Expr::String(" World".to_string())),
+            right: Box::new(Expr::String(" World".into())),
         };
         match evaluator.evaluate(&expr).unwrap() {
             Value::String(s) => assert_eq!(s, "Hello World"),
@@ -2037,7 +2144,7 @@ mod tests {
         
         // Test mixed concatenation
         let expr = Expr::Binary {
-            left: Box::new(Expr::String("Number: ".to_string())),
+            left: Box::new(Expr::String("Number: ".into())),
             operator: BinaryOp::Concatenate,
             right: Box::new(Expr::Number(42.0)),
         };
@@ -2055,9 +2162,9 @@ mod tests {
         
         // String equality
         let expr = Expr::Binary {
-            left: Box::new(Expr::String("Hello".to_string())),
+            left: Box::new(Expr::String("Hello".into())),
             operator: BinaryOp::Equal,
-            right: Box::new(Expr::String("Hello".to_string())),
+            right: Box::new(Expr::String("Hello".into())),
         };
         match evaluator.evaluate(&expr).unwrap() {
             Value::Number(n) => assert_eq!(n, 1.0),
@@ -2066,9 +2173,9 @@ mod tests {
         
         // String inequality
         let expr = Expr::Binary {
-            left: Box::new(Expr::String("Hello".to_string())),
+            left: Box::new(Expr::String("Hello".into())),
             operator: BinaryOp::NotEqual,
-            right: Box::new(Expr::String("World".to_string())),
+            right: Box::new(Expr::String("World".into())),
         };
         match evaluator.evaluate(&expr).unwrap() {
             Value::Number(n) => assert_eq!(n, 1.0),
@@ -2084,7 +2191,7 @@ mod tests {
         
         let expr = Expr::FunctionCall {
             name: "SUM".to_string(),
-            args: vec![Expr::Range("A1".to_string(), "B1".to_string())],
+            args: vec![Expr::Range("A1".to_string(), "B1".into())],
         };
         match evaluator.evaluate(&expr).unwrap() {
             Value::Number(n) => assert_eq!(n, 30.0),
@@ -2093,7 +2200,7 @@ mod tests {
         
         let expr = Expr::FunctionCall {
             name: "AVERAGE".to_string(),
-            args: vec![Expr::Range("A1".to_string(), "C1".to_string())],
+            args: vec![Expr::Range("A1".to_string(), "C1".into())],
         };
         match evaluator.evaluate(&expr).unwrap() {
             Value::Number(n) => assert_eq!(n, 20.0),
@@ -2124,7 +2231,7 @@ mod tests {
             if args.len() == 1 {
                 Ok(Value::Number(args[0].to_number() * 2.0))
             } else {
-                Err("DOUBLE requires exactly 1 argument".to_string())
+                Err("DOUBLE requires exactly 1 argument".into())
             }
         });
         
@@ -2194,22 +2301,22 @@ mod tests {
         assert!(evaluator.evaluate(&expr).is_err());
         
         // Test invalid cell reference
-        let expr = Expr::CellRef("INVALID".to_string());
+        let expr = Expr::CellRef("INVALID".into());
         assert!(evaluator.evaluate(&expr).is_err());
     }
 
     #[test]
     fn test_lexer_strings() {
         let mut lexer = Lexer::new("\"Hello World\"");
-        assert_eq!(lexer.next_token().unwrap(), Token::String("Hello World".to_string()));
+        assert_eq!(lexer.next_token().unwrap(), Token::String("Hello World".into()));
         assert_eq!(lexer.next_token().unwrap(), Token::Eof);
         
         let mut lexer = Lexer::new("\"\"");
-        assert_eq!(lexer.next_token().unwrap(), Token::String("".to_string()));
+        assert_eq!(lexer.next_token().unwrap(), Token::String("".into()));
         assert_eq!(lexer.next_token().unwrap(), Token::Eof);
         
         let mut lexer = Lexer::new("\"Quote\"\"Test\"");
-        assert_eq!(lexer.next_token().unwrap(), Token::String("Quote\"Test".to_string()));
+        assert_eq!(lexer.next_token().unwrap(), Token::String("Quote\"Test".into()));
         assert_eq!(lexer.next_token().unwrap(), Token::Eof);
     }
 
@@ -2230,11 +2337,11 @@ mod tests {
     fn test_parser_string_literals() {
         let mut parser = Parser::new("\"Hello\"").unwrap();
         let expr = parser.parse().unwrap();
-        assert_eq!(expr, Expr::String("Hello".to_string()));
+        assert_eq!(expr, Expr::String("Hello".into()));
         
         let mut parser = Parser::new("\"\"").unwrap();
         let expr = parser.parse().unwrap();
-        assert_eq!(expr, Expr::String("".to_string()));
+        assert_eq!(expr, Expr::String("".into()));
     }
 
     #[test]

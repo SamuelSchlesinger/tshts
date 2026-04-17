@@ -3,7 +3,8 @@ use crate::domain::{Spreadsheet, TerminalColor, format_cell_value};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table},
+    text::{Line, Span},
+    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Tabs},
     Frame,
 };
 
@@ -31,15 +32,17 @@ pub fn render_ui(f: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
-            Constraint::Min(0),
-            Constraint::Length(3),
+            Constraint::Length(1), // header
+            Constraint::Length(1), // sheet tabs
+            Constraint::Min(0),    // grid
+            Constraint::Length(3), // status
         ])
         .split(f.area());
 
     render_header(f, app, chunks[0]);
-    render_spreadsheet(f, app, chunks[1]);
-    render_status_bar(f, app, chunks[2]);
+    render_sheet_tabs(f, app, chunks[1]);
+    render_spreadsheet(f, app, chunks[2]);
+    render_status_bar(f, app, chunks[3]);
 
     if matches!(app.mode, AppMode::Help) {
         render_help_popup(f, app.help_scroll);
@@ -47,27 +50,48 @@ pub fn render_ui(f: &mut Frame, app: &mut App) {
 }
 
 fn render_header(f: &mut Frame, app: &App, area: Rect) {
-    // Build tab bar showing sheet names
-    let mut tabs = String::new();
-    for (i, name) in app.workbook.sheet_names.iter().enumerate() {
-        if i == app.workbook.active_sheet {
-            tabs.push_str(&format!("[{}]", name));
-        } else {
-            tabs.push_str(&format!(" {} ", name));
-        }
-        if i < app.workbook.sheet_names.len() - 1 {
-            tabs.push('|');
-        }
-    }
-
+    let file_label = app.filename.as_deref().unwrap_or("unsaved");
     let header = Paragraph::new(format!(
-        "tshts | Cell: {}{} | {}",
+        "tshts | {} | Cell: {}{} | sheet: {}",
+        file_label,
         Spreadsheet::column_label(app.selected_col),
         app.selected_row + 1,
-        tabs
+        app.workbook.sheet_names[app.workbook.active_sheet],
     ))
     .style(Style::default().fg(Color::Cyan));
     f.render_widget(header, area);
+}
+
+fn render_sheet_tabs(f: &mut Frame, app: &App, area: Rect) {
+    let titles: Vec<Line> = app
+        .workbook
+        .sheet_names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let is_active = i == app.workbook.active_sheet;
+            let prefix = Span::styled(" ", Style::default());
+            let label = if is_active {
+                Span::styled(
+                    format!("{}", name),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::LightCyan)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::styled(format!("{}", name), Style::default().fg(Color::Gray))
+            };
+            Line::from(vec![prefix, label, Span::raw(" ")])
+        })
+        .collect();
+
+    let tabs = Tabs::new(titles)
+        .select(app.workbook.active_sheet)
+        .divider(Span::styled("│", Style::default().fg(Color::DarkGray)))
+        .style(Style::default())
+        .highlight_style(Style::default());
+    f.render_widget(tabs, area);
 }
 
 fn render_spreadsheet(f: &mut Frame, app: &mut App, area: Rect) {
@@ -364,16 +388,17 @@ LOWER(text)     Convert to lowercase    =LOWER("WORLD") → world
 TRIM(text)      Remove leading/trailing spaces  =TRIM("  hi  ") → hi
 LEFT(text,num)  First N characters      =LEFT("Hello World",5) → Hello
 RIGHT(text,num) Last N characters       =RIGHT("Hello World",5) → World
-MID(text,start,len) Substring           =MID("Hello World",6,5) → World
-FIND(search,text) Find position         =FIND("lo","Hello") → 3
-FIND(search,text,start) Find from pos   =FIND("l","Hello",2) → 3
+MID(text,start,len) Substring           =MID("Hello World",7,5) → World
+FIND(search,text) Find (case-sensitive) =FIND("lo","Hello") → 4
+FIND(search,text,start) Find from pos   =FIND("l","Hello",4) → 4
+SEARCH(search,text[,start]) Case-insens =SEARCH("WORLD","Hello World") → 7
 CONCAT(...)     Concatenate values      =CONCAT("A","B","C") → ABC
 
 === WEB FUNCTIONS ===
 GET(url)        Fetch content from URL  =GET("https://api.example.com/data")
                                        =GET("https://raw.githubusercontent.com/...")
 
-Note: String functions use 0-based indexing (positions start at 0)
+Note: String positions are 1-based (Excel-compatible). Position 1 is the first char.
 
 === LOGICAL FUNCTIONS ===
 IF(cond,true,false) Conditional         =IF(A1>5,"High","Low")

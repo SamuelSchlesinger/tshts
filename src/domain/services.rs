@@ -5,7 +5,7 @@
 //! arithmetic operations, and built-in functions.
 
 use super::models::Spreadsheet;
-use super::parser::{Parser, ExpressionEvaluator, FunctionRegistry, Expr, Value};
+use super::parser::{Parser, ExpressionEvaluator, FunctionRegistry, Expr, Value, FormulaError};
 use std::collections::HashSet;
 use std::fs::File;
 
@@ -96,10 +96,10 @@ impl<'a> FormulaEvaluator<'a> {
     pub fn evaluate_formula(&self, formula: &str) -> String {
         if formula.starts_with('=') {
             let expr = &formula[1..];
-            
+
             match self.parse_and_evaluate(expr) {
                 Ok(result) => result.to_string(),
-                Err(_) => "#ERROR".to_string(),
+                Err(err) => err.code().to_string(),
             }
         } else {
             formula.to_string()
@@ -152,10 +152,10 @@ impl<'a> FormulaEvaluator<'a> {
     }
 
     /// Parses and evaluates an expression using the new parser.
-    fn parse_and_evaluate(&self, expr: &str) -> Result<Value, String> {
-        let mut parser = Parser::new(expr)?;
-        let ast = parser.parse()?;
-        
+    fn parse_and_evaluate(&self, expr: &str) -> Result<Value, FormulaError> {
+        let mut parser = Parser::new(expr).map_err(FormulaError::Parse)?;
+        let ast = parser.parse().map_err(FormulaError::Parse)?;
+
         let function_registry = FunctionRegistry::new();
         let evaluator = ExpressionEvaluator::new(self.spreadsheet, &function_registry);
         evaluator.evaluate(&ast)
@@ -366,37 +366,18 @@ impl<'a> FormulaEvaluator<'a> {
         }
     }
 
-    /// Adjusts cell references in an AST with the given offsets.
+    /// Adjusts cell references in an AST with the given offsets. Absolute
+    /// components (prefixed with `$`) are preserved and not shifted.
     fn adjust_ast_references(&self, expr: &Expr, row_offset: i32, col_offset: i32) -> Expr {
         match expr {
             Expr::String(s) => Expr::String(s.clone()),
             Expr::CellRef(cell_ref) => {
-                if let Some((row, col)) = Spreadsheet::parse_cell_reference(cell_ref) {
-                    let new_row = (row as i32 + row_offset).max(0) as usize;
-                    let new_col = (col as i32 + col_offset).max(0) as usize;
-                    let new_ref = format!("{}{}", Spreadsheet::column_label(new_col), new_row + 1);
-                    Expr::CellRef(new_ref)
-                } else {
-                    expr.clone()
-                }
+                Expr::CellRef(Self::shift_ref(cell_ref, row_offset, col_offset))
             }
-            Expr::Range(start_ref, end_ref) => {
-                let new_start = if let Some((row, col)) = Spreadsheet::parse_cell_reference(start_ref) {
-                    let new_row = (row as i32 + row_offset).max(0) as usize;
-                    let new_col = (col as i32 + col_offset).max(0) as usize;
-                    format!("{}{}", Spreadsheet::column_label(new_col), new_row + 1)
-                } else {
-                    start_ref.clone()
-                };
-                let new_end = if let Some((row, col)) = Spreadsheet::parse_cell_reference(end_ref) {
-                    let new_row = (row as i32 + row_offset).max(0) as usize;
-                    let new_col = (col as i32 + col_offset).max(0) as usize;
-                    format!("{}{}", Spreadsheet::column_label(new_col), new_row + 1)
-                } else {
-                    end_ref.clone()
-                };
-                Expr::Range(new_start, new_end)
-            }
+            Expr::Range(start_ref, end_ref) => Expr::Range(
+                Self::shift_ref(start_ref, row_offset, col_offset),
+                Self::shift_ref(end_ref, row_offset, col_offset),
+            ),
             Expr::Binary { left, operator, right } => {
                 Expr::Binary {
                     left: Box::new(self.adjust_ast_references(left, row_offset, col_offset)),
@@ -536,6 +517,40 @@ impl<'a> FormulaEvaluator<'a> {
         }
     }
 
+    /// Shifts a cell reference by (row_offset, col_offset), preserving `$`-absolute parts.
+    fn shift_ref(cell_ref: &str, row_offset: i32, col_offset: i32) -> String {
+        if let Some((row, col, abs_row, abs_col)) = Spreadsheet::parse_cell_reference_abs(cell_ref) {
+            let new_row = if abs_row {
+                row
+            } else {
+                (row as i32 + row_offset).max(0) as usize
+            };
+            let new_col = if abs_col {
+                col
+            } else {
+                (col as i32 + col_offset).max(0) as usize
+            };
+            Spreadsheet::format_cell_reference(new_row, new_col, abs_row, abs_col)
+        } else {
+            cell_ref.to_string()
+        }
+    }
+
+    /// Maps only the non-absolute components of a cell reference.
+    fn map_ref_preserving_abs<F>(cell_ref: &str, map_ref: F) -> String
+    where
+        F: Fn(usize, usize) -> (usize, usize),
+    {
+        if let Some((row, col, abs_row, abs_col)) = Spreadsheet::parse_cell_reference_abs(cell_ref) {
+            let (mapped_row, mapped_col) = map_ref(row, col);
+            let new_row = if abs_row { row } else { mapped_row };
+            let new_col = if abs_col { col } else { mapped_col };
+            Spreadsheet::format_cell_reference(new_row, new_col, abs_row, abs_col)
+        } else {
+            cell_ref.to_string()
+        }
+    }
+
     /// Maps all cell references in an AST using the given function.
     fn map_ast_refs<F>(&self, expr: &Expr, map_ref: F) -> Expr
     where
@@ -544,29 +559,11 @@ impl<'a> FormulaEvaluator<'a> {
         match expr {
             Expr::String(s) => Expr::String(s.clone()),
             Expr::Number(n) => Expr::Number(*n),
-            Expr::CellRef(cell_ref) => {
-                if let Some((row, col)) = Spreadsheet::parse_cell_reference(cell_ref) {
-                    let (new_row, new_col) = map_ref(row, col);
-                    Expr::CellRef(format!("{}{}", Spreadsheet::column_label(new_col), new_row + 1))
-                } else {
-                    expr.clone()
-                }
-            }
-            Expr::Range(start_ref, end_ref) => {
-                let new_start = if let Some((row, col)) = Spreadsheet::parse_cell_reference(start_ref) {
-                    let (nr, nc) = map_ref(row, col);
-                    format!("{}{}", Spreadsheet::column_label(nc), nr + 1)
-                } else {
-                    start_ref.clone()
-                };
-                let new_end = if let Some((row, col)) = Spreadsheet::parse_cell_reference(end_ref) {
-                    let (nr, nc) = map_ref(row, col);
-                    format!("{}{}", Spreadsheet::column_label(nc), nr + 1)
-                } else {
-                    end_ref.clone()
-                };
-                Expr::Range(new_start, new_end)
-            }
+            Expr::CellRef(cell_ref) => Expr::CellRef(Self::map_ref_preserving_abs(cell_ref, map_ref)),
+            Expr::Range(start_ref, end_ref) => Expr::Range(
+                Self::map_ref_preserving_abs(start_ref, map_ref),
+                Self::map_ref_preserving_abs(end_ref, map_ref),
+            ),
             Expr::Binary { left, operator, right } => {
                 Expr::Binary {
                     left: Box::new(self.map_ast_refs(left, map_ref)),
@@ -770,19 +767,33 @@ impl AutofillPattern {
 
     /// Split a string into (prefix, number, suffix).
     /// E.g., "Item10" -> ("Item", 10.0, ""), "Row_5_data" -> ("Row_", 5.0, "_data")
+    ///
+    /// The number may contain at most one decimal point. Uses byte offsets so
+    /// multi-byte prefixes/suffixes ("日本1") are handled correctly.
     fn split_prefixed_number(s: &str) -> Option<(String, f64, String)> {
-        // Find the first digit
-        let first_digit = s.chars().position(|c| c.is_ascii_digit())?;
+        let first_digit_byte = s.char_indices()
+            .find(|&(_, c)| c.is_ascii_digit())
+            .map(|(i, _)| i)?;
 
-        // Find where the number ends
-        let after_number = s[first_digit..].chars()
-            .position(|c| !c.is_ascii_digit() && c != '.' && c != '-')
-            .map(|i| first_digit + i)
+        let mut seen_dot = false;
+        let after_number_byte = s[first_digit_byte..]
+            .char_indices()
+            .find(|&(_, c)| {
+                if c.is_ascii_digit() {
+                    false
+                } else if c == '.' && !seen_dot {
+                    seen_dot = true;
+                    false
+                } else {
+                    true
+                }
+            })
+            .map(|(i, _)| first_digit_byte + i)
             .unwrap_or(s.len());
 
-        let prefix = &s[..first_digit];
-        let num_str = &s[first_digit..after_number];
-        let suffix = &s[after_number..];
+        let prefix = &s[..first_digit_byte];
+        let num_str = &s[first_digit_byte..after_number_byte];
+        let suffix = &s[after_number_byte..];
 
         let num = num_str.parse::<f64>().ok()?;
 
@@ -1157,9 +1168,9 @@ mod tests {
         let sheet = create_test_spreadsheet();
         let evaluator = FormulaEvaluator::new(&sheet);
         
-        assert_eq!(evaluator.evaluate_formula("=1/0"), "#ERROR"); // Division by zero
-        assert_eq!(evaluator.evaluate_formula("=10%0"), "#ERROR"); // Modulo by zero
-        assert_eq!(evaluator.evaluate_formula("=INVALID()"), "#ERROR"); // Unknown function
+        assert_eq!(evaluator.evaluate_formula("=1/0"), "#DIV/0!"); // Division by zero
+        assert_eq!(evaluator.evaluate_formula("=10%0"), "#DIV/0!"); // Modulo by zero
+        assert_eq!(evaluator.evaluate_formula("=INVALID()"), "#NAME?"); // Unknown function
         assert_eq!(evaluator.evaluate_formula("=AVERAGE()"), "#ERROR"); // No args for average
     }
 
@@ -1294,12 +1305,19 @@ mod tests {
         assert_eq!(evaluator.evaluate_formula("=LEFT(\"Hello World\", 5)"), "Hello");
         assert_eq!(evaluator.evaluate_formula("=RIGHT(\"Hello World\", 5)"), "World");
         
-        // Test MID function (0-based indexing)
-        assert_eq!(evaluator.evaluate_formula("=MID(\"Hello World\", 6, 5)"), "World");
-        
-        // Test FIND function (0-based indexing)
-        assert_eq!(evaluator.evaluate_formula("=FIND(\"lo\", \"Hello\")"), "3");
-        assert_eq!(evaluator.evaluate_formula("=FIND(\"World\", \"Hello World\")"), "6");
+        // Test MID function (1-based, Excel-compatible)
+        assert_eq!(evaluator.evaluate_formula("=MID(\"Hello World\", 7, 5)"), "World");
+        assert_eq!(evaluator.evaluate_formula("=MID(\"Hello World\", 1, 5)"), "Hello");
+
+        // Test FIND function (1-based, Excel-compatible, case-sensitive)
+        assert_eq!(evaluator.evaluate_formula("=FIND(\"lo\", \"Hello\")"), "4");
+        assert_eq!(evaluator.evaluate_formula("=FIND(\"World\", \"Hello World\")"), "7");
+        assert_eq!(evaluator.evaluate_formula("=FIND(\"o\", \"Hello World\", 6)"), "8");
+        // Case-sensitive FIND fails on mismatched case
+        assert_eq!(evaluator.evaluate_formula("=FIND(\"HELLO\", \"hello\")"), "#N/A");
+        // SEARCH is case-insensitive
+        assert_eq!(evaluator.evaluate_formula("=SEARCH(\"HELLO\", \"hello world\")"), "1");
+        assert_eq!(evaluator.evaluate_formula("=SEARCH(\"WORLD\", \"Hello World\")"), "7");
         
         // Test CONCAT function
         assert_eq!(evaluator.evaluate_formula("=CONCAT(\"A\", \"B\", \"C\")"), "ABC");
@@ -1330,14 +1348,27 @@ mod tests {
     fn test_string_equality() {
         let sheet = create_test_spreadsheet();
         let evaluator = FormulaEvaluator::new(&sheet);
-        
+
         // String equality
         assert_eq!(evaluator.evaluate_formula("=\"Hello\" = \"Hello\""), "1");
         assert_eq!(evaluator.evaluate_formula("=\"Hello\" = \"World\""), "0");
-        
+
         // String inequality
         assert_eq!(evaluator.evaluate_formula("=\"Hello\" <> \"World\""), "1");
         assert_eq!(evaluator.evaluate_formula("=\"Hello\" <> \"Hello\""), "0");
+    }
+
+    #[test]
+    fn test_numeric_equality_tolerates_float_error() {
+        // Regression: previously `=0.1 + 0.2 = 0.3` returned 0 because of
+        // f64::EPSILON being too tight for ordinary arithmetic.
+        let sheet = create_test_spreadsheet();
+        let evaluator = FormulaEvaluator::new(&sheet);
+        assert_eq!(evaluator.evaluate_formula("=0.1 + 0.2 = 0.3"), "1");
+        assert_eq!(evaluator.evaluate_formula("=1.1 + 2.2 = 3.3"), "1");
+        // But genuinely different numbers still compare unequal.
+        assert_eq!(evaluator.evaluate_formula("=1 = 2"), "0");
+        assert_eq!(evaluator.evaluate_formula("=0.1 + 0.2 <> 0.3"), "0");
     }
 
     #[test]
@@ -1359,8 +1390,8 @@ mod tests {
         let evaluator = FormulaEvaluator::new(&sheet);
         
         // Test FIND with no match
-        assert_eq!(evaluator.evaluate_formula("=FIND(\"xyz\", \"Hello\")"), "#ERROR");
-        
+        assert_eq!(evaluator.evaluate_formula("=FIND(\"xyz\", \"Hello\")"), "#N/A");
+
         // Test functions with wrong argument count
         assert_eq!(evaluator.evaluate_formula("=LEN()"), "#ERROR");
         assert_eq!(evaluator.evaluate_formula("=LEN(\"a\", \"b\")"), "#ERROR");
@@ -1388,11 +1419,11 @@ mod tests {
         
         // Test with invalid URL - this should return an error
         let result = evaluator.evaluate_formula("=GET(\"not-a-valid-url\")");
-        assert_eq!(result, "#ERROR");
-        
+        assert_eq!(result, "#NETWORK!");
+
         // Test with empty string URL
         let result = evaluator.evaluate_formula("=GET(\"\")");
-        assert_eq!(result, "#ERROR");
+        assert_eq!(result, "#NETWORK!");
     }
 
     #[test]
@@ -1537,18 +1568,18 @@ mod tests {
         
         // Test that errors in inner functions propagate outward
         let result = evaluator.evaluate_formula("=LEN(GET(\"invalid-url\"))");
-        assert_eq!(result, "#ERROR");
-        
+        assert_eq!(result, "#NETWORK!");
+
         let result = evaluator.evaluate_formula("=CONCAT(\"Price: \", GET(\"invalid-url\"))");
-        assert_eq!(result, "#ERROR");
-        
+        assert_eq!(result, "#NETWORK!");
+
         let result = evaluator.evaluate_formula("=IF(LEN(GET(\"invalid-url\"))>0, \"Good\", \"Bad\")");
-        assert_eq!(result, "#ERROR");
-        
+        assert_eq!(result, "#NETWORK!");
+
         // Test FIND with invalid search in valid GET
         let result = evaluator.evaluate_formula("=FIND(\"xyz123notfound\", GET(\"https://cryptoprices.cc/ADA\"))");
-        // This should return #ERROR because the search string likely won't be found
-        assert_eq!(result, "#ERROR");
+        // Could fail for NOT-FOUND (#N/A) or network issues (#NETWORK!) depending on connectivity.
+        assert!(result == "#N/A" || result == "#NETWORK!", "unexpected result: {}", result);
     }
 
     #[test]
@@ -1978,14 +2009,63 @@ Break""#).expect("Failed to write to temp file");
     fn test_adjust_formula_references_diagonal() {
         let sheet = Spreadsheet::default();
         let evaluator = FormulaEvaluator::new(&sheet);
-        
+
         // Test moving formula diagonally (down and right)
         let adjusted = evaluator.adjust_formula_references("=A1+B2", 1, 1);
         assert_eq!(adjusted, "=B2+C3");
-        
+
         // Test range adjustment diagonally
         let adjusted = evaluator.adjust_formula_references("=SUM(A1:B2)", 2, 3);
         assert_eq!(adjusted, "=SUM(D3:E4)");
+    }
+
+    #[test]
+    fn test_absolute_references_preserved_on_shift() {
+        let sheet = Spreadsheet::default();
+        let evaluator = FormulaEvaluator::new(&sheet);
+
+        // Fully absolute stays put.
+        assert_eq!(evaluator.adjust_formula_references("=$A$1", 5, 3), "=$A$1");
+
+        // Mixed: $A1 — column locked, row shifts with row_offset.
+        assert_eq!(evaluator.adjust_formula_references("=$A1", 2, 4), "=$A3");
+        // A$1 — row locked, column shifts.
+        assert_eq!(evaluator.adjust_formula_references("=A$1", 2, 4), "=E$1");
+
+        // Range with mixed refs.
+        assert_eq!(
+            evaluator.adjust_formula_references("=SUM($A$1:B2)", 1, 1),
+            "=SUM($A$1:C3)"
+        );
+    }
+
+    #[test]
+    fn test_absolute_references_eval() {
+        // Absolute refs should resolve to the same cell as the non-$ equivalent.
+        let mut sheet = Spreadsheet::default();
+        sheet.set_cell(0, 0, CellData { value: "42".to_string(), formula: None, format: None, comment: None });
+        sheet.set_cell(1, 0, CellData { value: "100".to_string(), formula: None, format: None, comment: None });
+        let evaluator = FormulaEvaluator::new(&sheet);
+        assert_eq!(evaluator.evaluate_formula("=$A$1"), "42");
+        assert_eq!(evaluator.evaluate_formula("=$A$1+$A$2"), "142");
+        assert_eq!(evaluator.evaluate_formula("=SUM($A$1:$A$2)"), "142");
+    }
+
+    #[test]
+    fn test_absolute_refs_survive_row_insert_delete() {
+        let sheet = Spreadsheet::default();
+        let evaluator = FormulaEvaluator::new(&sheet);
+
+        // Inserting a row before $A$5 should NOT shift it.
+        assert_eq!(
+            evaluator.adjust_formula_for_row_insert("=$A$5+A5", 0),
+            "=$A$5+A6"
+        );
+        // Deleting a row before A5 shifts A5 → A4, but $A$5 stays.
+        assert_eq!(
+            evaluator.adjust_formula_for_row_delete("=$A$5+A5", 0),
+            "=$A$5+A4"
+        );
     }
 
     #[test]
@@ -2095,6 +2175,35 @@ Break""#).expect("Failed to write to temp file");
         assert!(matches!(pattern, AutofillPattern::PrefixedNumber { .. }));
         assert_eq!(pattern.generate(2), "Row_3_data");
         assert_eq!(pattern.generate(3), "Row_4_data");
+    }
+
+    #[test]
+    fn test_autofill_pattern_prefixed_number_unicode_prefix() {
+        // Regression: previously panicked because chars().position() was used
+        // as a byte offset. "日本" is 6 bytes but 2 chars.
+        let values = vec!["日本1".to_string(), "日本2".to_string()];
+        let pattern = AutofillPattern::detect(&values);
+        assert!(matches!(pattern, AutofillPattern::PrefixedNumber { .. }));
+        assert_eq!(pattern.generate(2), "日本3");
+        assert_eq!(pattern.generate(3), "日本4");
+    }
+
+    #[test]
+    fn test_autofill_pattern_prefixed_number_unicode_suffix() {
+        let values = vec!["Item1_日".to_string(), "Item2_日".to_string()];
+        let pattern = AutofillPattern::detect(&values);
+        assert!(matches!(pattern, AutofillPattern::PrefixedNumber { .. }));
+        assert_eq!(pattern.generate(2), "Item3_日");
+    }
+
+    #[test]
+    fn test_autofill_pattern_prefixed_number_stops_at_second_dot() {
+        // With the fix, "Item1.2.3" splits as prefix="Item" / number=1.2 / suffix=".3"
+        // rather than trying to parse "1.2.3" as a single number (which always failed).
+        let values = vec!["Item1.2.3".to_string(), "Item2.2.3".to_string()];
+        let pattern = AutofillPattern::detect(&values);
+        assert!(matches!(pattern, AutofillPattern::PrefixedNumber { .. }));
+        assert_eq!(pattern.generate(2), "Item3.2.3");
     }
 
     #[test]
