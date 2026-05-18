@@ -1,2 +1,4 @@
 /target
-balance_sheet.tshts
+# Scratch workbooks from local testing — keep test fixtures elsewhere.
+/*.tshts
+/*.xlsx
