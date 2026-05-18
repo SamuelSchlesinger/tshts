@@ -27,31 +27,47 @@ cargo build --release
 
 ### First Steps
 
-1. **Navigate**: Use arrow keys or `hjkl` to move between cells
-2. **Edit**: Press `Enter` or `F2` to edit a cell
+TSHTS uses **vim-style modes**. The status bar shows your current mode
+(`-- NORMAL --`, `-- INSERT --`, `-- VISUAL --`, etc.).
+
+1. **Navigate**: Arrow keys or `hjkl` move between cells. Counts work: `5j`, `10G`.
+2. **Edit**: `i` / `a` / `I` / `A` / `s` / `Enter` enter Insert mode. `o` / `O` open a new row.
 3. **Formula**: Start with `=` for formulas (e.g., `=A1+B1`, `=SUM(A1:A10)`)
-4. **Save**: Press `Ctrl+S` to save your spreadsheet as `.tshts` file
-5. **Export/Import**: Use `Ctrl+E` for CSV export, `Ctrl+I` for CSV import
-6. **Search**: Press `/` to search across all cells and formulas
-7. **Help**: Press `F1` or `?` for comprehensive help
+4. **Visual**: `v` (cells), `V` (whole row), `Ctrl+V` (block). Then `y` yank / `d` delete / `c` change / `p` paste.
+5. **Save/Quit**: `Ctrl+S` saves; `:w` / `:wq` / `:q!` work from the command palette (`:`).
+6. **Export/Import**: `Ctrl+E` (CSV export), `Ctrl+L` (CSV import), or `:export <file>` / `:import <file>`.
+7. **Search**: `/` searches across cells and formulas; `n` / `N` cycle results.
+8. **Help**: `F1` or `?` opens help. Press `0` to jump to Vim Mode reference; `/` searches help.
 
 ## ✨ Key Features
 
 ### 🧮 Powerful Formula Engine
-- **Multi-Type System**: Full support for both numbers and strings
-- **Arithmetic Operations**: `+`, `-`, `*`, `/`, `**` (power), `%` (modulo)
+- **Multi-Type System**: numbers, strings, booleans, and list (range) values
+- **Arithmetic**: `+`, `-`, `*`, `/`, `**` / `^` (power), `%` (modulo)
 - **String Operations**: `&` (concatenation), string literals with `"quotes"`
-- **Comparison Operators**: `<`, `>`, `<=`, `>=`, `=`, `<>` (works with strings and numbers)
-- **Numeric Functions**: `SUM`, `AVERAGE`, `MIN`, `MAX`, `ABS`, `SQRT`, `ROUND`
-- **String Functions**: `CONCAT`, `LEN`, `UPPER`, `LOWER`, `TRIM`, `LEFT`, `RIGHT`, `MID`, `FIND`
-- **Web Functions**: `GET` (fetch content from URLs)
-- **Logical Functions**: `IF`, `AND`, `OR`, `NOT` (work with strings and numbers)
-- **Cell References**: Standard notation (A1, B2, AA123, etc.)
-- **Range Support**: Use ranges like `A1:C3` in functions
-- **Circular Reference Detection**: AST-based analysis prevents infinite loops
-- **Undo/Redo Support**: Full undo/redo functionality with `Ctrl+Z`/`Ctrl+Y`
-- **Cell Range Selection**: Select ranges with `Shift+Arrow` keys
-- **Autofill Functionality**: Copy formulas with relative references using `Ctrl+D`
+- **Comparison Operators**: `<`, `>`, `<=`, `>=`, `=`, `<>`
+- **Numeric Functions**: `SUM`, `AVERAGE`, `MIN`, `MAX`, `ABS`, `SQRT`, `ROUND`,
+  `CEILING`, `FLOOR`, `INT`, `MOD`, `POWER`, `SIGN`, `LOG`, `LN`, `EXP`, `PI`, `RAND`, `RANDBETWEEN`
+- **Conditional Aggregates**: `SUMIF`, `COUNTIF`, `AVERAGEIF` (`">5"`, wildcards)
+- **Lookup**: `VLOOKUP`, `INDEX`, `MATCH`
+- **String Functions**: `CONCAT`, `LEN`, `UPPER`, `LOWER`, `PROPER`, `TRIM`,
+  `LEFT`, `RIGHT`, `MID`, `FIND`, `SUBSTITUTE`, `REPLACE`, `REPT`, `EXACT`,
+  `CLEAN`, `CHAR`, `CODE`, `TEXT`, `VALUE`, `NUMBERVALUE`
+- **Date Functions**: `TODAY`, `NOW`, `DATE`, `YEAR`, `MONTH`, `DAY` (Excel
+  serial-day numbers)
+- **Web Functions**: `GET(url)` — non-blocking, cached for 5 min; first call
+  returns "Loading…" and the cell auto-refreshes when the background fetch
+  completes
+- **Logical Functions**: `IF`, `AND`, `OR`, `NOT`, `TRUE`, `FALSE`
+- **Info Functions**: `ISBLANK`, `ISNUMBER`, `ISTEXT`, `TYPE`, `COUNT`, `COUNTA`
+- **Visualization**: `SPARKLINE(range)` — unicode bar chart
+- **Cell References**: `A1`, `AA123` — and absolute markers `$A$1`, `$A1`, `A$1`
+- **Range Support**: `A1:C3` for any range-aware function
+- **Circular Reference Detection**: AST-based, prevents infinite loops
+- **Undo/Redo**: 1000-action history with `Ctrl+Z` / `Ctrl+Y`
+- **Range Selection**: `Shift+Arrow` keys
+- **Autofill**: `Ctrl+D` — copies formulas with relative-ref adjustment,
+  preserving `$`-anchored parts
 
 ### 📊 Smart Interface
 - **Auto-sizing Columns**: Columns automatically adjust to content width
@@ -102,13 +118,16 @@ TSHTS provides a comprehensive spreadsheet experience with:
 
 ### Roadmap & Contributing
 
-We're actively developing TSHTS with these upcoming features:
+Upcoming features:
 
-- 📅 **Charts & Visualization**: Basic terminal-based charts
-- 📅 **Import/Export**: CSV, Excel format support
+- 📅 **Charts & Visualization**: Basic terminal-based charts (a SPARKLINE
+  function already exists)
+- 📅 **Excel format support** (CSV is shipped)
 - 📅 **Scripting**: Lua/Python integration for custom functions
 - 📅 **Collaboration**: Real-time sharing capabilities
 - 📅 **Plugins**: Extension system for custom functionality
+- 📅 **Named ranges in formulas**, `INDIRECT` / `OFFSET`, conditional
+  formatting, multi-column `VLOOKUP`, `DATEDIF`
 
 **Want to contribute?** Check our [issues](https://github.com/SamuelSchlesinger/tshts/issues) for good first contributions. We welcome:
 - Bug reports and feature requests
@@ -165,21 +184,20 @@ TSHTS supports a powerful multi-type formula system that handles both numbers an
 =TRIM("  spaces  ")   → spaces (remove leading/trailing spaces)
 ```
 
-#### String Extraction (1-based, Excel-compatible)
+#### String Extraction (0-based indexing)
 ```
 =LEFT("Hello World", 5)    → Hello (first 5 characters)
 =RIGHT("Hello World", 5)   → World (last 5 characters)
-=MID("Hello World", 7, 5)  → World (5 chars starting at position 7)
-=FIND("lo", "Hello")       → 4 (case-sensitive; 'l' of "lo" is at position 4)
-=FIND("World", "Hello World")  → 7
-=SEARCH("WORLD", "Hello World") → 7 (case-insensitive FIND)
+=MID("Hello World", 6, 5)  → World (5 chars starting at position 6)
+=FIND("lo", "Hello")       → 3 (position of "lo" in "Hello")
+=FIND("World", "Hello World")  → 6 (position of "World")
 ```
 
 #### Advanced String Operations
 ```
 =CONCAT("A", "B", "C")      → ABC (concatenate multiple values)
 =CONCAT("Number: ", 123)    → Number: 123
-=FIND("text", A1, 4)        → Find "text" in A1 starting from position 4
+=FIND("text", A1, 3)        → Find "text" in A1 starting from position 3
 ```
 
 ### 🌐 Web Functions
@@ -218,17 +236,6 @@ TSHTS supports a powerful multi-type formula system that handles both numbers an
 =CONCAT(A1:A3)    → Concatenate all values in range A1:A3
 ```
 
-#### Absolute vs Relative References
-Use `$` to lock a component so it doesn't shift when the formula is copied,
-pasted, or when rows/columns are inserted.
-```
-=A1               → fully relative (both row and column shift)
-=$A1              → column A is locked, row shifts
-=A$1              → row 1 is locked, column shifts
-=$A$1             → both locked — always the same cell
-=SUM($A$1:B2)     → mix of absolute and relative in a range
-```
-
 ### 🔄 Type Conversion
 TSHTS automatically handles type conversion:
 - **Numeric operations**: Strings are converted to numbers (empty/invalid = 0)
@@ -261,8 +268,8 @@ TSHTS automatically handles type conversion:
 
 ### ⚠️ Important Notes
 
-- **String Indexing**: String functions use 1-based Excel-compatible indexing (position 1 is the first character)
-- **Case Sensitivity**: String comparisons and `FIND` are case-sensitive; use `SEARCH` for case-insensitive matching
+- **String Indexing**: All string functions use 0-based indexing (FIND, MID, etc.)
+- **Case Sensitivity**: String comparisons are case-sensitive
 - **Error Handling**: Invalid operations return `#ERROR`
 - **Empty Strings**: `""` is considered different from empty cells
 - **Quotes in Strings**: Use double quotes to escape: `"Quote""Test"` → `Quote"Test`
@@ -280,9 +287,17 @@ TSHTS automatically handles type conversion:
 - **Enter**: Confirm editing
 
 ### File Operations
-- **Ctrl+S**: Save spreadsheet
-- **Ctrl+O**: Load spreadsheet
-- **q**: Quit application (in normal mode)
+- **Ctrl+S**: Save in place (Save As if no filename yet)
+- **Ctrl+O**: Load spreadsheet (prompts if dirty)
+- **Ctrl+L**: Import CSV (prompts if dirty)
+- **Ctrl+E**: Export CSV
+- **q**: Quit (prompts if dirty)
+- **Command line**: `tshts foo.tshts` opens at startup
+
+### Search & Replace
+- **/**: Live search; `n` / `N` for next / previous
+- **Ctrl+R**: Find and replace (was Ctrl+H — Ctrl+H is Backspace in many terminals)
+- **`:regex on`**, **`:case on`**: search-option toggles
 
 ### View
 - **F1** / **?**: Show/hide help

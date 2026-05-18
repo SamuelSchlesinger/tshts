@@ -1,55 +1,13 @@
-//! File persistence layer for spreadsheet data.
-//!
-//! This module handles saving and loading spreadsheet data to/from JSON files.
-//! It provides a simple file-based storage mechanism for the application.
+//! JSON serialization for Workbook/Spreadsheet.
 
 use crate::domain::{Spreadsheet, Workbook};
 use std::fs;
 
-/// Repository for file-based spreadsheet persistence.
-///
-/// Handles serialization and deserialization of spreadsheet data using JSON format.
-/// All operations are synchronous and use the standard filesystem.
-///
-/// # Examples
-///
-/// ```
-/// use tshts::infrastructure::FileRepository;
-/// use tshts::domain::Spreadsheet;
-///
-/// let sheet = Spreadsheet::default();
-/// let result = FileRepository::save_spreadsheet(&sheet, "test.tshts");
-/// ```
 pub struct FileRepository;
 
 impl FileRepository {
-    /// Saves a spreadsheet to a JSON file.
-    ///
-    /// Serializes the spreadsheet data to JSON format and writes it to the specified file.
-    /// The file extension .tshts is recommended but not enforced.
-    ///
-    /// # Arguments
-    ///
-    /// * `spreadsheet` - Reference to the spreadsheet to save
-    /// * `filename` - Path where the file should be saved
-    ///
-    /// # Returns
-    ///
-    /// Result containing the filename on success, or error message on failure
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use tshts::infrastructure::FileRepository;
-    /// use tshts::domain::Spreadsheet;
-    ///
-    /// let sheet = Spreadsheet::default();
-    /// match FileRepository::save_spreadsheet(&sheet, "my_sheet.tshts") {
-    ///     Ok(filename) => println!("Saved to {}", filename),
-    ///     Err(error) => println!("Save failed: {}", error),
-    /// }
-    /// ```
-    #[allow(dead_code)] // Used in tests for single-sheet persistence
+    /// Save a single sheet. Public lib API; main loop uses `save_workbook`.
+    #[allow(dead_code)]
     pub fn save_spreadsheet(spreadsheet: &Spreadsheet, filename: &str) -> Result<String, String> {
         match serde_json::to_string_pretty(spreadsheet) {
             Ok(json) => {
@@ -62,32 +20,8 @@ impl FileRepository {
         }
     }
 
-    /// Loads a spreadsheet from a JSON file.
-    ///
-    /// Reads and deserializes spreadsheet data from the specified file.
-    /// The file must contain valid JSON in the expected spreadsheet format.
-    ///
-    /// # Arguments
-    ///
-    /// * `filename` - Path to the file to load
-    ///
-    /// # Returns
-    ///
-    /// Result containing (spreadsheet, filename) tuple on success, or error message on failure
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use tshts::infrastructure::FileRepository;
-    ///
-    /// match FileRepository::load_spreadsheet("my_sheet.tshts") {
-    ///     Ok((sheet, filename)) => {
-    ///         println!("Loaded {} rows from {}", sheet.rows, filename);
-    ///     }
-    ///     Err(error) => println!("Load failed: {}", error),
-    /// }
-    /// ```
-    #[allow(dead_code)] // Used in tests for single-sheet persistence
+    /// Load a single sheet. Public lib API; main loop uses `load_workbook`.
+    #[allow(dead_code)]
     pub fn load_spreadsheet(filename: &str) -> Result<(Spreadsheet, String), String> {
         match fs::read_to_string(filename) {
             Ok(content) => {
@@ -104,7 +38,6 @@ impl FileRepository {
         }
     }
 
-    /// Saves a workbook to a JSON file.
     pub fn save_workbook(workbook: &Workbook, filename: &str) -> Result<String, String> {
         match serde_json::to_string_pretty(workbook) {
             Ok(json) => {
@@ -117,16 +50,37 @@ impl FileRepository {
         }
     }
 
-    /// Loads a workbook from a JSON file.
-    /// Handles both old Spreadsheet format and new Workbook format.
+    /// Loads a workbook. Falls back to single-sheet Spreadsheet format for
+    /// backward compatibility with files saved before the workbook tabs feature.
     pub fn load_workbook(filename: &str) -> Result<(Workbook, String), String> {
         match fs::read_to_string(filename) {
             Ok(content) => {
                 // Try workbook format first
                 if let Ok(mut workbook) = serde_json::from_str::<Workbook>(&content) {
+                    // Validate invariants: a file with `active_sheet` past
+                    // `sheets.len()` or mismatched `sheet_names.len()` would
+                    // panic on the first UI read. Clamp + pad here.
+                    if workbook.sheet_names.len() < workbook.sheets.len() {
+                        let needed = workbook.sheets.len() - workbook.sheet_names.len();
+                        for i in 0..needed {
+                            workbook
+                                .sheet_names
+                                .push(format!("Sheet{}", workbook.sheet_names.len() + i + 1));
+                        }
+                    } else if workbook.sheet_names.len() > workbook.sheets.len() {
+                        workbook.sheet_names.truncate(workbook.sheets.len());
+                    }
+                    if workbook.sheets.is_empty() {
+                        // Pathological: empty sheets array. Replace with default.
+                        workbook = Workbook::default();
+                    }
+                    if workbook.active_sheet >= workbook.sheets.len() {
+                        workbook.active_sheet = 0;
+                    }
                     for sheet in &mut workbook.sheets {
                         sheet.rebuild_dependencies();
                     }
+                    workbook.rebuild_cross_sheet_deps();
                     return Ok((workbook, filename.to_string()));
                 }
                 // Fall back to single spreadsheet format
@@ -159,6 +113,7 @@ mod tests {
             formula: None,
             format: None,
             comment: None,
+        spill_anchor: None,
         });
         
         sheet.set_cell(1, 1, CellData {
@@ -166,6 +121,7 @@ mod tests {
             formula: Some("=6*7".to_string()),
             format: None,
             comment: None,
+        spill_anchor: None,
         });
         
         sheet.set_cell(2, 0, CellData {
@@ -173,6 +129,7 @@ mod tests {
             formula: None,
             format: None,
             comment: None,
+        spill_anchor: None,
         });
         
         // Set custom column width
@@ -295,6 +252,7 @@ mod tests {
             formula: None,
             format: None,
             comment: None,
+        spill_anchor: None,
         });
         
         sheet.set_cell(1, 0, CellData {
@@ -302,6 +260,7 @@ mod tests {
             formula: Some("=SUM(\"quotes\", 'apostrophes', `backticks`)".to_string()),
             format: None,
             comment: None,
+        spill_anchor: None,
         });
         
         let temp_file = NamedTempFile::new().expect("Failed to create temp file");
@@ -339,6 +298,7 @@ mod tests {
                     },
                     format: None,
                     comment: None,
+                spill_anchor: None,
                 });
             }
         }
@@ -413,11 +373,13 @@ mod tests {
         let mut workbook = Workbook::default();
         workbook.current_sheet_mut().set_cell(0, 0, CellData {
             value: "Sheet1".to_string(), formula: None, format: None, comment: None,
+        spill_anchor: None,
         });
         workbook.add_sheet("Data".to_string());
         workbook.active_sheet = 1;
         workbook.current_sheet_mut().set_cell(0, 0, CellData {
             value: "Sheet2".to_string(), formula: None, format: None, comment: None,
+        spill_anchor: None,
         });
         workbook.active_sheet = 0; // Reset before save
 
@@ -441,6 +403,7 @@ mod tests {
         let mut sheet = Spreadsheet::default();
         sheet.set_cell(0, 0, CellData {
             value: "Legacy".to_string(), formula: None, format: None, comment: None,
+        spill_anchor: None,
         });
 
         let temp_file = NamedTempFile::new().expect("Failed to create temp file");

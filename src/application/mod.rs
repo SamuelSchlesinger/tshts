@@ -1,8 +1,4 @@
-//! Application layer managing state and business workflows.
-//!
-//! This module coordinates between the domain layer and presentation layer,
-//! managing application state, user interactions, and business workflows.
+//! Application orchestration layer.
 
 pub mod state;
-
 pub use state::*;

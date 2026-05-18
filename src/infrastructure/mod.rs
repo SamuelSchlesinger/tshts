@@ -4,5 +4,10 @@
 //! file I/O, persistence, and other system-level operations.
 
 pub mod persistence;
+pub mod fetcher;
+pub mod recent;
+pub mod autosave;
+pub mod sidecar;
+pub mod xlsx;
 
 pub use persistence::*;
