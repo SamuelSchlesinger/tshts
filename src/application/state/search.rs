@@ -242,3 +242,157 @@ impl App {
     }
 
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::CellData;
+
+    #[test]
+    fn test_regex_search_toggle() {
+        let mut app = App::default();
+        app.workbook.current_sheet_mut().set_cell(0, 0, crate::domain::CellData {
+            value: "foo123".to_string(), formula: None, format: None, comment: None,
+        spill_anchor: None,
+        });
+        app.workbook.current_sheet_mut().set_cell(1, 0, crate::domain::CellData {
+            value: "FOO456".to_string(), formula: None, format: None, comment: None,
+        spill_anchor: None,
+        });
+        // Default: case-insensitive substring matches both.
+        app.search_query = "foo".to_string();
+        app.perform_search();
+        assert_eq!(app.search_results.len(), 2);
+
+        // Case-sensitive: only first matches.
+        app.search_case_sensitive = true;
+        app.perform_search();
+        assert_eq!(app.search_results.len(), 1);
+
+        // Regex: anchored digit match.
+        app.search_case_sensitive = false;
+        app.search_regex = true;
+        app.search_query = "[0-9]+$".to_string();
+        app.perform_search();
+        assert_eq!(app.search_results.len(), 2);
+    }
+
+    #[test]
+    fn test_find_replace_basic() {
+        let mut app = App::default();
+        app.set_cell_with_undo(0, 0, CellData { value: "hello world".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
+        app.set_cell_with_undo(1, 0, CellData { value: "hello there".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
+        app.set_cell_with_undo(2, 0, CellData { value: "goodbye".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
+
+        app.start_find_replace();
+        assert!(matches!(app.mode, AppMode::FindReplace));
+
+        app.find_replace_search = "hello".to_string();
+        app.find_replace_search();
+
+        assert_eq!(app.find_replace_results.len(), 2);
+    }
+
+    #[test]
+    fn test_replace_current() {
+        let mut app = App::default();
+        app.set_cell_with_undo(0, 0, CellData { value: "hello world".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
+
+        app.start_find_replace();
+        app.find_replace_search = "hello".to_string();
+        app.find_replace_replace = "hi".to_string();
+        app.find_replace_search();
+
+        assert_eq!(app.find_replace_results.len(), 1);
+
+        app.replace_current();
+
+        assert_eq!(app.workbook.current_sheet().get_cell(0, 0).value, "hi world");
+    }
+
+    #[test]
+    fn test_replace_all() {
+        let mut app = App::default();
+        app.set_cell_with_undo(0, 0, CellData { value: "cat".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
+        app.set_cell_with_undo(1, 0, CellData { value: "cat food".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
+        app.set_cell_with_undo(2, 0, CellData { value: "dog".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
+
+        app.start_find_replace();
+        app.find_replace_search = "cat".to_string();
+        app.find_replace_replace = "kitten".to_string();
+        app.find_replace_search();
+
+        app.replace_all();
+
+        assert_eq!(app.workbook.current_sheet().get_cell(0, 0).value, "kitten");
+        assert_eq!(app.workbook.current_sheet().get_cell(1, 0).value, "kitten food");
+        assert_eq!(app.workbook.current_sheet().get_cell(2, 0).value, "dog"); // Unchanged
+    }
+
+    #[test]
+    fn test_replace_skips_formula_cells() {
+        let mut app = App::default();
+        app.set_cell_with_undo(0, 0, CellData {
+            value: "hello".to_string(),
+            formula: Some("=A2".to_string()),
+            format: None,
+            comment: None,
+        spill_anchor: None,
+        });
+
+        app.start_find_replace();
+        app.find_replace_search = "hello".to_string();
+        app.find_replace_replace = "bye".to_string();
+        app.find_replace_search();
+
+        // Should find the cell but not replace it
+        app.replace_current();
+
+        // Formula cell value should be unchanged (replace_current skips formula cells)
+        assert_eq!(app.workbook.current_sheet().get_cell(0, 0).formula, Some("=A2".to_string()));
+    }
+
+    #[test]
+    fn test_goto_cell() {
+        let mut app = App::default();
+        app.start_goto_cell();
+        assert!(matches!(app.mode, AppMode::GoToCell));
+
+        app.goto_cell_input = "C5".to_string();
+        app.finish_goto_cell();
+
+        assert!(matches!(app.mode, AppMode::Normal));
+        assert_eq!(app.selected_row, 4); // 0-indexed
+        assert_eq!(app.selected_col, 2); // C = index 2
+    }
+
+    #[test]
+    fn test_goto_cell_invalid() {
+        let mut app = App::default();
+        app.start_goto_cell();
+
+        app.goto_cell_input = "invalid".to_string();
+        app.finish_goto_cell();
+
+        assert!(matches!(app.mode, AppMode::Normal));
+        assert!(app.status_message.as_ref().unwrap().contains("Invalid cell reference"));
+        assert_eq!(app.selected_row, 0); // Unchanged
+        assert_eq!(app.selected_col, 0);
+    }
+
+    #[test]
+    fn test_goto_cell_cancel() {
+        let mut app = App::default();
+        app.selected_row = 5;
+        app.selected_col = 3;
+        app.start_goto_cell();
+
+        app.goto_cell_input = "A1".to_string();
+        app.cancel_goto_cell();
+
+        assert!(matches!(app.mode, AppMode::Normal));
+        assert_eq!(app.selected_row, 5); // Unchanged
+        assert_eq!(app.selected_col, 3);
+    }
+
+}

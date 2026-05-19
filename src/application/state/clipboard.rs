@@ -315,3 +315,107 @@ impl App {
     }
 
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::CellData;
+
+    #[test]
+    fn test_copy_paste_single_cell() {
+        let mut app = App::default();
+        app.set_cell_with_undo(0, 0, CellData { value: "Hello".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
+
+        // Copy A1
+        app.selected_row = 0;
+        app.selected_col = 0;
+        app.copy_selection();
+        assert!(app.clipboard.is_some());
+
+        // Paste to B2
+        app.selected_row = 1;
+        app.selected_col = 1;
+        app.paste();
+
+        assert_eq!(app.workbook.current_sheet().get_cell(1, 1).value, "Hello");
+    }
+
+    #[test]
+    fn test_copy_paste_range() {
+        let mut app = App::default();
+        app.set_cell_with_undo(0, 0, CellData { value: "A".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
+        app.set_cell_with_undo(0, 1, CellData { value: "B".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
+        app.set_cell_with_undo(1, 0, CellData { value: "C".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
+        app.set_cell_with_undo(1, 1, CellData { value: "D".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
+
+        // Select A1:B2
+        app.selection_start = Some((0, 0));
+        app.selection_end = Some((1, 1));
+        app.copy_selection();
+
+        // Paste to C3
+        app.selected_row = 2;
+        app.selected_col = 2;
+        app.paste();
+
+        assert_eq!(app.workbook.current_sheet().get_cell(2, 2).value, "A");
+        assert_eq!(app.workbook.current_sheet().get_cell(2, 3).value, "B");
+        assert_eq!(app.workbook.current_sheet().get_cell(3, 2).value, "C");
+        assert_eq!(app.workbook.current_sheet().get_cell(3, 3).value, "D");
+    }
+
+    #[test]
+    fn test_cut_paste() {
+        let mut app = App::default();
+        app.set_cell_with_undo(0, 0, CellData { value: "Move me".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
+
+        app.selected_row = 0;
+        app.selected_col = 0;
+        app.cut_selection();
+
+        // Original cell should be cleared
+        assert!(app.workbook.current_sheet().get_cell(0, 0).value.is_empty());
+
+        // Paste to new location
+        app.selected_row = 2;
+        app.selected_col = 2;
+        app.paste();
+
+        assert_eq!(app.workbook.current_sheet().get_cell(2, 2).value, "Move me");
+    }
+
+    #[test]
+    fn test_paste_nothing() {
+        let mut app = App::default();
+        app.paste(); // Should not crash
+        assert!(app.status_message.as_ref().unwrap().contains("Nothing to paste"));
+    }
+
+    #[test]
+    fn test_copy_paste_formula_adjusts_refs() {
+        let mut app = App::default();
+        app.set_cell_with_undo(0, 0, CellData { value: "10".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
+        app.set_cell_with_undo(0, 1, CellData {
+            value: "20".to_string(),
+            formula: Some("=A1*2".to_string()),
+            format: None,
+            comment: None,
+        spill_anchor: None,
+        });
+
+        // Copy B1 (has formula =A1*2)
+        app.selected_row = 0;
+        app.selected_col = 1;
+        app.copy_selection();
+
+        // Paste to B2 (should adjust to =A2*2)
+        app.selected_row = 1;
+        app.selected_col = 1;
+        app.paste();
+
+        let pasted = app.workbook.current_sheet().get_cell(1, 1);
+        assert!(pasted.formula.is_some());
+        assert_eq!(pasted.formula.unwrap(), "=A2*2");
+    }
+
+}

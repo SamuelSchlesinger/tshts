@@ -222,3 +222,244 @@ impl App {
     }
 
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::CellData;
+
+    #[test]
+    fn test_start_save_as() {
+        let mut app = App::default();
+        app.start_save_as();
+        
+        assert!(matches!(app.mode, AppMode::SaveAs));
+        assert_eq!(app.filename_input, "spreadsheet.tshts"); // Default filename
+        assert_eq!(app.cursor_position, "spreadsheet.tshts".len());
+        assert!(app.status_message.is_none());
+    }
+
+    #[test]
+    fn test_start_save_as_with_existing_filename() {
+        let mut app = App::default();
+        app.filename = Some("existing.tshts".to_string());
+        
+        app.start_save_as();
+        
+        assert!(matches!(app.mode, AppMode::SaveAs));
+        assert_eq!(app.filename_input, "existing.tshts");
+        assert_eq!(app.cursor_position, "existing.tshts".len());
+    }
+
+    #[test]
+    fn test_start_load_file() {
+        let mut app = App::default();
+        app.start_load_file();
+        
+        assert!(matches!(app.mode, AppMode::LoadFile));
+        assert_eq!(app.filename_input, "spreadsheet.tshts");
+        assert_eq!(app.cursor_position, "spreadsheet.tshts".len());
+        assert!(app.status_message.is_none());
+    }
+
+    #[test]
+    fn test_cancel_filename_input() {
+        let mut app = App::default();
+        app.start_save_as();
+        app.filename_input = "test.tshts".to_string();
+        app.cursor_position = 5;
+        
+        app.cancel_filename_input();
+        
+        assert!(matches!(app.mode, AppMode::Normal));
+        assert!(app.filename_input.is_empty());
+        assert_eq!(app.cursor_position, 0);
+    }
+
+    #[test]
+    fn test_set_save_result_success() {
+        let mut app = App::default();
+        app.start_save_as();
+        app.filename_input = "test.tshts".to_string();
+        
+        app.set_save_result(Ok("test.tshts".to_string()));
+        
+        assert!(matches!(app.mode, AppMode::Normal));
+        assert_eq!(app.filename.unwrap(), "test.tshts");
+        assert!(app.status_message.unwrap().contains("Saved to test.tshts"));
+        assert!(app.filename_input.is_empty());
+        assert_eq!(app.cursor_position, 0);
+    }
+
+    #[test]
+    fn test_set_save_result_failure() {
+        let mut app = App::default();
+        app.start_save_as();
+        
+        app.set_save_result(Err("Permission denied".to_string()));
+        
+        assert!(matches!(app.mode, AppMode::Normal));
+        assert!(app.filename.is_none()); // Filename unchanged on failure
+        assert!(app.status_message.unwrap().contains("Save failed: Permission denied"));
+        assert!(app.filename_input.is_empty());
+        assert_eq!(app.cursor_position, 0);
+    }
+
+    #[test]
+    fn test_set_load_workbook_result_success() {
+        let mut app = App::default();
+        app.selected_row = 5;
+        app.selected_col = 3;
+        app.scroll_row = 2;
+        app.scroll_col = 1;
+
+        let mut new_sheet = Spreadsheet::default();
+        new_sheet.set_cell(0, 0, CellData {
+            value: "Loaded".to_string(),
+            formula: None,
+            format: None,
+            comment: None,
+        spill_anchor: None,
+        });
+        let workbook = Workbook::from_spreadsheet(new_sheet);
+
+        app.set_load_workbook_result(Ok((workbook, "loaded.tshts".to_string())));
+
+        assert!(matches!(app.mode, AppMode::Normal));
+        assert_eq!(app.filename.unwrap(), "loaded.tshts");
+        assert!(app.status_message.unwrap().contains("Loaded from loaded.tshts"));
+
+        // Position should be reset
+        assert_eq!(app.selected_row, 0);
+        assert_eq!(app.selected_col, 0);
+        assert_eq!(app.scroll_row, 0);
+        assert_eq!(app.scroll_col, 0);
+
+        // Spreadsheet should be updated
+        let cell = app.workbook.current_sheet().get_cell(0, 0);
+        assert_eq!(cell.value, "Loaded");
+    }
+
+    #[test]
+    fn test_set_load_workbook_result_failure() {
+        let mut app = App::default();
+        let original_sheet = app.workbook.current_sheet().clone();
+
+        app.set_load_workbook_result(Err("File not found".to_string()));
+
+        assert!(matches!(app.mode, AppMode::Normal));
+        assert!(app.filename.is_none());
+        assert!(app.status_message.unwrap().contains("Load failed: File not found"));
+
+        // Spreadsheet should remain unchanged
+        assert_eq!(app.workbook.current_sheet().rows, original_sheet.rows);
+        assert_eq!(app.workbook.current_sheet().cols, original_sheet.cols);
+    }
+
+    #[test]
+    fn test_get_save_filename() {
+        let mut app = App::default();
+        
+        // Empty filename input should return default
+        assert_eq!(app.get_save_filename(), "spreadsheet.tshts");
+        
+        // Non-empty filename input should return that
+        app.filename_input = "custom.tshts".to_string();
+        assert_eq!(app.get_save_filename(), "custom.tshts");
+    }
+
+    #[test]
+    fn test_get_load_filename() {
+        let mut app = App::default();
+        
+        // Empty filename input should return default
+        assert_eq!(app.get_load_filename(), "spreadsheet.tshts");
+        
+        // Non-empty filename input should return that
+        app.filename_input = "custom.tshts".to_string();
+        assert_eq!(app.get_load_filename(), "custom.tshts");
+    }
+
+    #[test]
+    fn test_csv_import_mode() {
+        let mut app = App::default();
+        
+        // Initially in normal mode
+        assert!(matches!(app.mode, AppMode::Normal));
+        assert!(app.filename_input.is_empty());
+        
+        // Start CSV import mode
+        app.start_csv_import();
+        
+        // Should be in ImportCsv mode with default filename
+        assert!(matches!(app.mode, AppMode::ImportCsv));
+        assert_eq!(app.filename_input, "data.csv");
+        assert_eq!(app.cursor_position, "data.csv".len());
+        assert!(app.status_message.is_none());
+        
+        // Test getting import filename
+        assert_eq!(app.get_csv_import_filename(), "data.csv");
+        
+        // Test with custom filename
+        app.filename_input = "custom.csv".to_string();
+        assert_eq!(app.get_csv_import_filename(), "custom.csv");
+        
+        // Test with empty filename
+        app.filename_input.clear();
+        assert_eq!(app.get_csv_import_filename(), "data.csv");
+        
+        // Test cancel
+        app.cancel_filename_input();
+        assert!(matches!(app.mode, AppMode::Normal));
+        assert!(app.filename_input.is_empty());
+        assert_eq!(app.cursor_position, 0);
+    }
+
+    #[test]
+    fn test_csv_import_result_handling() {
+        let mut app = App::default();
+        app.start_csv_import();
+        
+        // Set initial position away from origin
+        app.selected_row = 5;
+        app.selected_col = 3;
+        app.scroll_row = 2;
+        app.scroll_col = 1;
+        
+        // Test successful import
+        let mut new_sheet = Spreadsheet::default();
+        new_sheet.set_cell(0, 0, CellData {
+            value: "Imported".to_string(),
+            formula: None,
+            format: None,
+            comment: None,
+        spill_anchor: None,
+        });
+        
+        app.set_csv_import_result(Ok(new_sheet));
+        
+        // Should return to normal mode with success message
+        assert!(matches!(app.mode, AppMode::Normal));
+        assert!(app.status_message.as_ref().unwrap().contains("imported successfully"));
+        assert!(app.filename_input.is_empty());
+        assert_eq!(app.cursor_position, 0);
+        
+        // Position should be reset to origin
+        assert_eq!(app.selected_row, 0);
+        assert_eq!(app.selected_col, 0);
+        assert_eq!(app.scroll_row, 0);
+        assert_eq!(app.scroll_col, 0);
+        
+        // Spreadsheet should be updated
+        let cell = app.workbook.current_sheet().get_cell(0, 0);
+        assert_eq!(cell.value, "Imported");
+        
+        // Test failed import
+        app.start_csv_import();
+        app.set_csv_import_result(Err("File not found".to_string()));
+        
+        assert!(matches!(app.mode, AppMode::Normal));
+        assert!(app.status_message.as_ref().unwrap().contains("Import failed: File not found"));
+    }
+
+}

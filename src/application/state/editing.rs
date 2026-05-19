@@ -153,3 +153,130 @@ impl App {
     }
 
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::CellData;
+
+    #[test]
+    fn test_start_editing_empty_cell() {
+        let mut app = App::default();
+        app.start_editing();
+        
+        assert!(matches!(app.mode, AppMode::Editing));
+        assert!(app.input.is_empty()); // Empty cell should give empty input
+        assert_eq!(app.cursor_position, 0);
+    }
+
+    #[test]
+    fn test_start_editing_cell_with_value() {
+        let mut app = App::default();
+        
+        // Set a cell with value
+        let cell_data = CellData {
+            value: "Hello".to_string(),
+            formula: None,
+            format: None,
+            comment: None,
+        spill_anchor: None,
+        };
+        app.workbook.current_sheet_mut().set_cell(0, 0, cell_data);
+        
+        app.start_editing();
+        
+        assert!(matches!(app.mode, AppMode::Editing));
+        assert_eq!(app.input, "Hello");
+        assert_eq!(app.cursor_position, 5); // End of "Hello"
+    }
+
+    #[test]
+    fn test_start_editing_cell_with_formula() {
+        let mut app = App::default();
+        
+        // Set a cell with formula
+        let cell_data = CellData {
+            value: "42".to_string(),
+            formula: Some("=6*7".to_string()),
+            format: None,
+            comment: None,
+        spill_anchor: None,
+        };
+        app.workbook.current_sheet_mut().set_cell(0, 0, cell_data);
+        
+        app.start_editing();
+        
+        assert!(matches!(app.mode, AppMode::Editing));
+        assert_eq!(app.input, "=6*7"); // Should load formula, not value
+        assert_eq!(app.cursor_position, 4); // End of "=6*7"
+    }
+
+    #[test]
+    fn test_finish_editing_simple_value() {
+        let mut app = App::default();
+        app.start_editing();
+        app.input = "Test Value".to_string();
+        
+        app.finish_editing();
+        
+        assert!(matches!(app.mode, AppMode::Normal));
+        assert!(app.input.is_empty());
+        assert_eq!(app.cursor_position, 0);
+        
+        let cell = app.workbook.current_sheet().get_cell(0, 0);
+        assert_eq!(cell.value, "Test Value");
+        assert!(cell.formula.is_none());
+    }
+
+    #[test]
+    fn test_finish_editing_formula() {
+        let mut app = App::default();
+        app.start_editing();
+        app.input = "=2+3".to_string();
+        
+        app.finish_editing();
+        
+        assert!(matches!(app.mode, AppMode::Normal));
+        assert!(app.input.is_empty());
+        assert_eq!(app.cursor_position, 0);
+        
+        let cell = app.workbook.current_sheet().get_cell(0, 0);
+        assert_eq!(cell.value, "5"); // Evaluated result
+        assert_eq!(cell.formula.unwrap(), "=2+3"); // Original formula
+    }
+
+    #[test]
+    fn test_finish_editing_circular_reference() {
+        let mut app = App::default();
+        app.start_editing();
+        app.input = "=A1+1".to_string(); // Self-reference
+        
+        let original_cell = app.workbook.current_sheet().get_cell(0, 0).clone();
+        app.finish_editing();
+        
+        // Should remain in editing mode and not change the cell
+        let cell_after = app.workbook.current_sheet().get_cell(0, 0);
+        assert_eq!(original_cell.value, cell_after.value);
+        assert_eq!(original_cell.formula, cell_after.formula);
+    }
+
+    #[test]
+    fn test_cancel_editing() {
+        let mut app = App::default();
+        app.start_editing();
+        app.input = "Some input".to_string();
+        app.cursor_position = 5;
+        
+        app.cancel_editing();
+        
+        assert!(matches!(app.mode, AppMode::Normal));
+        assert!(app.input.is_empty());
+        assert_eq!(app.cursor_position, 0);
+        
+        // Cell should remain unchanged
+        let cell = app.workbook.current_sheet().get_cell(0, 0);
+        assert!(cell.value.is_empty());
+        assert!(cell.formula.is_none());
+    }
+
+}

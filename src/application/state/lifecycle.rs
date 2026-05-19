@@ -45,3 +45,42 @@ impl App {
     }
 
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::CellData;
+
+    #[test]
+    fn test_confirm_discard_save_then_quit_with_known_filename() {
+        use tempfile::NamedTempFile;
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+
+        let mut app = App::default();
+        app.workbook.current_sheet_mut().set_cell(0, 0, crate::domain::CellData {
+            value: "x".to_string(), formula: None, format: None, comment: None,
+        spill_anchor: None,
+        });
+        app.dirty = true;
+        app.filename = Some(path);
+
+        // Quit with dirty → prompt.
+        app.request_quit();
+        assert!(matches!(app.mode, AppMode::ConfirmDiscard));
+        assert!(!app.should_quit);
+
+        // Simulate "s" (save & quit). save_in_place_or_prompt should succeed
+        // because filename is known.
+        let pending = app.pending_action.take();
+        app.save_in_place_or_prompt();
+        assert!(!app.dirty);
+        // Trigger the deferred quit.
+        if let Some(action) = pending {
+            app.pending_action = Some(action);
+            app.confirm_pending_action();
+        }
+        assert!(app.should_quit);
+    }
+
+}
