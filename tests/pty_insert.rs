@@ -24,7 +24,7 @@ fn insert_left_arrow_moves_cursor() {
     h.send_text("X");
     h.send_enter();
     h.send_text("k");
-    let bar = h.row(1);
+    let bar = h.formula_bar();
     assert!(bar.contains("abcXde"),
         "Left-arrow should reposition the cursor mid-edit. Got: {:?}", bar);
     quit_force(&mut h);
@@ -39,7 +39,7 @@ fn insert_home_jumps_to_start() {
     h.send_text("hello ");
     h.send_enter();
     h.send_text("k");
-    let bar = h.row(1);
+    let bar = h.formula_bar();
     assert!(bar.contains("hello world"),
         "Home should move cursor to start. Got: {:?}", bar);
     quit_force(&mut h);
@@ -57,7 +57,7 @@ fn insert_end_jumps_to_end() {
     h.send_text("!");
     h.send_enter();
     h.send_text("k");
-    let bar = h.row(1);
+    let bar = h.formula_bar();
     assert!(bar.contains("hello!"),
         "End should move cursor past last char. Got: {:?}", bar);
     quit_force(&mut h);
@@ -71,7 +71,7 @@ fn insert_backspace_deletes_left_of_cursor() {
     h.send_backspace();
     h.send_enter();
     h.send_text("k");
-    let bar = h.row(1);
+    let bar = h.formula_bar();
     assert!(bar.contains("hell"),
         "Backspace should remove last char. Got: {:?}", bar);
     quit_force(&mut h);
@@ -88,7 +88,7 @@ fn insert_delete_key_removes_right_of_cursor() {
     h.send(b"\x1b[3~"); // Delete key
     h.send_enter();
     h.send_text("k");
-    let bar = h.row(1);
+    let bar = h.formula_bar();
     assert!(bar.contains("helo"),
         "Delete should remove char to the right. Got: {:?}", bar);
     quit_force(&mut h);
@@ -103,7 +103,7 @@ fn insert_unicode_chars_preserved() {
     h.send_text("café"); // 'é' is multi-byte UTF-8
     h.send_enter();
     h.send_text("k");
-    let bar = h.row(1);
+    let bar = h.formula_bar();
     assert!(bar.contains("café"), "Unicode should round-trip. Got: {:?}", bar);
     quit_force(&mut h);
 }
@@ -168,7 +168,7 @@ fn insert_i_prepends_to_existing_content() {
     h.send_text("hello ");
     h.send_enter();
     h.send_text("k");
-    let bar = h.row(1);
+    let bar = h.formula_bar();
     assert!(bar.contains("hello world"),
         "`i` should put cursor at start, typing prepends. Got: {:?}", bar);
     quit_force(&mut h);
@@ -185,7 +185,7 @@ fn insert_A_appends_to_existing_content() {
     h.send_text(" world");
     h.send_enter();
     h.send_text("k");
-    let bar = h.row(1);
+    let bar = h.formula_bar();
     assert!(bar.contains("hello world"),
         "`A` should put cursor at end, typing appends. Got: {:?}", bar);
     quit_force(&mut h);
@@ -202,7 +202,7 @@ fn insert_esc_leaves_prior_value_intact() {
     h.send_text("discard-this");
     h.send_esc();
     h.send_text("k"); // motion to refresh formula bar
-    let bar = h.row(1);
+    let bar = h.formula_bar();
     assert!(bar.contains("keep") && !bar.contains("discard"),
         "Esc must restore original value. Got: {:?}", bar);
     quit_force(&mut h);

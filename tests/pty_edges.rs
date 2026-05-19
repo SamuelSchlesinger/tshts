@@ -65,7 +65,7 @@ fn edge_insert_col_at_first_position() {
     h.send_text(":ic"); h.send_enter();
     // After insert col, "first" should now be at B1 (was A1).
     // Both rows visible in the grid.
-    let r1 = h.row(4); // data row 1
+    let r1 = h.data_row(1); // data row 1
     assert!(
         r1.contains("first"),
         "After :ic, 'first' should still be visible (in B1). Got: {:?}",
@@ -216,7 +216,7 @@ fn edge_q_in_insert_mode_is_literal() {
     h.assert_contains("-- NORMAL --");
     // A1 should contain "q".
     h.send_text("k");
-    let bar = h.row(1);
+    let bar = h.formula_bar();
     assert!(bar.contains("q"), "A1 should hold literal 'q'. Got: {:?}", bar);
     quit_force(&mut h);
 }
@@ -258,7 +258,7 @@ fn edge_long_input_preserved() {
     h.send_text(&long);
     h.send_enter();
     h.send_text("k");
-    let bar = h.row(1);
+    let bar = h.formula_bar();
     // Formula bar shows the value (which is 80 x's). vt100 may have its own
     // line wrap so we just check at least 60 are visible.
     let xcount = bar.matches('x').count();

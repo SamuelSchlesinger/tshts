@@ -52,7 +52,7 @@ fn adv_rename_sheet_updates_cross_sheet_refs() {
     h.send_text("k");
     h.assert_contains("42");
     // The formula text should mention "Data!", not stale "Sheet1!".
-    let formula = h.row(1);
+    let formula = h.formula_bar();
     assert!(
         formula.contains("Data!") || formula.contains("42"),
         "After rename, the cross-sheet formula should refer to the new name. Formula bar: {:?}",
@@ -185,12 +185,12 @@ fn adv_f5_recalculates_formulas() {
     h.send_text("=RAND()");
     h.send_enter();
     h.send_text("k");
-    let _before = h.row(4);
+    let _before = h.data_row(1);
     // F5 (xterm CSI form). Recalc should not crash; we don't compare values
     // since RAND() can collide by chance.
     h.send(b"\x1b[15~");
     std::thread::sleep(Duration::from_millis(200));
-    let _after = h.row(4);
+    let _after = h.data_row(1);
     quit_force(&mut h);
 }
 
@@ -204,7 +204,7 @@ fn adv_url_value_displayed() {
     h.send_enter();
     h.send_text("k");
     // The cell will be truncated in the grid; check the formula bar.
-    let bar = h.row(1);
+    let bar = h.formula_bar();
     assert!(bar.contains("http://example.com"),
         "Formula bar should show the full URL: {:?}", bar);
     quit_force(&mut h);

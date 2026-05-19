@@ -31,7 +31,7 @@ pub use help::{help_section_offset, find_help_match, HELP_SECTIONS};
 pub use grid::cell_at;
 
 // Bring submodule render functions into scope for the dispatcher below.
-use header::{render_header, render_formula_bar};
+use header::{render_header, render_formula_bar, render_sheet_tabs};
 use grid::render_spreadsheet;
 use status_bar::{render_status_bar, mode_label, render_vim_pending};
 use popups::{
@@ -70,10 +70,14 @@ fn terminal_color_to_ratatui(color: &TerminalColor) -> Color {
 }
 
 pub fn render_ui(f: &mut Frame, app: &mut App) {
+    // 5-row layout: header / sheet tabs / formula bar / grid / status.
+    // The dedicated sheet-tabs row makes multi-sheet navigation visible at
+    // a glance (carry-over from the fabb869 refactor).
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // header (filename, sheet tabs, filter status)
+            Constraint::Length(1), // header (filename, mode chip, cell ref)
+            Constraint::Length(1), // sheet tabs
             Constraint::Length(1), // formula bar
             Constraint::Min(0),    // spreadsheet grid
             Constraint::Length(3), // status / mode line
@@ -81,21 +85,22 @@ pub fn render_ui(f: &mut Frame, app: &mut App) {
         .split(f.area());
 
     render_header(f, app, chunks[0]);
-    render_formula_bar(f, app, chunks[1]);
-    render_spreadsheet(f, app, chunks[2]);
-    render_status_bar(f, app, chunks[3]);
+    render_sheet_tabs(f, app, chunks[1]);
+    render_formula_bar(f, app, chunks[2]);
+    render_spreadsheet(f, app, chunks[3]);
+    render_status_bar(f, app, chunks[4]);
 
     if matches!(app.mode, AppMode::Help) {
         render_help_popup(f, app);
     }
     if matches!(app.mode, AppMode::CommandPalette) {
-        render_command_suggestions(f, app, chunks[3]);
+        render_command_suggestions(f, app, chunks[4]);
     }
     if matches!(app.mode, AppMode::Editing) {
-        render_function_autocomplete(f, app, chunks[3]);
+        render_function_autocomplete(f, app, chunks[4]);
     }
     if matches!(app.mode, AppMode::LoadFile) {
-        render_recent_files(f, chunks[3]);
+        render_recent_files(f, chunks[4]);
     }
     if let Some(_) = &app.chart_popup {
         render_chart_popup(f, app);

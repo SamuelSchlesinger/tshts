@@ -82,7 +82,7 @@ fn ux_esc_cancels_edit_leaves_cell_unchanged() {
     h.send_text("isecond"); // start editing again (vim `i` puts cursor at start)
     h.send_esc(); // cancel
     // A1 should STILL contain "first", not "second" or anything garbled.
-    let row1 = h.row(4); // row 4 in the rendered grid is data row 1
+    let row1 = h.data_row(1); // row 4 in the rendered grid is data row 1
     assert!(
         row1.contains("first"),
         "Esc must restore previous cell value, got row: {:?}",
@@ -101,7 +101,7 @@ fn ux_enter_commits_then_moves_cursor_down() {
     h.send_text("hi");
     h.send_enter();
     // Cursor should now be at A2.
-    let formula_bar = h.row(1);
+    let formula_bar = h.formula_bar();
     assert!(
         formula_bar.contains("A2"),
         "After commit, cursor should advance to A2. Formula bar: {:?}",
@@ -115,7 +115,7 @@ fn ux_tab_in_editing_commits_then_moves_right() {
     let mut h = Harness::new();
     h.send_text("ihi");
     h.send_tab();
-    let formula_bar = h.row(1);
+    let formula_bar = h.formula_bar();
     assert!(
         formula_bar.contains("B1"),
         "After Tab commit, cursor should advance to B1. Formula bar: {:?}",
@@ -162,7 +162,7 @@ fn ux_ctrl_g_then_b5_lands_at_b5() {
     h.assert_contains("-- GOTO --");
     h.send_text("B5");
     h.send_enter();
-    let formula_bar = h.row(1);
+    let formula_bar = h.formula_bar();
     assert!(
         formula_bar.contains("B5"),
         "After GoToCell B5, formula bar should show B5. Got: {:?}",
@@ -193,8 +193,8 @@ fn ux_palette_insert_row_command() {
     h.send_enter();
     // After inserting a row, "here" should now be at row 2.
     // Row 4 in the rendered grid is data row 1 (header is row 3).
-    let r1 = h.row(4);
-    let r2 = h.row(5);
+    let r1 = h.data_row(1);
+    let r2 = h.data_row(2);
     assert!(
         !r1.contains("here"),
         "After :ir, row 1 should be the new blank row. Got: {:?}",
@@ -279,7 +279,7 @@ fn ux_formula_bar_shows_selected_cell_value() {
     let mut h = Harness::new();
     h.send_text("ihello"); h.send_enter();
     h.send_text("k"); // back to A1
-    let formula_bar = h.row(1);
+    let formula_bar = h.formula_bar();
     assert!(
         formula_bar.contains("hello"),
         "Formula bar should show selected cell value. Got: {:?}",
@@ -295,7 +295,7 @@ fn ux_formula_bar_shows_full_text_when_grid_truncates() {
     h.send_text("ithis-is-a-long-value-here");
     h.send_enter();
     h.send_text("k");
-    let formula_bar = h.row(1);
+    let formula_bar = h.formula_bar();
     assert!(
         formula_bar.contains("this-is-a-long-value-here"),
         "Formula bar should show full value even when grid clips it. Got: {:?}",

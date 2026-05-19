@@ -225,6 +225,31 @@ impl Harness {
         s
     }
 
+    // ----- Semantic row helpers -----
+    //
+    // Concrete row indices change when the UI layout changes (e.g. adding a
+    // sheet-tabs row pushed the formula bar down by 1). These helpers
+    // centralize the layout knowledge so tests don't break on cosmetic
+    // changes. The current layout is:
+    //   row 0  — header (filename, cell ref, mode chip)
+    //   row 1  — sheet tabs
+    //   row 2  — formula bar
+    //   row 3  — grid top border
+    //   row 4  — column-letter row (A B C ...)
+    //   row 5+ — data rows (5 = row 1, 6 = row 2, ...)
+
+    /// Returns the formula-bar row. Use for assertions like
+    /// `assert!(h.formula_bar().contains("=A1+B1"))`.
+    pub fn formula_bar(&self) -> String {
+        self.row(2)
+    }
+
+    /// Returns the rendered N-th data row (1-indexed, like a spreadsheet).
+    /// `data_row(1)` returns A1's row, etc.
+    pub fn data_row(&self, n: u16) -> String {
+        self.row(4 + n)
+    }
+
     /// Current cursor position as (row, col).
     pub fn cursor(&self) -> (u16, u16) {
         self.parser.lock().unwrap().screen().cursor_position()

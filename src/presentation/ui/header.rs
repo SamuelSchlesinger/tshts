@@ -92,3 +92,35 @@ pub(super) fn render_header(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(header, area);
 }
 
+
+pub(super) fn render_sheet_tabs(f: &mut Frame, app: &App, area: Rect) {
+    let titles: Vec<Line> = app
+        .workbook
+        .sheet_names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let is_active = i == app.workbook.active_sheet;
+            let prefix = Span::styled(" ", Style::default());
+            let label = if is_active {
+                Span::styled(
+                    name.to_string(),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::LightCyan)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::styled(name.to_string(), Style::default().fg(Color::Gray))
+            };
+            Line::from(vec![prefix, label, Span::raw(" ")])
+        })
+        .collect();
+
+    let tabs = Tabs::new(titles)
+        .select(app.workbook.active_sheet)
+        .divider(Span::styled("│", Style::default().fg(Color::DarkGray)))
+        .style(Style::default())
+        .highlight_style(Style::default());
+    f.render_widget(tabs, area);
+}

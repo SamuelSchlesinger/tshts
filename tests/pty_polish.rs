@@ -84,7 +84,7 @@ fn polish_very_long_formula_displays() {
     h.send_text("=1+2+3+4+5+6+7+8+9+10");
     h.send_enter();
     h.send_text("k");
-    let bar = h.row(1);
+    let bar = h.formula_bar();
     assert!(bar.contains("=1+2") || bar.contains("55"),
         "Formula bar should show formula or its value. Got: {:?}", bar);
     quit_force(&mut h);
@@ -135,9 +135,9 @@ fn polish_tab_at_last_column_stays_put() {
     let mut h = Harness::new();
     // Navigate to last column. cols default is 26.
     h.send_text("25l"); // go to last visible col (A=0..Z=25)
-    let before = h.row(1).to_string();
+    let before = h.formula_bar().to_string();
     h.send_tab();
-    let after = h.row(1).to_string();
+    let after = h.formula_bar().to_string();
     // Should be at Z or wrap; either way no crash.
     let _ = (before, after);
     quit_force(&mut h);
@@ -225,9 +225,9 @@ fn polish_zero_count_is_motion_not_count() {
     // In vim, leading `0` is a row-start motion, not a count zero.
     let mut h = Harness::new();
     h.send_text("3l"); // go to col 3
-    let before = h.row(1).to_string();
+    let before = h.formula_bar().to_string();
     h.send_text("0"); // back to col 0
-    let after = h.row(1).to_string();
+    let after = h.formula_bar().to_string();
     assert_ne!(before, after, "0 should move to col 0, not be a count");
     quit_force(&mut h);
 }

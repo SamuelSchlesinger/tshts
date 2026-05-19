@@ -70,7 +70,7 @@ fn spill_sort_ascending() {
     h.send_enter();
     // Walk B1:B3 — should be 1, 2, 3 in order.
     h.send_ctrl('g'); h.send_text("B1"); h.send_enter();
-    let bar = h.row(1);
+    let bar = h.formula_bar();
     assert!(bar.contains("1"), "B1 should be smallest. Got: {:?}", bar);
     quit_force(&mut h);
 }
