@@ -391,3 +391,323 @@ impl InputHandler {
     }
 
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::application::{App, AppMode, VimOperator, VisualKind};
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+
+    fn typestr(app: &mut App, s: &str) {
+        for c in s.chars() {
+            InputHandler::handle_key_event(app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+    }
+    fn key(app: &mut App, code: KeyCode) {
+        InputHandler::handle_key_event(app, code, KeyModifiers::NONE);
+    }
+    fn ctrl(app: &mut App, c: char) {
+        InputHandler::handle_key_event(app, KeyCode::Char(c), KeyModifiers::CONTROL);
+    }
+    fn set_text(app: &mut App, row: usize, col: usize, s: &str) {
+        app.workbook.current_sheet_mut().set_cell(row, col, crate::domain::CellData {
+            value: s.to_string(), formula: None, format: None, comment: None,
+            spill_anchor: None,
+        });
+    }
+    fn put(app: &mut App, row: usize, col: usize, s: &str) { set_text(app, row, col, s); }
+
+    fn make_dirty(app: &mut App) {
+        app.workbook.current_sheet_mut().set_cell(0, 0, crate::domain::CellData {
+            value: "x".to_string(), formula: None, format: None, comment: None,
+            spill_anchor: None,
+        });
+        app.dirty = true;
+    }
+    fn run_palette(app: &mut App, cmd: &str) {
+        app.start_command_palette();
+        typestr(app, cmd);
+        key(app, KeyCode::Enter);
+    }
+    fn unique_tmp(name: &str) -> String {
+        let mut p = std::env::temp_dir();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+        p.push(format!("tshts_quit_{}_{}_{}.tshts", std::process::id(), now, name));
+        p.to_string_lossy().to_string()
+    }
+
+
+    #[test]
+    fn test_import_csv_filename_input() {
+        let mut app = App::default();
+        app.start_csv_import();
+        
+        // Test typing a character
+        InputHandler::handle_key_event(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
+        assert_eq!(app.filename_input, "data.csvm");
+        
+        // Test backspace
+        InputHandler::handle_key_event(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(app.filename_input, "data.csv");
+        
+        // Test escape to cancel
+        InputHandler::handle_key_event(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(matches!(app.mode, AppMode::Normal));
+        assert!(app.filename_input.is_empty());
+    }
+
+    #[test]
+    fn test_command_palette_escape_cancels() {
+        let mut app = App::default();
+        app.start_command_palette();
+        InputHandler::handle_key_event(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+        InputHandler::handle_key_event(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+        assert!(matches!(app.mode, AppMode::Normal));
+        assert!(app.command_input.is_empty());
+    }
+
+    #[test]
+    fn agent_quit_q_clean_quits_immediately() {
+        let mut app = App::default();
+        typestr(&mut app, "q");
+        assert!(app.should_quit, "clean `q` must set should_quit");
+        assert!(!matches!(app.mode, AppMode::ConfirmDiscard));
+    }
+
+    #[test]
+    fn agent_quit_q_dirty_enters_confirm_discard() {
+        let mut app = App::default();
+        make_dirty(&mut app);
+        typestr(&mut app, "q");
+        assert!(matches!(app.mode, AppMode::ConfirmDiscard));
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn agent_quit_confirm_y_quits() {
+        let mut app = App::default();
+        make_dirty(&mut app);
+        typestr(&mut app, "q");
+        key(&mut app, KeyCode::Char('y'));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn agent_quit_confirm_n_cancels() {
+        let mut app = App::default();
+        make_dirty(&mut app);
+        typestr(&mut app, "q");
+        key(&mut app, KeyCode::Char('n'));
+        assert!(!app.should_quit);
+        assert!(matches!(app.mode, AppMode::Normal));
+        assert!(app.dirty, "n must not lose dirty");
+    }
+
+    #[test]
+    fn agent_quit_confirm_s_saves_and_quits() {
+        let mut app = App::default();
+        let path = unique_tmp("confirm_s");
+        app.filename = Some(path.clone());
+        make_dirty(&mut app);
+        typestr(&mut app, "q");
+        assert!(matches!(app.mode, AppMode::ConfirmDiscard));
+        key(&mut app, KeyCode::Char('s'));
+        assert!(!app.dirty, "after 's' the workbook must be saved (dirty=false)");
+        assert!(app.should_quit, "after 's' the deferred quit must fire");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn agent_quit_palette_q_clean_quits() {
+        let mut app = App::default();
+        run_palette(&mut app, "q");
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn agent_quit_palette_qbang_forces_quit() {
+        let mut app = App::default();
+        make_dirty(&mut app);
+        run_palette(&mut app, "q!");
+        assert!(app.should_quit);
+        assert!(!matches!(app.mode, AppMode::ConfirmDiscard));
+    }
+
+    #[test]
+    fn agent_quit_w_then_q_quits() {
+        let mut app = App::default();
+        let path = unique_tmp("w_then_q");
+        app.filename = Some(path.clone());
+        make_dirty(&mut app);
+        run_palette(&mut app, "w");
+        assert!(!app.dirty, ":w must clear dirty");
+        run_palette(&mut app, "q");
+        assert!(app.should_quit);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn agent_quit_w_no_filename_opens_saveas() {
+        let mut app = App::default();
+        assert!(app.filename.is_none());
+        make_dirty(&mut app);
+        run_palette(&mut app, "w");
+        assert!(matches!(app.mode, AppMode::SaveAs),
+            ":w with no filename should open SaveAs dialog; mode={:?}", app.mode);
+    }
+
+    #[test]
+    fn agent_quit_w_with_filename_saves_and_sets_filename() {
+        let mut app = App::default();
+        let path = unique_tmp("w_with_file");
+        make_dirty(&mut app);
+        run_palette(&mut app, &format!("w {}", path));
+        assert!(!app.dirty, ":w <file> must clear dirty");
+        assert_eq!(app.filename.as_deref(), Some(path.as_str()),
+            ":w <file> must update app.filename");
+        assert!(std::path::Path::new(&path).exists(), "file must be written");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn agent_quit_wq_no_filename_opens_saveas_no_quit() {
+        let mut app = App::default();
+        make_dirty(&mut app);
+        run_palette(&mut app, "wq");
+        // With no filename, save_in_place_or_prompt opens SaveAs; dirty stays true.
+        // The code path: save_in_place_or_prompt (no filename → SaveAs), then
+        // `if !self.dirty { should_quit = true }`. Since dirty is still true,
+        // we should NOT quit.
+        assert!(!app.should_quit, ":wq without filename should not silently quit");
+        assert!(matches!(app.mode, AppMode::SaveAs));
+    }
+
+    #[test]
+    fn agent_quit_wq_with_filename_saves_and_quits() {
+        let mut app = App::default();
+        let path = unique_tmp("wq");
+        app.filename = Some(path.clone());
+        make_dirty(&mut app);
+        run_palette(&mut app, "wq");
+        assert!(!app.dirty);
+        assert!(app.should_quit);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn agent_quit_wqbang_force_quits_even_when_save_deferred() {
+        let mut app = App::default();
+        make_dirty(&mut app);
+        // No filename — save_in_place_or_prompt opens SaveAs. Then `!` path force quits.
+        run_palette(&mut app, "wq!");
+        assert!(app.should_quit, ":wq! must force-quit");
+    }
+
+    #[test]
+    fn agent_quit_xbang_force_quits() {
+        let mut app = App::default();
+        make_dirty(&mut app);
+        run_palette(&mut app, "x!");
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn agent_quit_x_with_filename_saves_and_quits() {
+        let mut app = App::default();
+        let path = unique_tmp("x");
+        app.filename = Some(path.clone());
+        make_dirty(&mut app);
+        run_palette(&mut app, "x");
+        assert!(!app.dirty);
+        assert!(app.should_quit);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn agent_quit_e_no_arg_opens_loadfile() {
+        let mut app = App::default();
+        run_palette(&mut app, "e");
+        assert!(matches!(app.mode, AppMode::LoadFile),
+            ":e with no arg should open LoadFile; mode={:?}", app.mode);
+    }
+
+    #[test]
+    fn agent_quit_e_with_filename_loads_file() {
+        let mut app = App::default();
+        // First, write a file via :w <file>
+        let path = unique_tmp("e_load");
+        run_palette(&mut app, &format!("w {}", path));
+        assert!(std::path::Path::new(&path).exists());
+        // Now create a fresh app and :e it
+        let mut app2 = App::default();
+        run_palette(&mut app2, &format!("e {}", path));
+        assert_eq!(app2.filename.as_deref(), Some(path.as_str()),
+            ":e <file> should load and set filename");
+        assert!(!app2.dirty);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn agent_quit_e_with_filename_when_other_open() {
+        // Set up file A.
+        let mut app = App::default();
+        let path_a = unique_tmp("e_other_a");
+        let path_b = unique_tmp("e_other_b");
+        run_palette(&mut app, &format!("w {}", path_a));
+        // Write a different file B by mutating a cell, then :w <B>.
+        app.workbook.current_sheet_mut().set_cell(2, 2, crate::domain::CellData {
+            value: "B-marker".to_string(), formula: None, format: None, comment: None,
+            spill_anchor: None,
+        });
+        app.dirty = true;
+        run_palette(&mut app, &format!("w {}", path_b));
+        // Now app.filename is path_b; open path_a via :e
+        let mut app2 = App::default();
+        app2.filename = Some(path_b.clone());
+        // Load it so dirty=false and consistent
+        let _ = crate::infrastructure::FileRepository::save_workbook(&app2.workbook, &path_b);
+        assert!(!app2.dirty);
+        run_palette(&mut app2, &format!("e {}", path_a));
+        assert_eq!(app2.filename.as_deref(), Some(path_a.as_str()),
+            ":e <file> with another file open should load typed file, not currently-open one");
+        let _ = std::fs::remove_file(&path_a);
+        let _ = std::fs::remove_file(&path_b);
+    }
+
+    #[test]
+    fn agent_quit_palette_uppercase_q_works() {
+        let mut app = App::default();
+        run_palette(&mut app, "Q");
+        // execute_command lowercases — :Q should behave like :q.
+        assert!(app.should_quit, ":Q must work like :q (lowercased)");
+    }
+
+    #[test]
+    fn agent_quit_palette_uppercase_wq_works() {
+        let mut app = App::default();
+        let path = unique_tmp("wq_upper");
+        app.filename = Some(path.clone());
+        make_dirty(&mut app);
+        run_palette(&mut app, "WQ");
+        assert!(app.should_quit, ":WQ must work like :wq");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn agent_quit_palette_q_with_trailing_space() {
+        let mut app = App::default();
+        run_palette(&mut app, "q ");
+        assert!(app.should_quit, ":q with trailing space should trim and quit");
+    }
+
+    #[test]
+    fn agent_quit_palette_q_with_leading_space() {
+        let mut app = App::default();
+        run_palette(&mut app, " q");
+        assert!(app.should_quit, ":q with leading space should trim and quit");
+    }
+
+}
