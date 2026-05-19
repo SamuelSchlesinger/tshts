@@ -368,6 +368,7 @@ pub enum UnaryOp {
 // Submodules — separated by structural concern.
 mod lexer;
 mod registry;
+mod registry_fns; // category-split builtin function files
 mod parser_impl;
 mod evaluator;
 
@@ -474,7 +475,7 @@ pub fn criteria_matches(value: &Value, criteria: &str) -> bool {
 }
 
 /// Glob match supporting `*` (any) and `?` (one). Case-sensitive.
-fn glob_match(s: &str, pattern: &str) -> bool {
+pub(super) fn glob_match(s: &str, pattern: &str) -> bool {
     if !pattern.contains('*') && !pattern.contains('?') {
         return s == pattern;
     }
@@ -494,7 +495,7 @@ fn glob_match(s: &str, pattern: &str) -> bool {
 
 // Date serial helpers — Excel-style epoch 1899-12-30 = 0, modulo the famous
 // 1900-leap-year bug which we elide here (we treat days correctly).
-fn date_to_serial(year: i32, month: u32, day: u32) -> f64 {
+pub(super) fn date_to_serial(year: i32, month: u32, day: u32) -> f64 {
     // Excel-style rollover: normalize month into [1..=12] (carrying year),
     // then compute the serial for day=1 of that month and add (day - 1) so
     // out-of-range days roll into adjacent months. This makes
@@ -517,7 +518,7 @@ fn date_to_serial(year: i32, month: u32, day: u32) -> f64 {
     serial as f64
 }
 
-fn serial_to_date(serial: f64) -> (i32, u32, u32) {
+pub(super) fn serial_to_date(serial: f64) -> (i32, u32, u32) {
     let z = (serial as i64) - 25569 + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
     let doe = (z - era * 146097) as u64;
@@ -532,7 +533,7 @@ fn serial_to_date(serial: f64) -> (i32, u32, u32) {
 }
 
 /// Parse `YYYY-MM-DD` into (year, month, day).
-fn parse_iso_date(s: &str) -> Result<(i32, u32, u32), ()> {
+pub(super) fn parse_iso_date(s: &str) -> Result<(i32, u32, u32), ()> {
     let parts: Vec<&str> = s.split('-').collect();
     if parts.len() != 3 {
         return Err(());
@@ -544,7 +545,7 @@ fn parse_iso_date(s: &str) -> Result<(i32, u32, u32), ()> {
 }
 
 /// Add thousands-separator commas to an integer-string.
-fn add_commas(int_str: &str) -> String {
+pub(super) fn add_commas(int_str: &str) -> String {
     let mut out = String::with_capacity(int_str.len() + int_str.len() / 3);
     for (i, c) in int_str.chars().rev().enumerate() {
         if i > 0 && i % 3 == 0 {
@@ -555,7 +556,7 @@ fn add_commas(int_str: &str) -> String {
     out.chars().rev().collect()
 }
 
-fn days_in_month(year: i32, month: u32) -> u32 {
+pub(super) fn days_in_month(year: i32, month: u32) -> u32 {
     match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
@@ -568,7 +569,7 @@ fn days_in_month(year: i32, month: u32) -> u32 {
     }
 }
 
-fn today_serial() -> f64 {
+pub(super) fn today_serial() -> f64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -578,7 +579,7 @@ fn today_serial() -> f64 {
     25569.0 + days as f64
 }
 
-fn now_serial() -> f64 {
+pub(super) fn now_serial() -> f64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
