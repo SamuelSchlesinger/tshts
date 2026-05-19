@@ -44,3 +44,29 @@ impl CellData {
         self.spill_anchor.is_some()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{CellData};
+    #[test]
+    fn test_cell_data_default() {
+        let cell = CellData::default();
+        assert!(cell.value.is_empty());
+        assert!(cell.formula.is_none());
+    }
+
+    #[test]
+    fn test_cell_data_creation() {
+        let cell = CellData {
+            value: "42".to_string(),
+            formula: Some("=6*7".to_string()),
+            format: None,
+            comment: None,
+        spill_anchor: None,
+        };
+        assert_eq!(cell.value, "42");
+        assert_eq!(cell.formula.unwrap(), "=6*7");
+    }
+
+}

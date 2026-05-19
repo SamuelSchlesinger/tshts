@@ -151,3 +151,124 @@ pub(super) fn add_thousands_separator(s: &str) -> String {
         format!("{}{}", prefix, int_formatted)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{CellData};
+    #[test]
+    fn test_conditional_format_fires_on_truthy_predicate() {
+        let mut sheet = Spreadsheet::default();
+        sheet.set_cell(0, 0, CellData {
+            value: "150".to_string(), formula: None, format: None, comment: None,
+        spill_anchor: None,
+        });
+        sheet.set_cell(1, 0, CellData {
+            value: "50".to_string(), formula: None, format: None, comment: None,
+        spill_anchor: None,
+        });
+        sheet.conditional_formats.push(ConditionalFormat {
+            column: 0,
+            predicate: "_ > 100".to_string(),
+            style: CellStyle {
+                bold: true,
+                underline: false,
+                fg_color: Some(TerminalColor::Red),
+                bg_color: None,
+            },
+        });
+        let s0 = sheet.conditional_style_for(0, 0);
+        assert!(s0.is_some());
+        assert!(s0.as_ref().unwrap().bold);
+        assert_eq!(s0.unwrap().fg_color, Some(TerminalColor::Red));
+        // Row 1 doesn't satisfy the predicate.
+        assert!(sheet.conditional_style_for(1, 0).is_none());
+    }
+
+    #[test]
+    fn test_thousands_separator_edge_cases() {
+        let fmt = CellFormat {
+            number_format: NumberFormat::Number { decimals: 2, thousands_sep: true },
+            style: CellStyle::default(),
+        };
+        assert_eq!(format_cell_value("1234567.89", &fmt), "1,234,567.89");
+        assert_eq!(format_cell_value("-1234.5", &fmt), "-1,234.50");
+        assert_eq!(format_cell_value("999.99", &fmt), "999.99");
+        assert_eq!(format_cell_value("0", &fmt), "0.00");
+        assert_eq!(format_cell_value("-0.5", &fmt), "-0.50");
+
+        // Whole-million boundary
+        let fmt0 = CellFormat {
+            number_format: NumberFormat::Number { decimals: 0, thousands_sep: true },
+            style: CellStyle::default(),
+        };
+        assert_eq!(format_cell_value("1000000", &fmt0), "1,000,000");
+        assert_eq!(format_cell_value("-1000000", &fmt0), "-1,000,000");
+    }
+
+    #[test]
+    fn test_format_cell_value_general() {
+        let fmt = CellFormat { number_format: NumberFormat::General, ..CellFormat::default() };
+        assert_eq!(super::format_cell_value("42.5", &fmt), "42.5");
+        assert_eq!(super::format_cell_value("hello", &fmt), "hello");
+    }
+
+    #[test]
+    fn test_format_cell_value_number() {
+        let fmt = CellFormat { number_format: NumberFormat::Number { decimals: 2, thousands_sep: false }, ..CellFormat::default() };
+        assert_eq!(super::format_cell_value("42", &fmt), "42.00");
+        assert_eq!(super::format_cell_value("3.14159", &fmt), "3.14");
+        assert_eq!(super::format_cell_value("hello", &fmt), "hello"); // non-numeric passthrough
+    }
+
+    #[test]
+    fn test_format_cell_value_number_thousands() {
+        let fmt = CellFormat { number_format: NumberFormat::Number { decimals: 2, thousands_sep: true }, ..CellFormat::default() };
+        assert_eq!(super::format_cell_value("1234567.89", &fmt), "1,234,567.89");
+        assert_eq!(super::format_cell_value("42", &fmt), "42.00");
+    }
+
+    #[test]
+    fn test_format_cell_value_currency() {
+        let fmt = CellFormat { number_format: NumberFormat::Currency { symbol: "$".to_string(), decimals: 2 }, ..CellFormat::default() };
+        assert_eq!(super::format_cell_value("1234.5", &fmt), "$1,234.50");
+        assert_eq!(super::format_cell_value("42", &fmt), "$42.00");
+        assert_eq!(super::format_cell_value("hello", &fmt), "hello");
+    }
+
+    #[test]
+    fn test_format_cell_value_percentage() {
+        let fmt = CellFormat { number_format: NumberFormat::Percentage { decimals: 1 }, ..CellFormat::default() };
+        assert_eq!(super::format_cell_value("0.75", &fmt), "75.0%");
+        assert_eq!(super::format_cell_value("1", &fmt), "100.0%");
+        assert_eq!(super::format_cell_value("0.123", &fmt), "12.3%");
+    }
+
+    #[test]
+    fn test_thousands_separator() {
+        assert_eq!(super::style::add_thousands_separator("1234567"), "1,234,567");
+        assert_eq!(super::style::add_thousands_separator("123"), "123");
+        assert_eq!(super::style::add_thousands_separator("1234.56"), "1,234.56");
+        assert_eq!(super::style::add_thousands_separator("-1234567"), "-1,234,567");
+    }
+
+    #[test]
+    fn test_cell_data_format_serialization() {
+        let cell = CellData {
+            value: "100".to_string(),
+            formula: None,
+            format: Some(CellFormat {
+                number_format: NumberFormat::Percentage { decimals: 1 },
+                ..CellFormat::default()
+            }),
+            comment: None,
+        spill_anchor: None,
+        };
+        let json = serde_json::to_string(&cell).unwrap();
+        let deserialized: CellData = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.value, "100");
+        assert!(deserialized.format.is_some());
+        assert!(matches!(deserialized.format.unwrap().number_format, NumberFormat::Percentage { decimals: 1 }));
+    }
+
+}
