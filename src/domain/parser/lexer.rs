@@ -343,3 +343,95 @@ impl Lexer {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{Spreadsheet, CellData, FormulaEvaluator};
+    use crate::domain::parser::*;
+
+    #[test]
+    fn test_lexer_numbers() {
+        let mut lexer = Lexer::new("42 3.14 0.5");
+        
+        assert_eq!(lexer.next_token().unwrap(), Token::Number(42.0));
+        assert_eq!(lexer.next_token().unwrap(), Token::Number(3.14));
+        assert_eq!(lexer.next_token().unwrap(), Token::Number(0.5));
+        assert_eq!(lexer.next_token().unwrap(), Token::Eof);
+    }
+
+    #[test]
+    fn test_lexer_operators() {
+        let mut lexer = Lexer::new("+ - * / % ** ^ < <= > >= <> =");
+        
+        assert_eq!(lexer.next_token().unwrap(), Token::Plus);
+        assert_eq!(lexer.next_token().unwrap(), Token::Minus);
+        assert_eq!(lexer.next_token().unwrap(), Token::Multiply);
+        assert_eq!(lexer.next_token().unwrap(), Token::Divide);
+        assert_eq!(lexer.next_token().unwrap(), Token::Modulo);
+        assert_eq!(lexer.next_token().unwrap(), Token::Power);
+        assert_eq!(lexer.next_token().unwrap(), Token::PowerAlt);
+        assert_eq!(lexer.next_token().unwrap(), Token::Less);
+        assert_eq!(lexer.next_token().unwrap(), Token::LessEqual);
+        assert_eq!(lexer.next_token().unwrap(), Token::Greater);
+        assert_eq!(lexer.next_token().unwrap(), Token::GreaterEqual);
+        assert_eq!(lexer.next_token().unwrap(), Token::NotEqual);
+        assert_eq!(lexer.next_token().unwrap(), Token::Equal);
+        assert_eq!(lexer.next_token().unwrap(), Token::Eof);
+    }
+
+    #[test]
+    fn test_lexer_identifiers_and_keywords() {
+        let mut lexer = Lexer::new("SUM AVERAGE AND OR NOT A1 B2 AA123");
+        
+        assert_eq!(lexer.next_token().unwrap(), Token::Identifier("SUM".to_string()));
+        assert_eq!(lexer.next_token().unwrap(), Token::Identifier("AVERAGE".to_string()));
+        assert_eq!(lexer.next_token().unwrap(), Token::Identifier("AND".to_string()));
+        assert_eq!(lexer.next_token().unwrap(), Token::Identifier("OR".to_string()));
+        assert_eq!(lexer.next_token().unwrap(), Token::Identifier("NOT".to_string()));
+        assert_eq!(lexer.next_token().unwrap(), Token::CellRef("A1".to_string()));
+        assert_eq!(lexer.next_token().unwrap(), Token::CellRef("B2".to_string()));
+        assert_eq!(lexer.next_token().unwrap(), Token::CellRef("AA123".to_string()));
+        assert_eq!(lexer.next_token().unwrap(), Token::Eof);
+    }
+
+    #[test]
+    fn test_lexer_delimiters() {
+        let mut lexer = Lexer::new("( ) , :");
+        
+        assert_eq!(lexer.next_token().unwrap(), Token::LeftParen);
+        assert_eq!(lexer.next_token().unwrap(), Token::RightParen);
+        assert_eq!(lexer.next_token().unwrap(), Token::Comma);
+        assert_eq!(lexer.next_token().unwrap(), Token::Colon);
+        assert_eq!(lexer.next_token().unwrap(), Token::Eof);
+    }
+
+    #[test]
+    fn test_lexer_strings() {
+        let mut lexer = Lexer::new("\"Hello World\"");
+        assert_eq!(lexer.next_token().unwrap(), Token::String("Hello World".to_string()));
+        assert_eq!(lexer.next_token().unwrap(), Token::Eof);
+        
+        let mut lexer = Lexer::new("\"\"");
+        assert_eq!(lexer.next_token().unwrap(), Token::String("".to_string()));
+        assert_eq!(lexer.next_token().unwrap(), Token::Eof);
+        
+        let mut lexer = Lexer::new("\"Quote\"\"Test\"");
+        assert_eq!(lexer.next_token().unwrap(), Token::String("Quote\"Test".to_string()));
+        assert_eq!(lexer.next_token().unwrap(), Token::Eof);
+    }
+
+    #[test]
+    fn test_lexer_ampersand() {
+        let mut lexer = Lexer::new("&");
+        assert_eq!(lexer.next_token().unwrap(), Token::Ampersand);
+        assert_eq!(lexer.next_token().unwrap(), Token::Eof);
+    }
+
+    #[test]
+    fn test_lexer_error_handling() {
+        let mut lexer = Lexer::new("@#$");
+        assert!(lexer.next_token().is_err());
+    }
+
+}

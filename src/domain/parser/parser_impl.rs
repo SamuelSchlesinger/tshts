@@ -484,3 +484,489 @@ impl Parser {
         Ok(args)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{Spreadsheet, CellData, FormulaEvaluator};
+    use crate::domain::parser::*;
+
+    fn create_test_spreadsheet() -> Spreadsheet {
+        let mut sheet = Spreadsheet::default();
+        sheet.set_cell(0, 0, CellData { value: "10".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
+        sheet.set_cell(0, 1, CellData { value: "20".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
+        sheet.set_cell(0, 2, CellData { value: "30".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
+        sheet.set_cell(1, 0, CellData { value: "5".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
+        sheet.set_cell(1, 1, CellData { value: "15".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
+        sheet.set_cell(1, 2, CellData { value: "25".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
+        sheet
+    }
+
+
+    #[test]
+    fn test_parser_numbers() {
+        let mut parser = Parser::new("42").unwrap();
+        let expr = parser.parse().unwrap();
+        assert_eq!(expr, Expr::Number(42.0));
+        
+        let mut parser = Parser::new("3.14").unwrap();
+        let expr = parser.parse().unwrap();
+        assert_eq!(expr, Expr::Number(3.14));
+    }
+
+    #[test]
+    fn test_parser_cell_references() {
+        let mut parser = Parser::new("A1").unwrap();
+        let expr = parser.parse().unwrap();
+        assert_eq!(expr, Expr::CellRef("A1".to_string()));
+        
+        let mut parser = Parser::new("B2").unwrap();
+        let expr = parser.parse().unwrap();
+        assert_eq!(expr, Expr::CellRef("B2".to_string()));
+    }
+
+    #[test]
+    fn test_parser_ranges() {
+        let mut parser = Parser::new("A1:C3").unwrap();
+        let expr = parser.parse().unwrap();
+        assert_eq!(expr, Expr::Range("A1".to_string(), "C3".to_string()));
+    }
+
+    #[test]
+    fn test_parser_binary_operations() {
+        let mut parser = Parser::new("2 + 3").unwrap();
+        let expr = parser.parse().unwrap();
+        match expr {
+            Expr::Binary { left, operator, right } => {
+                assert!(matches!(left.as_ref(), &Expr::Number(2.0)));
+                assert_eq!(operator, BinaryOp::Add);
+                assert!(matches!(right.as_ref(), &Expr::Number(3.0)));
+            }
+            _ => panic!("Expected binary expression"),
+        }
+        
+        let mut parser = Parser::new("A1 * B1").unwrap();
+        let expr = parser.parse().unwrap();
+        match expr {
+            Expr::Binary { left, operator, right } => {
+                assert!(matches!(left.as_ref(), &Expr::CellRef(ref s) if s == "A1"));
+                assert_eq!(operator, BinaryOp::Multiply);
+                assert!(matches!(right.as_ref(), &Expr::CellRef(ref s) if s == "B1"));
+            }
+            _ => panic!("Expected binary expression"),
+        }
+    }
+
+    #[test]
+    fn test_parser_operator_precedence() {
+        // Test that 2 + 3 * 4 is parsed as 2 + (3 * 4)
+        let mut parser = Parser::new("2 + 3 * 4").unwrap();
+        let expr = parser.parse().unwrap();
+        match expr {
+            Expr::Binary { left, operator: BinaryOp::Add, right } => {
+                assert!(matches!(left.as_ref(), &Expr::Number(2.0)));
+                match right.as_ref() {
+                    Expr::Binary { left: mult_left, operator: BinaryOp::Multiply, right: mult_right } => {
+                        assert!(matches!(mult_left.as_ref(), &Expr::Number(3.0)));
+                        assert!(matches!(mult_right.as_ref(), &Expr::Number(4.0)));
+                    }
+                    _ => panic!("Expected multiplication as right operand"),
+                }
+            }
+            _ => panic!("Expected addition at top level"),
+        }
+    }
+
+    #[test]
+    fn test_parser_power_right_associative() {
+        // Test that 2 ** 3 ** 2 is parsed as 2 ** (3 ** 2)
+        let mut parser = Parser::new("2 ** 3 ** 2").unwrap();
+        let expr = parser.parse().unwrap();
+        match expr {
+            Expr::Binary { left, operator: BinaryOp::Power, right } => {
+                assert!(matches!(left.as_ref(), &Expr::Number(2.0)));
+                match right.as_ref() {
+                    Expr::Binary { left: pow_left, operator: BinaryOp::Power, right: pow_right } => {
+                        assert!(matches!(pow_left.as_ref(), &Expr::Number(3.0)));
+                        assert!(matches!(pow_right.as_ref(), &Expr::Number(2.0)));
+                    }
+                    _ => panic!("Expected power as right operand"),
+                }
+            }
+            _ => panic!("Expected power at top level"),
+        }
+    }
+
+    #[test]
+    fn test_parser_unary_operations() {
+        let mut parser = Parser::new("-5").unwrap();
+        let expr = parser.parse().unwrap();
+        match expr {
+            Expr::Unary { operator, operand } => {
+                assert_eq!(operator, UnaryOp::Minus);
+                assert!(matches!(operand.as_ref(), &Expr::Number(5.0)));
+            }
+            _ => panic!("Expected unary expression"),
+        }
+        
+        // NOT is now a function, not a unary operator
+        let mut parser = Parser::new("NOT(A1)").unwrap();
+        let expr = parser.parse().unwrap();
+        match expr {
+            Expr::FunctionCall { name, args } => {
+                assert_eq!(name, "NOT");
+                assert_eq!(args.len(), 1);
+                assert!(matches!(args[0], Expr::CellRef(ref s) if s == "A1"));
+            }
+            _ => panic!("Expected function call expression"),
+        }
+    }
+
+    #[test]
+    fn test_parser_parentheses() {
+        let mut parser = Parser::new("(2 + 3) * 4").unwrap();
+        let expr = parser.parse().unwrap();
+        match expr {
+            Expr::Binary { left, operator: BinaryOp::Multiply, right } => {
+                match left.as_ref() {
+                    Expr::Binary { left: add_left, operator: BinaryOp::Add, right: add_right } => {
+                        assert!(matches!(add_left.as_ref(), &Expr::Number(2.0)));
+                        assert!(matches!(add_right.as_ref(), &Expr::Number(3.0)));
+                    }
+                    _ => panic!("Expected addition in parentheses"),
+                }
+                assert!(matches!(right.as_ref(), &Expr::Number(4.0)));
+            }
+            _ => panic!("Expected multiplication at top level"),
+        }
+    }
+
+    #[test]
+    fn test_parser_function_calls() {
+        let mut parser = Parser::new("SUM(A1, B1, C1)").unwrap();
+        let expr = parser.parse().unwrap();
+        match expr {
+            Expr::FunctionCall { name, args } => {
+                assert_eq!(name, "SUM");
+                assert_eq!(args.len(), 3);
+                assert_eq!(args[0], Expr::CellRef("A1".to_string()));
+                assert_eq!(args[1], Expr::CellRef("B1".to_string()));
+                assert_eq!(args[2], Expr::CellRef("C1".to_string()));
+            }
+            _ => panic!("Expected function call"),
+        }
+        
+        let mut parser = Parser::new("SUM(A1:C1)").unwrap();
+        let expr = parser.parse().unwrap();
+        match expr {
+            Expr::FunctionCall { name, args } => {
+                assert_eq!(name, "SUM");
+                assert_eq!(args.len(), 1);
+                assert_eq!(args[0], Expr::Range("A1".to_string(), "C1".to_string()));
+            }
+            _ => panic!("Expected function call"),
+        }
+    }
+
+    #[test]
+    fn test_parser_comparison_operations() {
+        let mut parser = Parser::new("A1 > B1").unwrap();
+        let expr = parser.parse().unwrap();
+        match expr {
+            Expr::Binary { left, operator, right } => {
+                assert!(matches!(left.as_ref(), &Expr::CellRef(ref s) if s == "A1"));
+                assert_eq!(operator, BinaryOp::Greater);
+                assert!(matches!(right.as_ref(), &Expr::CellRef(ref s) if s == "B1"));
+            }
+            _ => panic!("Expected binary expression"),
+        }
+        
+        let mut parser = Parser::new("5 <= 10").unwrap();
+        let expr = parser.parse().unwrap();
+        match expr {
+            Expr::Binary { left, operator, right } => {
+                assert!(matches!(left.as_ref(), &Expr::Number(5.0)));
+                assert_eq!(operator, BinaryOp::LessEqual);
+                assert!(matches!(right.as_ref(), &Expr::Number(10.0)));
+            }
+            _ => panic!("Expected binary expression"),
+        }
+    }
+
+    #[test]
+    fn test_parser_logical_operations() {
+        // Logical operations are now functions, test AND function call
+        let mut parser = Parser::new("AND(A1 > 5, B1 < 10)").unwrap();
+        let expr = parser.parse().unwrap();
+        match expr {
+            Expr::FunctionCall { name, args } => {
+                assert_eq!(name, "AND");
+                assert_eq!(args.len(), 2);
+                
+                // First argument should be A1 > 5
+                match &args[0] {
+                    Expr::Binary { left: comp_left, operator: BinaryOp::Greater, right: comp_right } => {
+                        assert!(matches!(comp_left.as_ref(), &Expr::CellRef(ref s) if s == "A1"));
+                        assert!(matches!(comp_right.as_ref(), &Expr::Number(5.0)));
+                    }
+                    _ => panic!("Expected comparison in first argument"),
+                }
+                
+                // Second argument should be B1 < 10
+                match &args[1] {
+                    Expr::Binary { left: comp_left, operator: BinaryOp::Less, right: comp_right } => {
+                        assert!(matches!(comp_left.as_ref(), &Expr::CellRef(ref s) if s == "B1"));
+                        assert!(matches!(comp_right.as_ref(), &Expr::Number(10.0)));
+                    }
+                    _ => panic!("Expected comparison in second argument"),
+                }
+            }
+            _ => panic!("Expected function call"),
+        }
+    }
+
+    #[test]
+    fn test_parser_string_literals() {
+        let mut parser = Parser::new("\"Hello\"").unwrap();
+        let expr = parser.parse().unwrap();
+        assert_eq!(expr, Expr::String("Hello".to_string()));
+        
+        let mut parser = Parser::new("\"\"").unwrap();
+        let expr = parser.parse().unwrap();
+        assert_eq!(expr, Expr::String("".to_string()));
+    }
+
+    #[test]
+    fn test_parser_string_concatenation() {
+        let mut parser = Parser::new("\"Hello\" & \"World\"").unwrap();
+        let expr = parser.parse().unwrap();
+        match expr {
+            Expr::Binary { left, operator, right } => {
+                assert!(matches!(left.as_ref(), &Expr::String(ref s) if s == "Hello"));
+                assert_eq!(operator, BinaryOp::Concatenate);
+                assert!(matches!(right.as_ref(), &Expr::String(ref s) if s == "World"));
+            }
+            _ => panic!("Expected binary expression"),
+        }
+    }
+
+    #[test]
+    fn test_parser_mixed_concatenation() {
+        let mut parser = Parser::new("\"Number: \" & 42").unwrap();
+        let expr = parser.parse().unwrap();
+        match expr {
+            Expr::Binary { left, operator, right } => {
+                assert!(matches!(left.as_ref(), &Expr::String(ref s) if s == "Number: "));
+                assert_eq!(operator, BinaryOp::Concatenate);
+                assert!(matches!(right.as_ref(), &Expr::Number(42.0)));
+            }
+            _ => panic!("Expected binary expression"),
+        }
+    }
+
+    #[test]
+    fn test_parser_error_handling() {
+        // Test unexpected token
+        let result = Parser::new("2 +");
+        assert!(result.is_ok()); // Parser creation should succeed
+        let mut parser = result.unwrap();
+        assert!(parser.parse().is_err()); // But parsing should fail
+        
+        // Test mismatched parentheses
+        let mut parser = Parser::new("(2 + 3").unwrap();
+        assert!(parser.parse().is_err());
+        
+        // Test invalid function call
+        let mut parser = Parser::new("SUM(").unwrap();
+        assert!(parser.parse().is_err());
+        
+        // Test unterminated string
+        let result = Parser::new("\"Hello");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parser_complex_nested_functions() {
+        // Test parsing of deeply nested function calls
+        let mut parser = Parser::new("UPPER(CONCAT(\"Price: \", TRIM(GET(\"https://example.com\"))))").unwrap();
+        let expr = parser.parse().unwrap();
+        
+        // Verify the AST structure for nested functions
+        match expr {
+            Expr::FunctionCall { name, args } => {
+                assert_eq!(name, "UPPER");
+                assert_eq!(args.len(), 1);
+                
+                // Check that the inner argument is a CONCAT function
+                match &args[0] {
+                    Expr::FunctionCall { name: inner_name, args: inner_args } => {
+                        assert_eq!(inner_name, "CONCAT");
+                        assert_eq!(inner_args.len(), 2);
+                        
+                        // First arg should be string literal "Price: "
+                        assert!(matches!(inner_args[0], Expr::String(ref s) if s == "Price: "));
+                        
+                        // Second arg should be TRIM function
+                        match &inner_args[1] {
+                            Expr::FunctionCall { name: trim_name, args: trim_args } => {
+                                assert_eq!(trim_name, "TRIM");
+                                assert_eq!(trim_args.len(), 1);
+                                
+                                // TRIM's arg should be GET function
+                                match &trim_args[0] {
+                                    Expr::FunctionCall { name: get_name, args: get_args } => {
+                                        assert_eq!(get_name, "GET");
+                                        assert_eq!(get_args.len(), 1);
+                                        assert!(matches!(get_args[0], Expr::String(ref s) if s == "https://example.com"));
+                                    }
+                                    _ => panic!("Expected GET function call"),
+                                }
+                            }
+                            _ => panic!("Expected TRIM function call"),
+                        }
+                    }
+                    _ => panic!("Expected CONCAT function call"),
+                }
+            }
+            _ => panic!("Expected function call at top level"),
+        }
+    }
+
+    #[test]
+    fn test_parser_multiple_nested_levels() {
+        // Test 5-level nesting: IF(LEN(TRIM(GET(url))) > 5, LEFT(UPPER(GET(url)), 20), "Short")
+        let mut parser = Parser::new("IF(LEN(TRIM(GET(\"https://api.com\")))>5, LEFT(UPPER(GET(\"https://api.com\")), 20), \"Short\")").unwrap();
+        let expr = parser.parse().unwrap();
+        
+        // Verify this parses correctly as an IF function
+        match expr {
+            Expr::FunctionCall { name, args } => {
+                assert_eq!(name, "IF");
+                assert_eq!(args.len(), 3);
+                
+                // First argument should be a comparison (LEN(...) > 5)
+                match &args[0] {
+                    Expr::Binary { left, operator, right } => {
+                        assert_eq!(*operator, BinaryOp::Greater);
+                        assert!(matches!(right.as_ref(), &Expr::Number(5.0)));
+                        
+                        // Left side should be LEN(TRIM(GET(...)))
+                        match left.as_ref() {
+                            Expr::FunctionCall { name: len_name, args: len_args } => {
+                                assert_eq!(len_name, "LEN");
+                                assert_eq!(len_args.len(), 1);
+                                
+                                // LEN's arg should be TRIM(GET(...))
+                                match &len_args[0] {
+                                    Expr::FunctionCall { name: trim_name, args: trim_args } => {
+                                        assert_eq!(trim_name, "TRIM");
+                                        assert_eq!(trim_args.len(), 1);
+                                        
+                                        // TRIM's arg should be GET(...)
+                                        match &trim_args[0] {
+                                            Expr::FunctionCall { name: get_name, .. } => {
+                                                assert_eq!(get_name, "GET");
+                                            }
+                                            _ => panic!("Expected GET function"),
+                                        }
+                                    }
+                                    _ => panic!("Expected TRIM function"),
+                                }
+                            }
+                            _ => panic!("Expected LEN function"),
+                        }
+                    }
+                    _ => panic!("Expected comparison expression"),
+                }
+                
+                // Second argument should be LEFT(UPPER(GET(...)), 20)
+                match &args[1] {
+                    Expr::FunctionCall { name: left_name, args: left_args } => {
+                        assert_eq!(left_name, "LEFT");
+                        assert_eq!(left_args.len(), 2);
+                        
+                        // First arg should be UPPER(GET(...))
+                        match &left_args[0] {
+                            Expr::FunctionCall { name: upper_name, args: upper_args } => {
+                                assert_eq!(upper_name, "UPPER");
+                                assert_eq!(upper_args.len(), 1);
+                                
+                                // UPPER's arg should be GET(...)
+                                match &upper_args[0] {
+                                    Expr::FunctionCall { name: get_name, .. } => {
+                                        assert_eq!(get_name, "GET");
+                                    }
+                                    _ => panic!("Expected GET function"),
+                                }
+                            }
+                            _ => panic!("Expected UPPER function"),
+                        }
+                        
+                        // Second arg should be number 20
+                        assert!(matches!(left_args[1], Expr::Number(20.0)));
+                    }
+                    _ => panic!("Expected LEFT function"),
+                }
+                
+                // Third argument should be string "Short"
+                assert!(matches!(args[2], Expr::String(ref s) if s == "Short"));
+            }
+            _ => panic!("Expected IF function call"),
+        }
+    }
+
+    #[test]
+    fn test_parser_mixed_operators_and_functions() {
+        // Test expression mixing operators and functions: GET(A1) & " - " & UPPER(GET(B1))
+        let mut parser = Parser::new("GET(A1) & \" - \" & UPPER(GET(B1))").unwrap();
+        let expr = parser.parse().unwrap();
+        
+        // Should parse as nested concatenation operations
+        match expr {
+            Expr::Binary { left, operator: op1, right } => {
+                assert_eq!(op1, BinaryOp::Concatenate);
+                
+                // Left side should be another concatenation: GET(A1) & " - "
+                match left.as_ref() {
+                    Expr::Binary { left: inner_left, operator: op2, right: inner_right } => {
+                        assert_eq!(*op2, BinaryOp::Concatenate);
+                        
+                        // Inner left should be GET(A1)
+                        match inner_left.as_ref() {
+                            Expr::FunctionCall { name, args } => {
+                                assert_eq!(name, "GET");
+                                assert_eq!(args.len(), 1);
+                                assert!(matches!(args[0], Expr::CellRef(ref s) if s == "A1"));
+                            }
+                            _ => panic!("Expected GET function call"),
+                        }
+                        
+                        // Inner right should be " - "
+                        assert!(matches!(inner_right.as_ref(), &Expr::String(ref s) if s == " - "));
+                    }
+                    _ => panic!("Expected concatenation expression"),
+                }
+                
+                // Right side should be UPPER(GET(B1))
+                match right.as_ref() {
+                    Expr::FunctionCall { name: upper_name, args: upper_args } => {
+                        assert_eq!(upper_name, "UPPER");
+                        assert_eq!(upper_args.len(), 1);
+                        
+                        match &upper_args[0] {
+                            Expr::FunctionCall { name: get_name, args: get_args } => {
+                                assert_eq!(get_name, "GET");
+                                assert_eq!(get_args.len(), 1);
+                                assert!(matches!(get_args[0], Expr::CellRef(ref s) if s == "B1"));
+                            }
+                            _ => panic!("Expected GET function call"),
+                        }
+                    }
+                    _ => panic!("Expected UPPER function call"),
+                }
+            }
+            _ => panic!("Expected concatenation expression at top level"),
+        }
+    }
+
+}

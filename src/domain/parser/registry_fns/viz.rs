@@ -30,3 +30,68 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
             Ok(Value::String(sparkline))
         });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{Spreadsheet, CellData, FormulaEvaluator};
+    use crate::domain::parser::{Parser, ExpressionEvaluator};
+
+    #[test]
+    fn test_sparkline_basic() {
+        let mut sheet = Spreadsheet::default();
+        sheet.set_cell(0, 0, CellData { value: "1".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
+        sheet.set_cell(0, 1, CellData { value: "5".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
+        sheet.set_cell(0, 2, CellData { value: "10".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
+
+        let registry = FunctionRegistry::new();
+        let evaluator = ExpressionEvaluator::new(&sheet, &registry);
+        let expr = Parser::new("SPARKLINE(A1:C1)").unwrap().parse().unwrap();
+        let result = evaluator.evaluate(&expr);
+        assert!(result.is_ok());
+        match result.unwrap() {
+            Value::String(val) => assert_eq!(val.chars().count(), 3),
+            _ => panic!("Expected string from SPARKLINE"),
+        }
+    }
+
+    #[test]
+    fn test_sparkline_all_equal() {
+        let mut sheet = Spreadsheet::default();
+        sheet.set_cell(0, 0, CellData { value: "5".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
+        sheet.set_cell(0, 1, CellData { value: "5".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
+        sheet.set_cell(0, 2, CellData { value: "5".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
+
+        let registry = FunctionRegistry::new();
+        let evaluator = ExpressionEvaluator::new(&sheet, &registry);
+        let expr = Parser::new("SPARKLINE(A1:C1)").unwrap().parse().unwrap();
+        let result = evaluator.evaluate(&expr);
+        assert!(result.is_ok());
+        match result.unwrap() {
+            Value::String(val) => {
+                assert_eq!(val.chars().count(), 3);
+                let chars: Vec<char> = val.chars().collect();
+                assert_eq!(chars[0], chars[1]);
+                assert_eq!(chars[1], chars[2]);
+            }
+            _ => panic!("Expected string from SPARKLINE"),
+        }
+    }
+
+    #[test]
+    fn test_sparkline_single_value() {
+        let mut sheet = Spreadsheet::default();
+        sheet.set_cell(0, 0, CellData { value: "7".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
+
+        let registry = FunctionRegistry::new();
+        let evaluator = ExpressionEvaluator::new(&sheet, &registry);
+        let expr = Parser::new("SPARKLINE(A1)").unwrap().parse().unwrap();
+        let result = evaluator.evaluate(&expr);
+        assert!(result.is_ok());
+        match result.unwrap() {
+            Value::String(val) => assert_eq!(val.chars().count(), 1),
+            _ => panic!("Expected string from SPARKLINE"),
+        }
+    }
+
+}
