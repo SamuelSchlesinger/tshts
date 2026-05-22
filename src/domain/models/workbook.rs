@@ -369,6 +369,16 @@ impl Workbook {
         existed
     }
 
+    /// Run register_cross_sheet_deps + propagate_cross_sheet_changes for a
+     /// single cell on the active sheet. Use from mutation paths that bypass
+    /// `write_cells_on_active` / `clear_cells_on_active` (e.g. undo/redo
+    /// apply that restores via `set_cell` directly).
+    pub fn propagate_active_cell(&mut self, row: usize, col: usize) {
+        let sheet_name = self.sheet_names[self.active_sheet].clone();
+        self.register_cross_sheet_deps(&sheet_name, row, col);
+        self.propagate_cross_sheet_changes(&sheet_name, row, col);
+    }
+
     /// Write a batch of cells to the active sheet, then propagate.
     ///
     /// Replaces the previous "call set_many then loop calling

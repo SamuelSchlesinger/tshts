@@ -131,6 +131,11 @@ pub enum VimOperator {
 }
 
 /// Represents an action that can be undone/redone.
+///
+/// Each variant co-locates its data with its `apply` / `revert` logic via
+/// the impl block below — adding a new mutation type means adding a variant
+/// AND its two methods in one place, rather than touching three sites
+/// (variant + apply_undo arm + apply_redo arm in App).
 #[derive(Debug, Clone)]
 pub enum UndoAction {
     /// Cell was modified (row, col, old_value, new_value)
@@ -157,6 +162,81 @@ pub enum UndoAction {
         sheet_idx: usize,
         at: usize,
     },
+}
+
+impl UndoAction {
+    /// Roll the workbook back to the state before this action was applied.
+    /// Used by `App::undo`.
+    pub fn revert(&self, workbook: &mut Workbook) {
+        match self {
+            UndoAction::CellModified { row, col, old_cell, new_cell: _ } => {
+                restore_cell(workbook, *row, *col, old_cell.as_ref());
+            }
+            UndoAction::Batch(actions) => {
+                for a in actions.iter().rev() {
+                    a.revert(workbook);
+                }
+            }
+            UndoAction::ConditionalFormatsReplaced { sheet_idx, old, new: _ } => {
+                restore_cf(workbook, *sheet_idx, old);
+            }
+            UndoAction::RowInserted { sheet_idx, at } => {
+                if *sheet_idx < workbook.sheets.len() {
+                    with_active_sheet(workbook, *sheet_idx, |wb| wb.delete_row_on_active(*at));
+                }
+            }
+        }
+    }
+
+    /// Re-apply this action to the workbook. Used by `App::redo`.
+    pub fn apply(&self, workbook: &mut Workbook) {
+        match self {
+            UndoAction::CellModified { row, col, old_cell: _, new_cell } => {
+                restore_cell(workbook, *row, *col, new_cell.as_ref());
+            }
+            UndoAction::Batch(actions) => {
+                for a in actions {
+                    a.apply(workbook);
+                }
+            }
+            UndoAction::ConditionalFormatsReplaced { sheet_idx, old: _, new } => {
+                restore_cf(workbook, *sheet_idx, new);
+            }
+            UndoAction::RowInserted { sheet_idx, at } => {
+                if *sheet_idx < workbook.sheets.len() {
+                    with_active_sheet(workbook, *sheet_idx, |wb| wb.insert_row_on_active(*at));
+                }
+            }
+        }
+    }
+}
+
+/// Restore `(row, col)` to `data` (or clear if `None`), then propagate.
+/// Shared by `apply` and `revert` for `CellModified`.
+fn restore_cell(workbook: &mut Workbook, row: usize, col: usize, data: Option<&CellData>) {
+    match data {
+        Some(d) => workbook.current_sheet_mut().set_cell(row, col, d.clone()),
+        None => workbook.current_sheet_mut().clear_cell(row, col),
+    }
+    workbook.propagate_active_cell(row, col);
+}
+
+fn restore_cf(workbook: &mut Workbook, sheet_idx: usize, rules: &[crate::domain::ConditionalFormat]) {
+    if let Some(sheet) = workbook.sheets.get_mut(sheet_idx) {
+        sheet.conditional_formats = rules.to_vec();
+        sheet.cf_cache.borrow_mut().clear();
+    }
+}
+
+/// Run `f` with `sheet_idx` as the active sheet, restoring the prior active
+/// sheet afterward. Lets undo/redo operations that take an explicit
+/// sheet_idx reuse the workbook's `*_on_active` family without a permanent
+/// active-sheet switch surfacing to the UI.
+fn with_active_sheet<F: FnOnce(&mut Workbook)>(workbook: &mut Workbook, sheet_idx: usize, f: F) {
+    let prior = workbook.active_sheet;
+    workbook.active_sheet = sheet_idx;
+    f(workbook);
+    workbook.active_sheet = prior;
 }
 
 /// Data stored in the internal clipboard for copy/paste operations.
@@ -465,94 +545,24 @@ impl App {
 
     pub fn undo(&mut self) {
         if let Some(action) = self.undo_stack.pop_back() {
-            self.apply_undo(&action);
+            action.revert(&mut self.workbook);
             self.redo_stack.push_back(action);
             self.dirty = true;
         }
     }
 
-    /// Run register_cross_sheet_deps + propagate_cross_sheet_changes for
-    /// `(row, col)` on the active sheet. Use this from any mutation path
-    /// that writes/clears a cell without going through set_cell_with_undo /
-    /// clear_cell_with_undo, so cross-sheet dependents stay coherent.
+    /// Cross-sheet propagation hook for cell mutations that don't go through
+    /// `Workbook::write_cells_on_active`. Forwards to the workbook, which
+    /// owns the actual dep registration + propagation logic.
     pub(crate) fn propagate_cell_change(&mut self, row: usize, col: usize) {
-        let sheet_name = self.workbook.sheet_names[self.workbook.active_sheet].clone();
-        self.workbook.register_cross_sheet_deps(&sheet_name, row, col);
-        self.workbook.propagate_cross_sheet_changes(&sheet_name, row, col);
-    }
-
-    fn apply_undo(&mut self, action: &UndoAction) {
-        match action {
-            UndoAction::CellModified { row, col, old_cell, new_cell: _ } => {
-                if let Some(old_data) = old_cell {
-                    self.workbook.current_sheet_mut().set_cell(*row, *col, old_data.clone());
-                } else {
-                    self.workbook.current_sheet_mut().clear_cell(*row, *col);
-                }
-                // Cross-sheet listeners need to recalc against the restored
-                // value just as they would for a forward write.
-                self.propagate_cell_change(*row, *col);
-            }
-            UndoAction::Batch(actions) => {
-                // Undo in reverse order
-                for a in actions.iter().rev() {
-                    self.apply_undo(a);
-                }
-            }
-            UndoAction::ConditionalFormatsReplaced { sheet_idx, old, new: _ } => {
-                if let Some(sheet) = self.workbook.sheets.get_mut(*sheet_idx) {
-                    sheet.conditional_formats = old.clone();
-                    sheet.cf_cache.borrow_mut().clear();
-                }
-            }
-            UndoAction::RowInserted { sheet_idx, at } => {
-                if *sheet_idx < self.workbook.sheets.len() {
-                    let prior_active = self.workbook.active_sheet;
-                    self.workbook.active_sheet = *sheet_idx;
-                    self.workbook.delete_row_on_active(*at);
-                    self.workbook.active_sheet = prior_active;
-                }
-            }
-        }
+        self.workbook.propagate_active_cell(row, col);
     }
 
     pub fn redo(&mut self) {
         if let Some(action) = self.redo_stack.pop_back() {
-            self.apply_redo(&action);
+            action.apply(&mut self.workbook);
             self.undo_stack.push_back(action);
             self.dirty = true;
-        }
-    }
-
-    fn apply_redo(&mut self, action: &UndoAction) {
-        match action {
-            UndoAction::CellModified { row, col, old_cell: _, new_cell } => {
-                if let Some(new_data) = new_cell {
-                    self.workbook.current_sheet_mut().set_cell(*row, *col, new_data.clone());
-                } else {
-                    self.workbook.current_sheet_mut().clear_cell(*row, *col);
-                }
-                self.propagate_cell_change(*row, *col);
-            }
-            UndoAction::Batch(actions) => {
-                for a in actions {
-                    self.apply_redo(a);
-                }
-            }
-            UndoAction::ConditionalFormatsReplaced { sheet_idx, old: _, new } => {
-                if let Some(sheet) = self.workbook.sheets.get_mut(*sheet_idx) {
-                    sheet.conditional_formats = new.clone();
-                    sheet.cf_cache.borrow_mut().clear();
-                }
-            }
-            UndoAction::RowInserted { sheet_idx, at } => {
-                if *sheet_idx < self.workbook.sheets.len() {
-                    let prior_active = self.workbook.active_sheet;
-                    self.workbook.active_sheet = *sheet_idx;
-                    self.workbook.insert_row_on_active(*at);
-                    self.workbook.active_sheet = prior_active;
-                }
-            }
         }
     }
 
