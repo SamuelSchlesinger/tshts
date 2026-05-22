@@ -1090,13 +1090,14 @@ mod tests {
         // Test basic functions first
         assert_eq!(evaluator.evaluate_formula("=SUM(1,2)"), "3"); // Simple sum
         
-        // Test logical functions (these are built-in functions in the registry)
-        assert_eq!(evaluator.evaluate_formula("=AND(1,1)"), "1"); // Both true  
-        assert_eq!(evaluator.evaluate_formula("=AND(1,0)"), "0"); // One false
-        assert_eq!(evaluator.evaluate_formula("=OR(0,1)"), "1"); // One true
-        assert_eq!(evaluator.evaluate_formula("=OR(0,0)"), "0"); // Both false
-        assert_eq!(evaluator.evaluate_formula("=NOT(0)"), "1"); // Not false
-        assert_eq!(evaluator.evaluate_formula("=NOT(1)"), "0"); // Not true
+        // Test logical functions (these are built-in functions in the registry).
+        // AND/OR return Value::Bool → "TRUE"/"FALSE"; NOT returns Value::Number.
+        assert_eq!(evaluator.evaluate_formula("=AND(1,1)"), "TRUE");
+        assert_eq!(evaluator.evaluate_formula("=AND(1,0)"), "FALSE");
+        assert_eq!(evaluator.evaluate_formula("=OR(0,1)"), "TRUE");
+        assert_eq!(evaluator.evaluate_formula("=OR(0,0)"), "FALSE");
+        assert_eq!(evaluator.evaluate_formula("=NOT(0)"), "1");
+        assert_eq!(evaluator.evaluate_formula("=NOT(1)"), "0");
         
         // All logical operations are now functions
         // (No need for separate binary operator tests since they're all functions now)
@@ -1813,7 +1814,7 @@ mod tests {
     fn test_regex_functions() {
         let sheet = Spreadsheet::default();
         let evaluator = FormulaEvaluator::new(&sheet);
-        assert_eq!(evaluator.evaluate_formula("=REGEXMATCH(\"abc123\", \"^[a-z]+[0-9]+$\")"), "1");
+        assert_eq!(evaluator.evaluate_formula("=REGEXMATCH(\"abc123\", \"^[a-z]+[0-9]+$\")"), "TRUE");
         assert_eq!(evaluator.evaluate_formula("=REGEXEXTRACT(\"price=$42.50\", \"\\$([0-9.]+)\")"), "42.50");
         assert_eq!(
             evaluator.evaluate_formula("=REGEXREPLACE(\"hello world\", \"\\s+\", \"_\")"),
@@ -1852,8 +1853,8 @@ mod tests {
         assert_eq!(evaluator.evaluate_formula("=IFS(0, \"a\", 1, \"b\", 1, \"c\")"), "b");
         assert_eq!(evaluator.evaluate_formula("=SWITCH(2, 1, \"one\", 2, \"two\", \"other\")"), "two");
         assert_eq!(evaluator.evaluate_formula("=SWITCH(99, 1, \"one\", 2, \"two\", \"other\")"), "other");
-        assert_eq!(evaluator.evaluate_formula("=XOR(1, 0, 0)"), "1");
-        assert_eq!(evaluator.evaluate_formula("=XOR(1, 1, 0)"), "0");
+        assert_eq!(evaluator.evaluate_formula("=XOR(1, 0, 0)"), "TRUE");
+        assert_eq!(evaluator.evaluate_formula("=XOR(1, 1, 0)"), "FALSE");
     }
 
     #[test]
@@ -1866,15 +1867,15 @@ mod tests {
         // IFERROR traps it.
         assert_eq!(evaluator.evaluate_formula("=IFERROR(1/0, 99)"), "99");
         // ISERROR detects it.
-        assert_eq!(evaluator.evaluate_formula("=ISERROR(1/0)"), "1");
-        assert_eq!(evaluator.evaluate_formula("=ISERROR(5)"), "0");
+        assert_eq!(evaluator.evaluate_formula("=ISERROR(1/0)"), "TRUE");
+        assert_eq!(evaluator.evaluate_formula("=ISERROR(5)"), "FALSE");
         // NA() yields #N/A; IFNA traps it.
         assert_eq!(evaluator.evaluate_formula("=NA()"), "#N/A");
         assert_eq!(evaluator.evaluate_formula("=IFNA(NA(), \"missing\")"), "missing");
-        assert_eq!(evaluator.evaluate_formula("=ISNA(NA())"), "1");
+        assert_eq!(evaluator.evaluate_formula("=ISNA(NA())"), "TRUE");
         // ISERR excludes #N/A.
-        assert_eq!(evaluator.evaluate_formula("=ISERR(NA())"), "0");
-        assert_eq!(evaluator.evaluate_formula("=ISERR(1/0)"), "1");
+        assert_eq!(evaluator.evaluate_formula("=ISERR(NA())"), "FALSE");
+        assert_eq!(evaluator.evaluate_formula("=ISERR(1/0)"), "TRUE");
     }
 
     #[test]
@@ -2030,10 +2031,11 @@ mod tests {
     fn test_true_false_literals() {
         let sheet = Spreadsheet::default();
         let evaluator = FormulaEvaluator::new(&sheet);
-        assert_eq!(evaluator.evaluate_formula("=TRUE()"), "1");
-        assert_eq!(evaluator.evaluate_formula("=FALSE()"), "0");
-        assert_eq!(evaluator.evaluate_formula("=AND(TRUE(), TRUE())"), "1");
-        assert_eq!(evaluator.evaluate_formula("=AND(TRUE(), FALSE())"), "0");
+        // Bool → "TRUE"/"FALSE" string (matches Excel).
+        assert_eq!(evaluator.evaluate_formula("=TRUE()"), "TRUE");
+        assert_eq!(evaluator.evaluate_formula("=FALSE()"), "FALSE");
+        assert_eq!(evaluator.evaluate_formula("=AND(TRUE(), TRUE())"), "TRUE");
+        assert_eq!(evaluator.evaluate_formula("=AND(TRUE(), FALSE())"), "FALSE");
     }
 
     #[test]

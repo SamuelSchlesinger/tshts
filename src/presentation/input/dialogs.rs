@@ -273,10 +273,14 @@ impl InputHandler {
                 if app.find_replace_on_replace {
                     app.replace_current();
                 } else {
-                    // Perform search, then switch to replace field
                     app.find_replace_search();
-                    app.find_replace_on_replace = true;
-                    app.cursor_position = app.find_replace_replace.chars().count();
+                    // Only auto-advance focus to the Replace field if the
+                    // search actually produced results. With 0 results,
+                    // jumping focus forces the user to Tab back to fix typos.
+                    if !app.find_replace_results.is_empty() {
+                        app.find_replace_on_replace = true;
+                        app.cursor_position = app.find_replace_replace.chars().count();
+                    }
                 }
             }
             KeyCode::Esc => {

@@ -142,6 +142,21 @@ pub enum UndoAction {
     },
     /// Multiple actions that should be undone/redone atomically
     Batch(Vec<UndoAction>),
+    /// Sheet-level conditional-format list replaced (sheet_idx, old, new).
+    /// Lets `:cf <col> ...` and `:cf clear` participate in undo/redo.
+    ConditionalFormatsReplaced {
+        sheet_idx: usize,
+        old: Vec<crate::domain::ConditionalFormat>,
+        new: Vec<crate::domain::ConditionalFormat>,
+    },
+    /// Row was inserted at `at` on `sheet_idx`. Undo = delete the row.
+    /// Used by vim `o`/`O` so an unwanted opened row can be rolled back. We
+    /// don't carry cell data because the row is always inserted empty —
+    /// any content typed in after gets its own CellModified entry.
+    RowInserted {
+        sheet_idx: usize,
+        at: usize,
+    },
 }
 
 /// Data stored in the internal clipboard for copy/paste operations.
@@ -306,6 +321,7 @@ pub enum PendingAction {
 #[derive(Debug, Clone, Copy)]
 enum EditExitDir {
     Down,
+    Up,
     Right,
 }
 
@@ -401,6 +417,9 @@ impl App {
         self.search_result_index = 0;
         self.status_message = None;
         self.chart_popup = None;
+        // Vim pending operator/count/awaiting-g would otherwise leak across
+        // Esc and cause the next motion key to act as `<op><motion>`.
+        self.vim_reset_pending();
         if self.filter_column.is_some() || !self.hidden_rows.is_empty() {
             self.clear_filter();
         }
@@ -480,6 +499,20 @@ impl App {
                     self.apply_undo(a);
                 }
             }
+            UndoAction::ConditionalFormatsReplaced { sheet_idx, old, new: _ } => {
+                if let Some(sheet) = self.workbook.sheets.get_mut(*sheet_idx) {
+                    sheet.conditional_formats = old.clone();
+                    sheet.cf_cache.borrow_mut().clear();
+                }
+            }
+            UndoAction::RowInserted { sheet_idx, at } => {
+                if *sheet_idx < self.workbook.sheets.len() {
+                    let prior_active = self.workbook.active_sheet;
+                    self.workbook.active_sheet = *sheet_idx;
+                    self.workbook.delete_row_on_active(*at);
+                    self.workbook.active_sheet = prior_active;
+                }
+            }
         }
     }
 
@@ -504,6 +537,20 @@ impl App {
             UndoAction::Batch(actions) => {
                 for a in actions {
                     self.apply_redo(a);
+                }
+            }
+            UndoAction::ConditionalFormatsReplaced { sheet_idx, old: _, new } => {
+                if let Some(sheet) = self.workbook.sheets.get_mut(*sheet_idx) {
+                    sheet.conditional_formats = new.clone();
+                    sheet.cf_cache.borrow_mut().clear();
+                }
+            }
+            UndoAction::RowInserted { sheet_idx, at } => {
+                if *sheet_idx < self.workbook.sheets.len() {
+                    let prior_active = self.workbook.active_sheet;
+                    self.workbook.active_sheet = *sheet_idx;
+                    self.workbook.insert_row_on_active(*at);
+                    self.workbook.active_sheet = prior_active;
                 }
             }
         }

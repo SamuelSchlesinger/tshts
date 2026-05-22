@@ -66,21 +66,6 @@ impl<'a> ExpressionEvaluator<'a> {
         None
     }
 
-    /// Resolve a possibly sheet-qualified cell ref to the addressed sheet.
-    /// Returns the "current" sheet for unqualified refs. Currently used only
-    /// for cross-sheet INDIRECT/OFFSET work; kept here for symmetry.
-    #[allow(dead_code)]
-    fn sheet_for_ref(&self, cell_ref: &str) -> &Spreadsheet {
-        if let (Some(wb), Some((Some(sheet_name), _, _, _, _))) = (
-            self.workbook,
-            crate::domain::models::Spreadsheet::parse_qualified_reference(cell_ref),
-        )
-            && let Some(idx) = wb.sheet_names.iter().position(|n| n == &sheet_name) {
-                return &wb.sheets[idx];
-            }
-        self.spreadsheet
-    }
-
     /// Look up a name and parse its value into an `Expr`. The value may be
     /// a single cell ref or a range like `A1:B10`.
     fn resolve_name(&self, name: &str) -> Result<Expr, String> {
@@ -490,7 +475,8 @@ impl<'a> ExpressionEvaluator<'a> {
     }
 
     /// INDIRECT(ref_text) → value at the cell whose A1-style address is `ref_text`.
-    /// Errors if the string can't be parsed as a cell reference.
+    /// Errors if the string can't be parsed as a cell reference. Supports
+    /// sheet-qualified addresses (`"Sheet2!A1"`) when a workbook is in scope.
     fn eval_indirect(&self, args: &[Expr]) -> Result<Value, String> {
         if args.len() != 1 {
             return Err("INDIRECT requires exactly 1 argument".to_string());
@@ -506,14 +492,29 @@ impl<'a> ExpressionEvaluator<'a> {
             let values = self.evaluate_function_args(&[range_expr])?;
             return Ok(values.into_iter().next().unwrap_or(Value::String(String::new())));
         }
-        let (row, col) = Spreadsheet::parse_cell_reference(&ref_text)
+        // Qualified `Sheet!A1` resolves through the workbook; unqualified
+        // refs read the current sheet. Match Expr::CellRef semantics.
+        let parsed = Spreadsheet::parse_qualified_reference(&ref_text)
             .ok_or_else(|| format!("INDIRECT: invalid reference: {}", ref_text))?;
-        let cell = self.spreadsheet.get_cell(row, col);
+        let (sheet_opt, row, col, _, _) = parsed;
+        let sheet = self.resolve_sheet(sheet_opt.as_deref())
+            .ok_or_else(|| format!("INDIRECT: unknown sheet in {}", ref_text))?;
+        let cell = sheet.get_cell(row, col);
         if let Ok(n) = cell.value.parse::<f64>() {
             Ok(Value::Number(n))
         } else {
             Ok(Value::String(cell.value))
         }
+    }
+
+    /// Map an optional sheet name (case-insensitive) to a `&Spreadsheet`.
+    /// Returns the current sheet for `None`. Returns `None` only if the name
+    /// is unknown in the workbook.
+    fn resolve_sheet(&self, sheet_name: Option<&str>) -> Option<&Spreadsheet> {
+        let Some(name) = sheet_name else { return Some(self.spreadsheet); };
+        let wb = self.workbook?;
+        let idx = wb.sheet_names.iter().position(|n| n.eq_ignore_ascii_case(name))?;
+        Some(&wb.sheets[idx])
     }
 
     /// OFFSET(base, rows, cols, [height], [width]) → value or range starting
@@ -523,22 +524,27 @@ impl<'a> ExpressionEvaluator<'a> {
         if args.len() < 3 || args.len() > 5 {
             return Err("OFFSET requires 3-5 arguments".to_string());
         }
-        // Base must be a CellRef (extract row/col without evaluating).
-        let (base_row, base_col) = match &args[0] {
-            Expr::CellRef(r) => Spreadsheet::parse_cell_reference(r)
-                .ok_or_else(|| format!("OFFSET: invalid base: {}", r))?,
+        // Base must be a CellRef (extract sheet/row/col without evaluating).
+        // `parse_qualified_reference` accepts both `A1` and `Sheet2!A1`.
+        let parse_base = |r: &str| -> Result<(Option<String>, usize, usize), String> {
+            Spreadsheet::parse_qualified_reference(r)
+                .map(|(s, row, col, _, _)| (s, row, col))
+                .ok_or_else(|| format!("OFFSET: invalid base: {}", r))
+        };
+        let (base_sheet, base_row, base_col) = match &args[0] {
+            Expr::CellRef(r) => parse_base(r)?,
             Expr::NamedRef(name) => {
                 let resolved = self.resolve_name(name)?;
                 match resolved {
-                    Expr::CellRef(r) => Spreadsheet::parse_cell_reference(&r)
-                        .ok_or_else(|| format!("OFFSET: invalid base: {}", r))?,
-                    Expr::Range(start, _) => Spreadsheet::parse_cell_reference(&start)
-                        .ok_or_else(|| format!("OFFSET: invalid base: {}", start))?,
+                    Expr::CellRef(r) => parse_base(&r)?,
+                    Expr::Range(start, _) => parse_base(&start)?,
                     _ => return Err("OFFSET: base must be a cell ref".to_string()),
                 }
             }
             _ => return Err("OFFSET: base must be a cell ref".to_string()),
         };
+        let sheet = self.resolve_sheet(base_sheet.as_deref())
+            .ok_or_else(|| format!("OFFSET: unknown sheet: {}", base_sheet.unwrap_or_default()))?;
         let row_off = self.evaluate(&args[1])?.to_number() as i64;
         let col_off = self.evaluate(&args[2])?.to_number() as i64;
         let height = args
@@ -558,21 +564,21 @@ impl<'a> ExpressionEvaluator<'a> {
         // Negative offsets and rows/cols beyond the sheet are `#REF!`.
         if new_row_i < 0
             || new_col_i < 0
-            || new_row_i as usize >= self.spreadsheet.rows
-            || new_col_i as usize >= self.spreadsheet.cols
+            || new_row_i as usize >= sheet.rows
+            || new_col_i as usize >= sheet.cols
         {
             return Ok(Value::Error(ErrorKind::Ref));
         }
         let new_row = new_row_i as usize;
         let new_col = new_col_i as usize;
         // Also bounds-check the height/width corner.
-        if new_row + height as usize > self.spreadsheet.rows
-            || new_col + width as usize > self.spreadsheet.cols
+        if new_row + height as usize > sheet.rows
+            || new_col + width as usize > sheet.cols
         {
             return Ok(Value::Error(ErrorKind::Ref));
         }
         if height == 1 && width == 1 {
-            let cell = self.spreadsheet.get_cell(new_row, new_col);
+            let cell = sheet.get_cell(new_row, new_col);
             if let Ok(n) = cell.value.parse::<f64>() {
                 return Ok(Value::Number(n));
             }
@@ -582,7 +588,7 @@ impl<'a> ExpressionEvaluator<'a> {
         let mut list = Vec::with_capacity((height * width) as usize);
         for r in new_row..new_row + height as usize {
             for c in new_col..new_col + width as usize {
-                let cell = self.spreadsheet.get_cell(r, c);
+                let cell = sheet.get_cell(r, c);
                 if let Ok(n) = cell.value.parse::<f64>() {
                     list.push(Value::Number(n));
                 } else {

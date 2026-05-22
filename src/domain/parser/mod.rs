@@ -155,7 +155,7 @@ impl Value {
         match self {
             Value::Number(n) => n.to_string(),
             Value::String(s) => s.clone(),
-            Value::Bool(b) => if *b { "1".to_string() } else { "0".to_string() },
+            Value::Bool(b) => if *b { "TRUE".to_string() } else { "FALSE".to_string() },
             Value::List(items) => items
                 .first()
                 .map(|v| v.to_string())
@@ -451,21 +451,24 @@ pub fn criteria_matches(value: &Value, criteria: &str) -> bool {
         ("=", c)
     };
     let rest = rest.trim();
-    // Numeric comparison if both parse as numbers
-    if let (Ok(a), Ok(b)) = (rest.parse::<f64>(), Ok::<f64, ()>(value.to_number())) {
+    // Numeric comparison only when both sides parse as numbers AND the value
+    // is either a Number or a String whose contents parse cleanly. Bool/Error
+    // values fall through to string compare (Excel: `COUNTIF(["#REF!"], ">3")`
+    // does not match).
+    let value_num: Option<f64> = match value {
+        Value::Number(n) => Some(*n),
+        Value::String(s) => s.trim().parse::<f64>().ok(),
+        Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+        _ => None,
+    };
+    if let (Ok(a), Some(b)) = (rest.parse::<f64>(), value_num) {
         match op {
-            ">" => return value.to_number() > a,
-            "<" => return value.to_number() < a,
-            ">=" => return value.to_number() >= a,
-            "<=" => return value.to_number() <= a,
-            "<>" => return (b - a).abs() > 1e-9 || !matches!(value, Value::Number(_) | Value::String(_) if {
-                // hack: keep numeric check fast
-                true
-            }),
-            "=" => {
-                if let Value::Number(_) = value { return (b - a).abs() < 1e-9; }
-                // fall through to string match if value isn't numeric
-            }
+            ">"  => return b >  a,
+            "<"  => return b <  a,
+            ">=" => return b >= a,
+            "<=" => return b <= a,
+            "<>" => return (b - a).abs() > 1e-9,
+            "="  => return (b - a).abs() < 1e-9,
             _ => {}
         }
     }

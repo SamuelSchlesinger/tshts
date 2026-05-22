@@ -14,12 +14,29 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
-use std::net::IpAddr;
+use std::net::{IpAddr, ToSocketAddrs};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
+
+/// Network requests are gated off by default — a workbook the user just
+/// opened might contain hostile `=GET(...)` formulas; opening a file should
+/// not silently exfiltrate to the network. The user enables fetches per
+/// session via the `:net on` command.
+static NETWORK_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Toggle whether `GET()` calls actually hit the network. When false, `fetch`
+/// returns a sentinel error and no request is enqueued. Bound to `:net on/off`.
+pub fn set_network_enabled(enabled: bool) {
+    NETWORK_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// Whether `:net on` has been issued this session.
+pub fn network_enabled() -> bool {
+    NETWORK_ENABLED.load(Ordering::Relaxed)
+}
 
 const CACHE_TTL: Duration = Duration::from_secs(300);
 /// How long to cache an error before re-attempting. Short so transient
@@ -61,8 +78,24 @@ fn inner() -> &'static Arc<Inner> {
         // Spawn the single worker thread.
         let worker = Arc::clone(&arc);
         thread::spawn(move || {
+            // Re-validate every redirect hop against the same SSRF rules as
+            // the initial URL. Default reqwest policy follows up to 10 hops
+            // unvalidated, so `https://attacker.com/redir` could 302 to
+            // `http://169.254.169.254/...` and bypass every check below.
+            let redirect_policy =
+                reqwest::redirect::Policy::custom(|attempt| {
+                    if attempt.previous().len() >= 10 {
+                        return attempt.error("too many redirects");
+                    }
+                    match check_url_safety(attempt.url().as_str()) {
+                        Ok(()) => attempt.follow(),
+                        Err(reason) => attempt.error(format!("redirect blocked: {}", reason)),
+                    }
+                });
             let client = reqwest::blocking::Client::builder()
                 .timeout(REQUEST_TIMEOUT)
+                .redirect(redirect_policy)
+                .user_agent(concat!("tshts/", env!("CARGO_PKG_VERSION")))
                 .build()
                 .ok();
             while let Ok(url) = rx.recv() {
@@ -175,12 +208,39 @@ fn check_url_safety(url_str: &str) -> Result<(), String> {
     if ip_candidate.contains('%') {
         return Err("IPv6 zone IDs are not supported".to_string());
     }
-    if let Ok(ip) = ip_candidate.parse::<IpAddr>()
-        && is_blocked_ip(&ip)
-    {
-        return Err(format!("{} is a private/loopback/link-local address", ip));
+    if let Ok(ip) = ip_candidate.parse::<IpAddr>() {
+        if is_blocked_ip(&ip) {
+            return Err(format!("{} is a private/loopback/link-local address", ip));
+        }
+        // Literal IP — nothing more to resolve.
+        return Ok(());
     }
-    Ok(())
+    // DNS-based SSRF: a hostname like `localtest.me` resolves to 127.0.0.1.
+    // We can't fully defend against rebinding (DNS may return different A
+    // records by the time reqwest actually connects), but rejecting URLs
+    // whose first-resolved address is private catches the obvious attacks.
+    let port = url.port_or_known_default().unwrap_or(80);
+    let resolve_target = format!("{}:{}", host, port);
+    match (resolve_target.as_str()).to_socket_addrs() {
+        Ok(addrs) => {
+            for addr in addrs {
+                if is_blocked_ip(&addr.ip()) {
+                    return Err(format!(
+                        "{} resolves to {} (private/loopback/link-local)",
+                        host,
+                        addr.ip()
+                    ));
+                }
+            }
+            Ok(())
+        }
+        Err(_) => {
+            // DNS failure isn't itself a safety issue — the actual GET will
+            // fail at connect-time. Let it through so the user sees a useful
+            // error rather than a confusing "DNS rejected" message.
+            Ok(())
+        }
+    }
 }
 
 fn is_blocked_ip(ip: &IpAddr) -> bool {
@@ -237,6 +297,14 @@ pub enum FetchResult {
 /// the background worker is fetching. Enqueues a request if no entry exists
 /// or the cached one has expired.
 pub fn fetch(url: &str) -> FetchResult {
+    // Hard gate: an unopened-into-this-session workbook can contain hostile
+    // `=GET(...)` formulas. Until the user types `:net on`, every GET()
+    // returns a static error and no request is enqueued.
+    if !network_enabled() {
+        return FetchResult::Error(
+            "#ERROR: network disabled (use :net on to enable)".to_string(),
+        );
+    }
     let i = inner();
     let now = Instant::now();
     let mut cache = i.cache.lock().expect("fetcher cache mutex poisoned");

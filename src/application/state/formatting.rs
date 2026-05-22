@@ -109,14 +109,24 @@ impl App {
             }
         }
         // Clears first (so dependent invalidation happens), then bulk writes.
-        for (r, c) in clears {
-            self.workbook.current_sheet_mut().clear_cell(r, c);
+        let touched: Vec<(usize, usize)> = clears
+            .iter()
+            .copied()
+            .chain(writes.iter().map(|(r, c, _)| (*r, *c)))
+            .collect();
+        for (r, c) in &clears {
+            self.workbook.current_sheet_mut().clear_cell(*r, *c);
         }
         if !writes.is_empty() {
             self.workbook.current_sheet_mut().set_many(writes);
         }
         if !batch.is_empty() {
             self.record_action(UndoAction::Batch(batch));
+        }
+        // Cross-sheet dependents on other sheets need to see the new values;
+        // set_many/clear_cell only handles the same-sheet dep graph.
+        for (r, c) in touched {
+            self.propagate_cell_change(r, c);
         }
         let dir = if ascending { "ascending" } else { "descending" };
         self.status_message = Some(format!(
@@ -126,122 +136,118 @@ impl App {
         ));
     }
 
+    /// Collect every (row, col) in the active selection (or just the cursor
+    /// cell if no selection is active). Used by every format-mutation path so
+    /// they all go through `set_many_with_undo` for consistent undo + dirty
+    /// + cross-sheet propagation.
+    fn selection_cells(&self) -> Vec<(usize, usize)> {
+        let range = self
+            .get_selection_range()
+            .unwrap_or(((self.selected_row, self.selected_col), (self.selected_row, self.selected_col)));
+        let ((sr, sc), (er, ec)) = range;
+        let mut out = Vec::with_capacity((er - sr + 1) * (ec - sc + 1));
+        for r in sr..=er {
+            for c in sc..=ec {
+                out.push((r, c));
+            }
+        }
+        out
+    }
+
     pub fn set_selection_format(&mut self, number_format: NumberFormat) {
-        let range = if let Some(range) = self.get_selection_range() {
-            range
-        } else {
-            ((self.selected_row, self.selected_col), (self.selected_row, self.selected_col))
-        };
-        let ((start_row, start_col), (end_row, end_col)) = range;
         let fmt_name = match &number_format {
             NumberFormat::General => "General",
             NumberFormat::Number { .. } => "Number",
             NumberFormat::Currency { .. } => "Currency",
             NumberFormat::Percentage { .. } => "Percentage",
         };
-        let mut count = 0;
-        for row in start_row..=end_row {
-            for col in start_col..=end_col {
-                let mut cell = self.workbook.current_sheet().get_cell(row, col);
-                let format = match &number_format {
+        let cells: Vec<(usize, usize, CellData)> = self
+            .selection_cells()
+            .into_iter()
+            .map(|(r, c)| {
+                let mut cell = self.workbook.current_sheet().get_cell(r, c);
+                cell.format = match &number_format {
                     NumberFormat::General => None,
                     _ => {
                         let existing_style = cell.format.as_ref().map(|f| f.style.clone()).unwrap_or_default();
                         Some(CellFormat { number_format: number_format.clone(), style: existing_style })
                     }
                 };
-                cell.format = format;
-                self.workbook.current_sheet_mut().set_cell(row, col, cell);
-                count += 1;
-            }
-        }
+                (r, c, cell)
+            })
+            .collect();
+        let count = cells.len();
+        self.set_many_with_undo(cells);
         self.status_message = Some(format!("Applied {} format to {} cell(s)", fmt_name, count));
     }
 
     pub fn toggle_bold(&mut self) {
-        let range = if let Some(range) = self.get_selection_range() {
-            range
-        } else {
-            ((self.selected_row, self.selected_col), (self.selected_row, self.selected_col))
-        };
-        let ((start_row, start_col), (end_row, end_col)) = range;
-        // Check current state from first cell to determine toggle direction
-        let first_cell = self.workbook.current_sheet().get_cell(start_row, start_col);
-        let currently_bold = first_cell.format.as_ref().map(|f| f.style.bold).unwrap_or(false);
-        let new_bold = !currently_bold;
-
-        for row in start_row..=end_row {
-            for col in start_col..=end_col {
-                let mut cell = self.workbook.current_sheet().get_cell(row, col);
+        let first = self.workbook.current_sheet().get_cell(self.selected_row, self.selected_col);
+        let new_bold = !first.format.as_ref().map(|f| f.style.bold).unwrap_or(false);
+        let cells: Vec<(usize, usize, CellData)> = self
+            .selection_cells()
+            .into_iter()
+            .map(|(r, c)| {
+                let mut cell = self.workbook.current_sheet().get_cell(r, c);
                 let mut fmt = cell.format.unwrap_or_default();
                 fmt.style.bold = new_bold;
                 cell.format = Some(fmt);
-                self.workbook.current_sheet_mut().set_cell(row, col, cell);
-            }
-        }
+                (r, c, cell)
+            })
+            .collect();
+        self.set_many_with_undo(cells);
         self.status_message = Some(format!("Bold {}", if new_bold { "on" } else { "off" }));
     }
 
     pub fn toggle_underline(&mut self) {
-        let range = if let Some(range) = self.get_selection_range() {
-            range
-        } else {
-            ((self.selected_row, self.selected_col), (self.selected_row, self.selected_col))
-        };
-        let ((start_row, start_col), (end_row, end_col)) = range;
-        let first_cell = self.workbook.current_sheet().get_cell(start_row, start_col);
-        let currently_underline = first_cell.format.as_ref().map(|f| f.style.underline).unwrap_or(false);
-        let new_underline = !currently_underline;
-
-        for row in start_row..=end_row {
-            for col in start_col..=end_col {
-                let mut cell = self.workbook.current_sheet().get_cell(row, col);
+        let first = self.workbook.current_sheet().get_cell(self.selected_row, self.selected_col);
+        let new_underline = !first.format.as_ref().map(|f| f.style.underline).unwrap_or(false);
+        let cells: Vec<(usize, usize, CellData)> = self
+            .selection_cells()
+            .into_iter()
+            .map(|(r, c)| {
+                let mut cell = self.workbook.current_sheet().get_cell(r, c);
                 let mut fmt = cell.format.unwrap_or_default();
                 fmt.style.underline = new_underline;
                 cell.format = Some(fmt);
-                self.workbook.current_sheet_mut().set_cell(row, col, cell);
-            }
-        }
+                (r, c, cell)
+            })
+            .collect();
+        self.set_many_with_undo(cells);
         self.status_message = Some(format!("Underline {}", if new_underline { "on" } else { "off" }));
     }
 
     pub fn set_selection_fg_color(&mut self, color: Option<TerminalColor>) {
-        let range = if let Some(range) = self.get_selection_range() {
-            range
-        } else {
-            ((self.selected_row, self.selected_col), (self.selected_row, self.selected_col))
-        };
-        let ((start_row, start_col), (end_row, end_col)) = range;
-        for row in start_row..=end_row {
-            for col in start_col..=end_col {
-                let mut cell = self.workbook.current_sheet().get_cell(row, col);
+        let cells: Vec<(usize, usize, CellData)> = self
+            .selection_cells()
+            .into_iter()
+            .map(|(r, c)| {
+                let mut cell = self.workbook.current_sheet().get_cell(r, c);
                 let mut fmt = cell.format.unwrap_or_default();
                 fmt.style.fg_color = color.clone();
                 cell.format = Some(fmt);
-                self.workbook.current_sheet_mut().set_cell(row, col, cell);
-            }
-        }
+                (r, c, cell)
+            })
+            .collect();
         let color_name = color.as_ref().map(|c| format!("{:?}", c)).unwrap_or("default".to_string());
+        self.set_many_with_undo(cells);
         self.status_message = Some(format!("Set foreground color to {}", color_name));
     }
 
     pub fn set_selection_bg_color(&mut self, color: Option<TerminalColor>) {
-        let range = if let Some(range) = self.get_selection_range() {
-            range
-        } else {
-            ((self.selected_row, self.selected_col), (self.selected_row, self.selected_col))
-        };
-        let ((start_row, start_col), (end_row, end_col)) = range;
-        for row in start_row..=end_row {
-            for col in start_col..=end_col {
-                let mut cell = self.workbook.current_sheet().get_cell(row, col);
+        let cells: Vec<(usize, usize, CellData)> = self
+            .selection_cells()
+            .into_iter()
+            .map(|(r, c)| {
+                let mut cell = self.workbook.current_sheet().get_cell(r, c);
                 let mut fmt = cell.format.unwrap_or_default();
                 fmt.style.bg_color = color.clone();
                 cell.format = Some(fmt);
-                self.workbook.current_sheet_mut().set_cell(row, col, cell);
-            }
-        }
+                (r, c, cell)
+            })
+            .collect();
         let color_name = color.as_ref().map(|c| format!("{:?}", c)).unwrap_or("default".to_string());
+        self.set_many_with_undo(cells);
         self.status_message = Some(format!("Set background color to {}", color_name));
     }
 

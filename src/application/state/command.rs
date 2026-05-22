@@ -144,6 +144,8 @@ impl App {
             let name = trimmed[7..].trim().to_string();
             if !name.is_empty() {
                 if self.workbook.rename_sheet(name.clone()) {
+                    self.dirty = true;
+                    crate::infrastructure::autosave::mark_dirty();
                     self.status_message = Some(format!("Renamed sheet to '{}'", name));
                 } else {
                     self.status_message = Some(format!(
@@ -234,6 +236,8 @@ impl App {
                 self.selected_col = 0;
                 self.scroll_row = 0;
                 self.scroll_col = 0;
+                self.dirty = true;
+                crate::infrastructure::autosave::mark_dirty();
                 self.status_message = Some(format!("Added sheet '{}'", name));
             }
             ["sheet", "delete"] | ["delsheet"] => {
@@ -243,6 +247,8 @@ impl App {
                     self.selected_col = 0;
                     self.scroll_row = 0;
                     self.scroll_col = 0;
+                    self.dirty = true;
+                    crate::infrastructure::autosave::mark_dirty();
                     // remove_sheet may have shifted the active sheet (the
                     // workbook re-anchors it). Drop search/find-replace state
                     // since their (row, col) results belonged to the old
@@ -301,6 +307,26 @@ impl App {
             ["cache", "clear"] => {
                 crate::infrastructure::fetcher::clear_cache();
                 self.status_message = Some("GET cache cleared".to_string());
+            }
+            ["net", "on"] | ["network", "on"] => {
+                crate::infrastructure::fetcher::set_network_enabled(true);
+                // Clear any cached "network disabled" errors so the next
+                // recalc actually attempts the fetch.
+                crate::infrastructure::fetcher::clear_cache();
+                self.status_message = Some("Network GET enabled for this session".to_string());
+                self.recalc_all();
+            }
+            ["net", "off"] | ["network", "off"] => {
+                crate::infrastructure::fetcher::set_network_enabled(false);
+                crate::infrastructure::fetcher::clear_cache();
+                self.status_message = Some("Network GET disabled".to_string());
+            }
+            ["net", "status"] | ["network", "status"] => {
+                let on = crate::infrastructure::fetcher::network_enabled();
+                self.status_message = Some(format!(
+                    "Network GET: {}",
+                    if on { "enabled" } else { "disabled (run :net on)" }
+                ));
             }
             ["clipboard", "clear"] => {
                 crate::infrastructure::sidecar::clear();
@@ -752,7 +778,10 @@ impl App {
                         // Restore the cell to its pre-bisection state, then
                         // perform the final write through set_cell_with_undo
                         // so the recorded `old_cell` is the *original* value
-                        // (not the last bisection step).
+                        // (not the last bisection step). The intermediate
+                        // bisection writes left cross-sheet dependents holding
+                        // stale `mid` values; the final set_cell_with_undo
+                        // propagates the converged value to them.
                         self.workbook
                             .current_sheet_mut()
                             .set_cell(i.0, i.1, original_cell);
@@ -767,10 +796,13 @@ impl App {
                         self.status_message = Some(format!("Goal seek: {} = {:.6}", input, v));
                     } else {
                         // No-op net effect: put the original cell back, no
-                        // undo entry needed.
+                        // undo entry needed. Propagate so cross-sheet
+                        // dependents see the *original* value, not the last
+                        // bisection step.
                         self.workbook
                             .current_sheet_mut()
                             .set_cell(i.0, i.1, original_cell);
+                        self.propagate_cell_change(i.0, i.1);
                         self.status_message = Some("Goal seek did not converge".to_string());
                     }
                 } else {
@@ -839,10 +871,18 @@ impl App {
                 }
             }
             ["cf", "clear"] => {
-                let n = self.workbook.current_sheet().conditional_formats.len();
-                self.workbook.current_sheet_mut().conditional_formats.clear();
-                self.workbook.current_sheet_mut().cf_cache.borrow_mut().clear();
-                self.dirty = true;
+                let sheet_idx = self.workbook.active_sheet;
+                let old = self.workbook.current_sheet().conditional_formats.clone();
+                let n = old.len();
+                if n > 0 {
+                    self.workbook.current_sheet_mut().conditional_formats.clear();
+                    self.workbook.current_sheet_mut().cf_cache.borrow_mut().clear();
+                    self.record_action(UndoAction::ConditionalFormatsReplaced {
+                        sheet_idx,
+                        old,
+                        new: Vec::new(),
+                    });
+                }
                 self.status_message = Some(format!("Cleared {} conditional format rule(s)", n));
             }
             ["cf", "list"] => {
@@ -885,16 +925,24 @@ impl App {
                         );
                     } else {
                         let predicate = predicate_parts.join(" ");
+                        let sheet_idx = self.workbook.active_sheet;
+                        let old = self.workbook.current_sheet().conditional_formats.clone();
+                        let mut new = old.clone();
+                        new.push(crate::domain::ConditionalFormat {
+                            column: col,
+                            predicate: predicate.clone(),
+                            style,
+                        });
                         {
                             let sheet = self.workbook.current_sheet_mut();
-                            sheet.conditional_formats.push(crate::domain::ConditionalFormat {
-                                column: col,
-                                predicate: predicate.clone(),
-                                style,
-                            });
+                            sheet.conditional_formats = new.clone();
                             sheet.cf_cache.borrow_mut().clear();
                         }
-                        self.dirty = true;
+                        self.record_action(UndoAction::ConditionalFormatsReplaced {
+                            sheet_idx,
+                            old,
+                            new,
+                        });
                         self.status_message = Some(format!(
                             "Added cf for col {}: {}",
                             crate::domain::Spreadsheet::column_label(col),

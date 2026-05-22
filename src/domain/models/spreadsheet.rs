@@ -500,6 +500,7 @@ impl Spreadsheet {
             .collect();
         while let Some(cell) = ready.pop_front() {
             self.recalculate_cell(cell.0, cell.1);
+            in_degree.remove(&cell);
             if let Some(deps) = self.dependents.get(&cell).cloned() {
                 for dep in deps {
                     if let Some(d) = in_degree.get_mut(&dep) {
@@ -511,6 +512,26 @@ impl Spreadsheet {
                 }
             }
         }
+
+        // 4. Anything left has in_degree > 0 — i.e. participates in a cycle
+        // that iterative_calc wasn't enabled to resolve. Surface as `#REF!`
+        // (Excel uses `#CIRC!`; we reuse Ref to avoid expanding ErrorKind)
+        // instead of silently leaving stale values in place.
+        for (row, col) in in_degree.into_keys() {
+            if let Some(cell) = self.cells.get(&(row, col)).cloned() {
+                let mut updated = cell;
+                updated.value = "#REF!".to_string();
+                self.cells.insert((row, col), updated);
+            }
+        }
+    }
+
+    /// Force a single cell to re-evaluate its formula and refresh `value`.
+    /// Public wrapper around `recalculate_cell` for use after non-`set_cell`
+    /// mutations (e.g. cross-sheet ref rewrites in `Workbook::remove_sheet`)
+    /// where the formula text changed without going through `set_cell`.
+    pub fn refresh_cell_value(&mut self, row: usize, col: usize) {
+        self.recalculate_cell(row, col);
     }
 
     /// Recalculates a single cell's value based on its formula.
@@ -716,10 +737,24 @@ impl Spreadsheet {
 
     /// Automatically resizes all columns to fit their content.
     ///
-    /// Calls `auto_resize_column` for each column in the spreadsheet.
+    /// Single pass over the sparse `cells` map (O(N) total) instead of
+    /// O(cols × cells) — the per-column loop iterated the entire HashMap.
     pub fn auto_resize_all_columns(&mut self) {
+        use unicode_width::UnicodeWidthStr;
+        let mut widths: HashMap<usize, usize> = HashMap::with_capacity(self.cols);
         for col in 0..self.cols {
-            self.auto_resize_column(col);
+            widths.insert(col, Self::column_label(col).width());
+        }
+        for (&(_, c), cell) in &self.cells {
+            let value_width = cell.value.width();
+            let formula_width = cell.formula.as_ref().map(|f| f.width()).unwrap_or(0);
+            let content_width = value_width.max(formula_width);
+            let entry = widths.entry(c).or_insert(3);
+            *entry = (*entry).max(content_width);
+        }
+        for (col, mut w) in widths {
+            w = w.max(3).min(50);
+            self.set_column_width(col, w);
         }
     }
 

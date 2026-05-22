@@ -119,14 +119,22 @@ impl App {
             self.search_regex,
             self.search_case_sensitive,
         );
-        for row in 0..self.workbook.current_sheet().rows {
-            for col in 0..self.workbook.current_sheet().cols {
-                let cell = self.workbook.current_sheet().get_cell(row, col);
-                if matcher.is_match(&cell.value) {
-                    self.find_replace_results.push((row, col));
-                }
+        // Walk the sparse `cells` map (not rows×cols) and match against value
+        // OR formula text. Previously this only matched `value`, so formulas
+        // that contained the needle were invisible to :replace even though
+        // /-search (`perform_search`) did match them — asymmetric and
+        // confusing.
+        let sheet = self.workbook.current_sheet();
+        for (&(row, col), cell) in &sheet.cells {
+            let formula_hit = cell
+                .formula
+                .as_ref()
+                .is_some_and(|f| matcher.is_match(f));
+            if matcher.is_match(&cell.value) || formula_hit {
+                self.find_replace_results.push((row, col));
             }
         }
+        self.find_replace_results.sort();
         if !self.find_replace_results.is_empty() {
             let (row, col) = self.find_replace_results[0];
             self.selected_row = row;
@@ -179,16 +187,26 @@ impl App {
         if self.find_replace_results.is_empty() {
             return;
         }
+        // Any operation user-initiated as "replace_all" should clear redo so
+        // stale forward-history can't be re-applied. Even when every match is
+        // a formula cell (skipped below) we still treat this as a state
+        // transition.
+        self.redo_stack.clear();
         let matcher = TextMatcher::new(
             &self.find_replace_search,
             self.search_regex,
             self.search_case_sensitive,
         );
         let mut batch = Vec::new();
+        let mut skipped_formulas = 0usize;
         let results = self.find_replace_results.clone();
         for (row, col) in results {
             let cell = self.workbook.current_sheet().get_cell(row, col);
             if cell.formula.is_some() {
+                // Excel/Sheets don't rewrite formula text via Replace. Track
+                // the count so we can tell the user why fewer cells changed
+                // than the result list suggested.
+                skipped_formulas += 1;
                 continue;
             }
             let old_cell = Some(cell.clone());
@@ -198,7 +216,7 @@ impl App {
                 formula: None,
                 format: cell.format.clone(),
                 comment: cell.comment.clone(),
-            spill_anchor: None,
+                spill_anchor: None,
             };
             batch.push(UndoAction::CellModified {
                 row,
@@ -215,7 +233,12 @@ impl App {
         if !batch.is_empty() {
             self.record_action(UndoAction::Batch(batch));
         }
-        self.status_message = Some(format!("Replaced {} occurrence(s)", count));
+        let msg = if skipped_formulas > 0 {
+            format!("Replaced {} occurrence(s); skipped {} formula cell(s)", count, skipped_formulas)
+        } else {
+            format!("Replaced {} occurrence(s)", count)
+        };
+        self.status_message = Some(msg);
         self.find_replace_results.clear();
     }
 

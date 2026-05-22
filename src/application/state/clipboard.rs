@@ -243,7 +243,7 @@ impl App {
         let dest_row = self.selected_row;
         let dest_col = self.selected_col;
         let mut batch = Vec::new();
-        let mut count = 0;
+        let mut writes: Vec<(usize, usize, CellData)> = Vec::new();
 
         for (row_offset, line) in text.lines().enumerate() {
             if line.is_empty() { continue; }
@@ -264,7 +264,7 @@ impl App {
                 // not tshts (no sentinel/sidecar), so we have no original
                 // anchor to shift against. Excel and Sheets behave the same
                 // way for plain-text formula paste. The tshts→tshts path in
-                // `paste()` (line ~184) handles relative adjustment properly.
+                // `paste()` handles relative adjustment properly.
                 let new_cell = if value.starts_with('=') {
                     let evaluator = FormulaEvaluator::new(self.workbook.current_sheet());
                     let evaluated = evaluator.evaluate_formula(value);
@@ -273,7 +273,7 @@ impl App {
                         formula: Some(value.to_string()),
                         format: None,
                         comment: None,
-                    spill_anchor: None,
+                        spill_anchor: None,
                     }
                 } else {
                     CellData {
@@ -281,7 +281,7 @@ impl App {
                         formula: None,
                         format: None,
                         comment: None,
-                    spill_anchor: None,
+                        spill_anchor: None,
                     }
                 };
                 batch.push(UndoAction::CellModified {
@@ -290,11 +290,20 @@ impl App {
                     old_cell: old,
                     new_cell: Some(new_cell.clone()),
                 });
-                self.workbook.current_sheet_mut().set_cell(target_row, target_col, new_cell);
-                // Cells on other sheets that reference this destination need
-                // to recalc against the pasted value.
-                self.propagate_cell_change(target_row, target_col);
-                count += 1;
+                writes.push((target_row, target_col, new_cell));
+            }
+        }
+        let count = writes.len();
+        if !writes.is_empty() {
+            // Bulk-write via set_many (one same-sheet recalc pass) and replay
+            // cross-sheet bookkeeping per cell. Previously each cell hit
+            // set_cell + propagate_cell_change in the inner loop — O(N²) on
+            // wide pastes.
+            let positions: Vec<(usize, usize)> =
+                writes.iter().map(|(r, c, _)| (*r, *c)).collect();
+            self.workbook.current_sheet_mut().set_many(writes);
+            for (r, c) in positions {
+                self.propagate_cell_change(r, c);
             }
         }
         if !batch.is_empty() {

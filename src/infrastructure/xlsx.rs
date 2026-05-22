@@ -14,6 +14,13 @@ use std::io::Write;
 
 use crate::domain::{CellData, CellFormat, CellStyle, NumberFormat, Spreadsheet, TerminalColor, Workbook};
 
+/// Hard caps on imported sheet geometry. Calamine reports the declared
+/// dimensions of the file, which a hostile workbook can inflate to Excel's
+/// `XFD1048576` to make us allocate a 16 GB scrollback region. We clamp to
+/// values that still cover any realistic spreadsheet.
+const MAX_IMPORT_ROWS: usize = 200_000;
+const MAX_IMPORT_COLS: usize = 1_024;
+
 /// Read an `.xlsx` file into a Workbook.
 pub fn load_xlsx(path: &str) -> Result<Workbook, String> {
     use calamine::{open_workbook_auto, Data, Reader};
@@ -38,8 +45,11 @@ pub fn load_xlsx(path: &str) -> Result<Workbook, String> {
         let formulas = wb.worksheet_formula(name).ok();
         let mut sheet = Spreadsheet::default();
         let (h, w) = range.get_size();
-        sheet.rows = h.max(100);
-        sheet.cols = w.max(26);
+        // Clamp declared geometry to defensive bounds. A pathological file
+        // with one cell at `XFD1048576` would otherwise set rows ≈ 1M, cols
+        // ≈ 16K — terminal rendering allocates per cell.
+        sheet.rows = h.max(100).min(MAX_IMPORT_ROWS);
+        sheet.cols = w.max(26).min(MAX_IMPORT_COLS);
         // Build (row, col) → formula. `used_cells` returns coords relative
         // to the range's `start()`, so we must offset back to absolute.
         let mut formula_map: std::collections::HashMap<(usize, usize), String> =
@@ -71,6 +81,11 @@ pub fn load_xlsx(path: &str) -> Result<Workbook, String> {
             };
             let abs_r = val_r as usize + r;
             let abs_c = val_c as usize + c;
+            // Drop cells outside the clamped sheet geometry so a stray cell
+            // at `XFD1048576` can't trip rendering bounds.
+            if abs_r >= sheet.rows || abs_c >= sheet.cols {
+                continue;
+            }
             // Strip `_xlfn.` and `_xlfn._xlws.` prefixes Excel adds to
             // modern function names (XLOOKUP, FILTER, etc.) so the
             // formula evaluator recognizes them.
@@ -83,7 +98,7 @@ pub fn load_xlsx(path: &str) -> Result<Workbook, String> {
                 formula,
                 format: None,
                 comment: None,
-            spill_anchor: None,
+                spill_anchor: None,
             };
             sheet.cells.insert((abs_r, abs_c), cd);
         }

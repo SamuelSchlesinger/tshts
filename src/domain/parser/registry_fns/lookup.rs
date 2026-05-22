@@ -79,7 +79,16 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
                         return Ok(data[r * cols + col_index - 1].clone());
                     }
                 } else if let Some(t) = target_num {
-                    let k = key.to_number();
+                    // Numeric approximate-match: only consider numeric keys
+                    // (skip strings whose to_number() collapses to 0 and would
+                    // falsely match every non-negative target).
+                    let k_num = match key {
+                        Value::Number(n) => Some(*n),
+                        Value::String(s) => s.trim().parse::<f64>().ok(),
+                        Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+                        _ => None,
+                    };
+                    let Some(k) = k_num else { continue };
                     if k > t {
                         // Sorted-ascending assumption: nothing further can match.
                         break;

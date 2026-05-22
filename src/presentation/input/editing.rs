@@ -14,6 +14,16 @@ impl InputHandler {
                 // Finish editing and move right instead of down
                 app.finish_editing_move_right();
             }
+            // Up/Down commit the edit and move the cursor — matches Excel /
+            // Sheets convention where a spreadsheet user's muscle memory
+            // expects arrow keys to confirm the value, not move the in-cell
+            // caret.
+            KeyCode::Up => {
+                app.finish_editing_move_up();
+            }
+            KeyCode::Down => {
+                app.finish_editing_move_down();
+            }
             KeyCode::Esc => {
                 app.cancel_editing();
             }

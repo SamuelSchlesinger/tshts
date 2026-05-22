@@ -26,6 +26,29 @@ mod dialogs;
 
 impl InputHandler {
     pub fn handle_key_event(app: &mut App, key: KeyCode, modifiers: KeyModifiers) {
+        // Drop modifier-laden Char events for text-input dialogs that have
+        // no Ctrl/Alt bindings of their own. Without this guard, pressing
+        // Ctrl+S inside the search/goto/filename/command-palette buffer
+        // literally inserts the character `s` into the buffer.
+        // Editing-mode and FindReplace handle their own modifier semantics
+        // (FindReplace owns Ctrl+A for "replace all"); Normal/Visual route
+        // through their own modifier-aware dispatchers.
+        if matches!(
+            app.mode,
+            AppMode::SaveAs
+                | AppMode::LoadFile
+                | AppMode::ExportCsv
+                | AppMode::ImportCsv
+                | AppMode::Search
+                | AppMode::GoToCell
+                | AppMode::CommandPalette
+                | AppMode::Editing
+        ) && matches!(key, KeyCode::Char(_))
+            && modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+        {
+            return;
+        }
         match app.mode {
             AppMode::Normal => Self::handle_normal_mode(app, key, modifiers),
             AppMode::Editing => Self::handle_editing_mode(app, key),

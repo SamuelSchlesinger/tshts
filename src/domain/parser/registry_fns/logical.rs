@@ -18,17 +18,25 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("AND", |args| {
             let flat = flatten_args(args);
+            if let Some(e) = flat.iter().find_map(|v| v.first_error()) {
+                return Ok(Value::Error(e));
+            }
             let result = flat.iter().all(|v| v.is_truthy());
             Ok(Value::Bool(result))
         });
         reg.register_function("OR", |args| {
             let flat = flatten_args(args);
+            if let Some(e) = flat.iter().find_map(|v| v.first_error()) {
+                return Ok(Value::Error(e));
+            }
             let result = flat.iter().any(|v| v.is_truthy());
             Ok(Value::Bool(result))
         });
         reg.register_function("NOT", |args| {
             if args.len() != 1 {
                 Err("NOT requires exactly 1 argument".to_string())
+            } else if let Some(e) = args[0].first_error() {
+                Ok(Value::Error(e))
             } else {
                 let result = !args[0].is_truthy();
                 Ok(Value::Number(if result { 1.0 } else { 0.0 }))
@@ -100,6 +108,9 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("XOR", |args| {
             let flat = flatten_args(args);
+            if let Some(e) = flat.iter().find_map(|v| v.first_error()) {
+                return Ok(Value::Error(e));
+            }
             let count_true = flat.iter().filter(|v| v.is_truthy()).count();
             Ok(Value::Bool(count_true % 2 == 1))
         });

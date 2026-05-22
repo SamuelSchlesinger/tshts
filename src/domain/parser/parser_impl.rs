@@ -156,21 +156,20 @@ impl Parser {
         Ok(left)
     }
     
-    /// Parses power expressions (right-associative).
+    /// Parses power expressions (left-associative, matching Excel/Sheets).
     fn parse_power(&mut self) -> Result<Expr, String> {
-        let left = self.parse_unary()?;
-        
-        if matches!(self.current_token, Token::Power | Token::PowerAlt) {
+        let mut left = self.parse_unary()?;
+
+        while matches!(self.current_token, Token::Power | Token::PowerAlt) {
             self.advance()?;
-            let right = self.parse_power()?; // Right-associative
-            Ok(Expr::Binary {
+            let right = self.parse_unary()?;
+            left = Expr::Binary {
                 left: Box::new(left),
                 operator: BinaryOp::Power,
                 right: Box::new(right),
-            })
-        } else {
-            Ok(left)
+            };
         }
+        Ok(left)
     }
     
     /// Parses unary expressions.
@@ -585,19 +584,19 @@ mod tests {
     }
 
     #[test]
-    fn test_parser_power_right_associative() {
-        // Test that 2 ** 3 ** 2 is parsed as 2 ** (3 ** 2)
+    fn test_parser_power_left_associative() {
+        // 2 ** 3 ** 2 parses as (2 ** 3) ** 2 — Excel/Sheets convention.
         let mut parser = Parser::new("2 ** 3 ** 2").unwrap();
         let expr = parser.parse().unwrap();
         match expr {
             Expr::Binary { left, operator: BinaryOp::Power, right } => {
-                assert!(matches!(left.as_ref(), &Expr::Number(2.0)));
-                match right.as_ref() {
+                assert!(matches!(right.as_ref(), &Expr::Number(2.0)));
+                match left.as_ref() {
                     Expr::Binary { left: pow_left, operator: BinaryOp::Power, right: pow_right } => {
-                        assert!(matches!(pow_left.as_ref(), &Expr::Number(3.0)));
-                        assert!(matches!(pow_right.as_ref(), &Expr::Number(2.0)));
+                        assert!(matches!(pow_left.as_ref(), &Expr::Number(2.0)));
+                        assert!(matches!(pow_right.as_ref(), &Expr::Number(3.0)));
                     }
-                    _ => panic!("Expected power as right operand"),
+                    _ => panic!("Expected power as left operand"),
                 }
             }
             _ => panic!("Expected power at top level"),

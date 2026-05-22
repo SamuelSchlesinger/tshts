@@ -233,12 +233,19 @@ impl Workbook {
                         .unwrap_or(false)
                 })
                 .collect();
+            let touched: Vec<(usize, usize)> = updates.iter().map(|(rc, _)| *rc).collect();
             for ((r, c), new_formula) in updates {
                 if let Some(cd) = sheet.cells.get_mut(&(r, c)) {
                     cd.formula = Some(new_formula);
                 }
             }
             sheet.rebuild_dependencies();
+            // The rewrite changed only the formula text; the cached `value`
+            // still shows whatever the formula previously evaluated to.
+            // Force a recalc so the displayed value matches `#REF!` immediately.
+            for (r, c) in touched {
+                sheet.refresh_cell_value(r, c);
+            }
         }
         // Purge any cross-sheet dep entries that touched the removed sheet.
         self.cross_sheet_dependents
@@ -395,8 +402,14 @@ impl Workbook {
             }
         }
 
-        // Step 2: pull the current formula.
-        let sheet_idx = match self.sheet_names.iter().position(|n| n == sheet_name) {
+        // Step 2: pull the current formula. Sheet names are case-insensitive
+        // (Excel convention); using `==` here silently dropped cross-sheet
+        // dep registration when callers passed a different casing.
+        let sheet_idx = match self
+            .sheet_names
+            .iter()
+            .position(|n| n.eq_ignore_ascii_case(sheet_name))
+        {
             Some(i) => i,
             None => return,
         };
@@ -463,6 +476,22 @@ impl Workbook {
         queue.push_back((sheet_name.to_string(), row, col));
         let mut visited: HashSet<CrossSheetKey> = HashSet::new();
 
+        // Check up front whether any dep edges exist — common case has none,
+        // and we want to skip the expensive workbook clone in that case.
+        let has_any_deps = self
+            .cross_sheet_dependents
+            .get(&(sheet_name.to_string(), row, col))
+            .is_some_and(|s| !s.is_empty());
+        if !has_any_deps {
+            return;
+        }
+
+        // One snapshot for the whole BFS, mutated in-place as we compute new
+        // values so chained refs (Sheet1!A1 → Sheet2!A1 → Sheet3!A1) see the
+        // freshly-recomputed upstream values on later layers.
+        let mut snapshot = self.clone();
+        let names = snapshot.named_ranges.clone();
+
         while let Some(key) = queue.pop_front() {
             if !visited.insert(key.clone()) {
                 continue;
@@ -477,12 +506,6 @@ impl Workbook {
             if deps.is_empty() {
                 continue;
             }
-            // Snapshot the workbook so the evaluator can borrow it while
-            // we mutate `self.sheets`. Cloning is heavy but only happens
-            // when something cross-sheet actually fires; for the common
-            // case of no cross-sheet deps, this is never reached.
-            let snapshot = self.clone();
-            let names = snapshot.named_ranges.clone();
             for dep in deps {
                 let (dep_sheet, dep_row, dep_col) = dep.clone();
                 let Some(dep_idx) = snapshot
@@ -492,14 +515,23 @@ impl Workbook {
                 else {
                     continue;
                 };
-                let snap_sheet = &snapshot.sheets[dep_idx];
-                let Some(cd) = snap_sheet.cells.get(&(dep_row, dep_col)) else {
-                    continue;
+                let new_value = {
+                    let snap_sheet = &snapshot.sheets[dep_idx];
+                    let Some(cd) = snap_sheet.cells.get(&(dep_row, dep_col)) else {
+                        continue;
+                    };
+                    let Some(formula) = cd.formula.clone() else { continue };
+                    let evaluator =
+                        FormulaEvaluator::with_workbook(&snapshot, snap_sheet, &names);
+                    evaluator.evaluate_formula(&formula)
                 };
-                let Some(formula) = cd.formula.clone() else { continue };
-                let evaluator =
-                    FormulaEvaluator::with_workbook(&snapshot, snap_sheet, &names);
-                let new_value = evaluator.evaluate_formula(&formula);
+                // Update the snapshot first so downstream layers see it.
+                if let Some(snap_cd) = snapshot.sheets[dep_idx]
+                    .cells
+                    .get_mut(&(dep_row, dep_col))
+                {
+                    snap_cd.value = new_value.clone();
+                }
                 // Write to the real workbook.
                 let dep_real_idx = self
                     .sheet_names

@@ -94,7 +94,14 @@ impl InputHandler {
                 app.vim_reset_pending();
                 return;
             }
-            // Any other key cancels the pending 'g' and falls through normally.
+            // Unknown second key: cancel both the pending `g` AND any leading
+            // count, then re-dispatch the key so e.g. `5g?` opens Help instead
+            // of silently dropping the `?`. Without this clear, vim_count
+            // leaks into the next motion (`5g j` would move 5 rows).
+            app.vim_count = None;
+            app.vim_pending_op = None;
+            Self::handle_normal_mode(app, key, modifiers);
+            return;
         }
 
         // ----- Count-prefix accumulation -----
@@ -111,6 +118,17 @@ impl InputHandler {
 
         // ----- Pending operator (d/y/c waiting for a motion) -----
         if let Some(op) = pending_op {
+            // Any Ctrl/Alt/Meta-modified key is *never* a vim motion. Without
+            // this guard, holding Ctrl on an unknown letter (e.g. Ctrl+J)
+            // would silently execute `dj` even though the user clearly held a
+            // modifier. Cancel the pending op and re-dispatch so the Ctrl
+            // binding can fire normally.
+            if modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER) {
+                app.vim_pending_op = None;
+                app.vim_count = None;
+                Self::handle_normal_mode(app, key, modifiers);
+                return;
+            }
             match key {
                 // Line operations: dd, yy, cc
                 KeyCode::Char('d') if matches!(op, VimOperator::Delete) => {
@@ -190,8 +208,11 @@ impl InputHandler {
                     return;
                 }
                 _ => {
-                    // Unknown motion under pending op — cancel
+                    // Unknown motion under pending op — cancel and re-dispatch
+                    // so e.g. `d?` opens Help instead of silently swallowing
+                    // the `?`. pending_op is now None so we won't recurse here.
                     app.vim_reset_pending();
+                    Self::handle_normal_mode(app, key, modifiers);
                     return;
                 }
             }
@@ -986,13 +1007,13 @@ mod tests {
     }
 
     #[test]
-    fn agent_pending_d_then_question_drops_keystroke() {
+    fn agent_pending_d_then_question_opens_help() {
         let mut app = App::default();
         typestr(&mut app, "d");
         typestr(&mut app, "?");
         assert!(app.vim_pending_op.is_none());
-        assert!(matches!(app.mode, AppMode::Normal),
-            "BUG: `d?` cancels d but drops `?` — user expects Help, gets nothing.");
+        // After fix: `d?` cancels d and re-dispatches `?` so Help opens.
+        assert!(matches!(app.mode, AppMode::Help));
     }
 
     #[test]

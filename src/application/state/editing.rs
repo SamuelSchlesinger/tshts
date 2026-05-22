@@ -30,19 +30,21 @@ impl App {
 
     pub fn vim_open_row_below(&mut self) {
         let at = self.selected_row + 1;
+        let sheet_idx = self.workbook.active_sheet;
         // Route through the Workbook so cross-sheet refs to rows >= `at`
         // shift along with the same-sheet ones.
         self.workbook.insert_row_on_active(at);
+        self.record_action(UndoAction::RowInserted { sheet_idx, at });
         self.selected_row = at;
-        self.dirty = true;
         self.ensure_cursor_visible();
         self.start_editing();
     }
 
     pub fn vim_open_row_above(&mut self) {
         let at = self.selected_row;
+        let sheet_idx = self.workbook.active_sheet;
         self.workbook.insert_row_on_active(at);
-        self.dirty = true;
+        self.record_action(UndoAction::RowInserted { sheet_idx, at });
         self.ensure_cursor_visible();
         self.start_editing();
     }
@@ -63,6 +65,11 @@ impl App {
             EditExitDir::Down => {
                 if self.selected_row < self.workbook.current_sheet().rows - 1 {
                     self.selected_row += 1;
+                }
+            }
+            EditExitDir::Up => {
+                if self.selected_row > 0 {
+                    self.selected_row -= 1;
                 }
             }
             EditExitDir::Right => {
@@ -146,6 +153,20 @@ impl App {
 
     pub fn finish_editing_move_right(&mut self) {
         self.finish_editing_in_direction(EditExitDir::Right);
+    }
+
+    /// Commit the edit and move the cursor up — used by the Up arrow in
+    /// Editing mode, matching Excel/Sheets behavior where pressing Up
+    /// confirms the value and goes to the cell above.
+    pub fn finish_editing_move_up(&mut self) {
+        self.finish_editing_in_direction(EditExitDir::Up);
+    }
+
+    /// Commit the edit and move the cursor down — alias for `finish_editing`
+    /// for symmetry with the Up/Right variants. Provided so the Down arrow
+    /// path is self-documenting at the call site.
+    pub fn finish_editing_move_down(&mut self) {
+        self.finish_editing_in_direction(EditExitDir::Down);
     }
 
     pub fn cancel_editing(&mut self) {

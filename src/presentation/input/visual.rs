@@ -192,11 +192,10 @@ impl InputHandler {
                 app.vim_count = None;
             }
             KeyCode::Char(':') => { app.start_command_palette(); }
-            KeyCode::Char('q') => {
-                // Exit visual first, then request_quit (with dirty-check).
-                app.vim_exit_visual();
-                app.request_quit();
-            }
+            // `q` in real vim starts a macro recording; we don't support
+            // macros, so swallow it as a no-op. Previously this exited visual
+            // mode AND fired request_quit, which silently quit the app when a
+            // user pressed `q` after deleting a selection.
             KeyCode::Char(c) if c.is_ascii_digit() && !(c == '0' && app.vim_count.is_none()) => {
                 let d = c.to_digit(10).unwrap() as usize;
                 app.vim_count = Some(app.vim_count.unwrap_or(0) * 10 + d);
@@ -752,13 +751,14 @@ mod tests {
     }
 
     #[test]
-    fn agent_pending_d_then_v_cancels_pending_no_visual_mode() {
+    fn agent_pending_d_then_v_cancels_pending_and_enters_visual() {
         let mut app = App::default();
         typestr(&mut app, "d");
         assert_eq!(app.vim_pending_op, Some(VimOperator::Delete));
         typestr(&mut app, "v");
-        assert!(matches!(app.mode, AppMode::Normal),
-            "BUG: After pending d, `v` is silently dropped (mode={:?}).", app.mode);
+        // After fix: `d` cancels and re-dispatches `v` so visual mode opens
+        // instead of silently dropping the keystroke.
+        assert!(matches!(app.mode, AppMode::Visual { .. }));
         assert!(app.vim_pending_op.is_none());
     }
 
@@ -797,18 +797,15 @@ mod tests {
     }
 
     #[test]
-    fn agent_quit_q_in_visual_mode() {
+    fn agent_quit_q_in_visual_mode_is_noop() {
         let mut app = App::default();
-        // Enter visual cell mode
         typestr(&mut app, "v");
         assert!(matches!(app.mode, AppMode::Visual { .. }));
         typestr(&mut app, "q");
-        // Expect either request_quit (should_quit true OR ConfirmDiscard) — or
-        // documented no-op. Either way we record actual behavior.
-        // Clean state, so request_quit would set should_quit.
-        assert!(app.should_quit,
-            "BUG candidate: `q` in Visual mode does not quit. mode={:?} should_quit={}",
-            app.mode, app.should_quit);
+        // After fix: `q` in Visual is a no-op (vim treats it as macro-start;
+        // we don't support macros). Previously it silently quit the app.
+        assert!(!app.should_quit);
+        assert!(matches!(app.mode, AppMode::Visual { .. }));
     }
 
 }
