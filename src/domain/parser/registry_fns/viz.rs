@@ -45,7 +45,7 @@ mod tests {
         sheet.set_cell(0, 2, CellData { value: "10".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
 
         let registry = FunctionRegistry::new();
-        let evaluator = ExpressionEvaluator::new(&sheet, &registry);
+        let evaluator = ExpressionEvaluator::new(&sheet, &registry, None, None);
         let expr = Parser::new("SPARKLINE(A1:C1)").unwrap().parse().unwrap();
         let result = evaluator.evaluate(&expr);
         assert!(result.is_ok());
@@ -63,7 +63,7 @@ mod tests {
         sheet.set_cell(0, 2, CellData { value: "5".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
 
         let registry = FunctionRegistry::new();
-        let evaluator = ExpressionEvaluator::new(&sheet, &registry);
+        let evaluator = ExpressionEvaluator::new(&sheet, &registry, None, None);
         let expr = Parser::new("SPARKLINE(A1:C1)").unwrap().parse().unwrap();
         let result = evaluator.evaluate(&expr);
         assert!(result.is_ok());
@@ -84,7 +84,7 @@ mod tests {
         sheet.set_cell(0, 0, CellData { value: "7".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
 
         let registry = FunctionRegistry::new();
-        let evaluator = ExpressionEvaluator::new(&sheet, &registry);
+        let evaluator = ExpressionEvaluator::new(&sheet, &registry, None, None);
         let expr = Parser::new("SPARKLINE(A1)").unwrap().parse().unwrap();
         let result = evaluator.evaluate(&expr);
         assert!(result.is_ok());

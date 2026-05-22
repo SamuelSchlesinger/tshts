@@ -711,7 +711,7 @@ impl App {
                         let formula = agg_formula(k);
                         // Evaluate immediately so the cell shows its initial
                         // value; set_many will rebuild deps so it tracks.
-                        let evaluator = FormulaEvaluator::with_workbook(
+                        let evaluator = FormulaEvaluator::for_workbook(
                             &self.workbook,
                             self.workbook.current_sheet(),
                             &self.workbook.named_ranges,

@@ -16,31 +16,38 @@ pub struct FormulaEvaluator<'a> {
 }
 
 impl<'a> FormulaEvaluator<'a> {
+    /// Single-sheet evaluator. Cross-sheet refs return `#REF!` because no
+    /// workbook context is supplied; bare identifiers don't resolve because
+    /// no named-ranges map is supplied. Use the builder methods
+    /// `with_names` / `with_workbook` to enrich the context.
     pub fn new(spreadsheet: &'a Spreadsheet) -> Self {
         Self { spreadsheet, names: None, workbook: None }
     }
 
-    /// Variant that resolves bare identifiers via `names`.
-    pub fn with_names(
-        spreadsheet: &'a Spreadsheet,
-        names: &'a HashMap<String, String>,
-    ) -> Self {
-        Self { spreadsheet, names: Some(names), workbook: None }
+    /// Attach a named-ranges map to the evaluator. Bare identifiers in
+    /// formulas (e.g. `=Revenue + 10`) resolve through it.
+    pub fn with_names(mut self, names: &'a HashMap<String, String>) -> Self {
+        self.names = Some(names);
+        self
     }
 
-    /// Full-context variant that resolves both named ranges and cross-sheet
-    /// references. The `spreadsheet` argument is the "current" sheet for
-    /// unqualified refs; the workbook is consulted for `Sheet2!A1`.
-    pub fn with_workbook(
+    /// Attach a workbook handle to the evaluator. Sheet-qualified refs
+    /// (`Sheet2!A1`) and 3-D ranges (`Sheet1:Sheet3!A1`) resolve through it.
+    pub fn with_workbook(mut self, workbook: &'a Workbook) -> Self {
+        self.workbook = Some(workbook);
+        self
+    }
+
+    /// Convenience for the common "I have a workbook plus its named ranges"
+    /// case — equivalent to `new(sheet).with_names(...).with_workbook(...)`.
+    pub fn for_workbook(
         workbook: &'a Workbook,
         spreadsheet: &'a Spreadsheet,
         names: &'a HashMap<String, String>,
     ) -> Self {
-        Self {
-            spreadsheet,
-            names: Some(names),
-            workbook: Some(workbook),
-        }
+        FormulaEvaluator::new(spreadsheet)
+            .with_names(names)
+            .with_workbook(workbook)
     }
 
     /// Returns the evaluated result, "#ERROR" on failure, or `formula`
@@ -107,18 +114,15 @@ impl<'a> FormulaEvaluator<'a> {
             parser.parse()
         })?;
         let function_registry = FunctionRegistry::new();
-        let evaluator = match (self.workbook, self.names) {
-            (Some(wb), Some(names)) => ExpressionEvaluator::with_workbook(
-                wb,
-                self.spreadsheet,
-                &function_registry,
-                names,
-            ),
-            (None, Some(names)) => {
-                ExpressionEvaluator::with_names(self.spreadsheet, &function_registry, names)
-            }
-            _ => ExpressionEvaluator::new(self.spreadsheet, &function_registry),
-        };
+        // Single constructor takes all the optional context. Three-way fork
+        // collapsed — `parse_and_evaluate` no longer cares which subset of
+        // the context is present.
+        let evaluator = ExpressionEvaluator::new(
+            self.spreadsheet,
+            &function_registry,
+            self.names,
+            self.workbook,
+        );
         evaluator.evaluate(&ast)
     }
     
@@ -1358,7 +1362,7 @@ mod tests {
         let mut names = std::collections::HashMap::new();
         names.insert("MYRANGE".to_string(), "A1:A4".to_string());
         names.insert("X".to_string(), "A2".to_string());
-        let evaluator = FormulaEvaluator::with_names(&sheet, &names);
+        let evaluator = FormulaEvaluator::new(&sheet).with_names(&names);
         assert_eq!(evaluator.evaluate_formula("=SUM(myrange)"), "100");
         assert_eq!(evaluator.evaluate_formula("=x+1"), "21");
     }
@@ -1373,7 +1377,7 @@ mod tests {
         spill_anchor: None,
         });
         let names = wb.named_ranges.clone();
-        let evaluator = FormulaEvaluator::with_workbook(&wb, &wb.sheets[0], &names);
+        let evaluator = FormulaEvaluator::for_workbook(&wb, &wb.sheets[0], &names);
         assert_eq!(evaluator.evaluate_formula("=Data!A1"), "42");
         assert_eq!(evaluator.evaluate_formula("=Data!A1 + 8"), "50");
     }
@@ -1390,7 +1394,7 @@ mod tests {
             });
         }
         let names = wb.named_ranges.clone();
-        let evaluator = FormulaEvaluator::with_workbook(&wb, &wb.sheets[0], &names);
+        let evaluator = FormulaEvaluator::for_workbook(&wb, &wb.sheets[0], &names);
         assert_eq!(evaluator.evaluate_formula("=SUM(Sales!A1:A3)"), "60");
     }
 
@@ -1404,7 +1408,7 @@ mod tests {
         spill_anchor: None,
         });
         let names = wb.named_ranges.clone();
-        let evaluator = FormulaEvaluator::with_workbook(&wb, &wb.sheets[0], &names);
+        let evaluator = FormulaEvaluator::for_workbook(&wb, &wb.sheets[0], &names);
         assert_eq!(evaluator.evaluate_formula("='My Sheet'!A1"), "hello");
     }
 
@@ -1462,7 +1466,7 @@ mod tests {
             wb.sheets[i].set_cell(0, 0, CellData { value: v.to_string(), formula: None, format: None, comment: None, spill_anchor: None });
         }
         let names = wb.named_ranges.clone();
-        let ev = FormulaEvaluator::with_workbook(&wb, &wb.sheets[0], &names);
+        let ev = FormulaEvaluator::for_workbook(&wb, &wb.sheets[0], &names);
         // 'Sheet1':'Q Two'!A1 sums A1 across all three sheets.
         assert_eq!(ev.evaluate_formula("=SUM('Sheet1':'Q Two'!A1)"), "60");
     }
@@ -1487,7 +1491,7 @@ mod tests {
         spill_anchor: None,
         });
         let names = wb.named_ranges.clone();
-        let evaluator = FormulaEvaluator::with_workbook(&wb, &wb.sheets[0], &names);
+        let evaluator = FormulaEvaluator::for_workbook(&wb, &wb.sheets[0], &names);
         // SUM(Sheet1:Q3!A1) — sum of A1 across Sheet1, Q2, Q3
         assert_eq!(evaluator.evaluate_formula("=SUM(Sheet1:Q3!A1)"), "600");
     }
@@ -1683,7 +1687,7 @@ mod tests {
         // Manually register table column as a named range (what :table create does).
         wb.set_name("DATA[SCORE]", "B2:B3");
         let names = wb.named_ranges.clone();
-        let evaluator = FormulaEvaluator::with_workbook(&wb, &wb.sheets[0], &names);
+        let evaluator = FormulaEvaluator::for_workbook(&wb, &wb.sheets[0], &names);
         assert_eq!(evaluator.evaluate_formula("=SUM(Data[Score])"), "165");
         assert_eq!(evaluator.evaluate_formula("=AVERAGE(Data[Score])"), "82.5");
     }
@@ -1763,7 +1767,7 @@ mod tests {
         wb.set_name("DOUBLE", "LAMBDA(x, x*2)");
         wb.set_name("ADD", "LAMBDA(a, b, a+b)");
         let names = wb.named_ranges.clone();
-        let evaluator = FormulaEvaluator::with_workbook(&wb, &wb.sheets[0], &names);
+        let evaluator = FormulaEvaluator::for_workbook(&wb, &wb.sheets[0], &names);
         assert_eq!(evaluator.evaluate_formula("=DOUBLE(7)"), "14");
         assert_eq!(evaluator.evaluate_formula("=ADD(3, 4)"), "7");
         // Combined with LET.

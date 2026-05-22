@@ -93,7 +93,7 @@ impl App {
 
         if self.input.starts_with('=') {
             let names = self.workbook.named_ranges.clone();
-            let evaluator = FormulaEvaluator::with_workbook(
+            let evaluator = FormulaEvaluator::for_workbook(
                 &self.workbook,
                 self.workbook.current_sheet(),
                 &names,

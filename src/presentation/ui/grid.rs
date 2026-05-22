@@ -158,7 +158,7 @@ pub(super) fn validation_passes(app: &App, value: &str, predicate: &str) -> bool
     };
     let bound = predicate.replace('_', &token);
     let formula = format!("={}", bound);
-    let evaluator = crate::domain::FormulaEvaluator::with_workbook(
+    let evaluator = crate::domain::FormulaEvaluator::for_workbook(
         &app.workbook,
         app.workbook.current_sheet(),
         &app.workbook.named_ranges,

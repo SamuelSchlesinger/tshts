@@ -426,7 +426,7 @@ impl Workbook {
         // so the evaluator can borrow the workbook immutably.
         let qualified_refs: Vec<(Option<String>, usize, usize)> = {
             let names = self.named_ranges.clone();
-            let evaluator = FormulaEvaluator::with_workbook(
+            let evaluator = FormulaEvaluator::for_workbook(
                 self,
                 &self.sheets[sheet_idx],
                 &names,
@@ -522,7 +522,7 @@ impl Workbook {
                     };
                     let Some(formula) = cd.formula.clone() else { continue };
                     let evaluator =
-                        FormulaEvaluator::with_workbook(&snapshot, snap_sheet, &names);
+                        FormulaEvaluator::for_workbook(&snapshot, snap_sheet, &names);
                     evaluator.evaluate_formula(&formula)
                 };
                 // Update the snapshot first so downstream layers see it.

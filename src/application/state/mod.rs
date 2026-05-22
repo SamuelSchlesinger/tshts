@@ -441,7 +441,7 @@ impl App {
             let snap_sheet = &wb_snapshot.sheets[idx];
             for (row, col, formula) in cells {
                 let evaluator =
-                    FormulaEvaluator::with_workbook(&wb_snapshot, snap_sheet, &names);
+                    FormulaEvaluator::for_workbook(&wb_snapshot, snap_sheet, &names);
                 let value = evaluator.evaluate_formula(&formula);
                 let mut cd = sheet.get_cell(row, col);
                 cd.value = value;

@@ -16,41 +16,20 @@ pub struct ExpressionEvaluator<'a> {
 }
 
 impl<'a> ExpressionEvaluator<'a> {
-    pub fn new(spreadsheet: &'a Spreadsheet, function_registry: &'a FunctionRegistry) -> Self {
-        Self {
-            spreadsheet,
-            function_registry,
-            named_ranges: None,
-            workbook: None,
-            local_scope: std::cell::RefCell::new(Vec::new()),
-        }
-    }
-
-    pub fn with_names(
+    /// Single constructor — pass `None` for `names` and/or `workbook` when
+    /// the caller doesn't have them. Previously this was three near-identical
+    /// constructors that diverged only in which fields they set to `None`.
+    pub fn new(
         spreadsheet: &'a Spreadsheet,
         function_registry: &'a FunctionRegistry,
-        names: &'a HashMap<String, String>,
+        names: Option<&'a HashMap<String, String>>,
+        workbook: Option<&'a crate::domain::models::Workbook>,
     ) -> Self {
         Self {
             spreadsheet,
             function_registry,
-            named_ranges: Some(names),
-            workbook: None,
-            local_scope: std::cell::RefCell::new(Vec::new()),
-        }
-    }
-
-    pub fn with_workbook(
-        workbook: &'a crate::domain::models::Workbook,
-        spreadsheet: &'a Spreadsheet,
-        function_registry: &'a FunctionRegistry,
-        names: &'a HashMap<String, String>,
-    ) -> Self {
-        Self {
-            spreadsheet,
-            function_registry,
-            named_ranges: Some(names),
-            workbook: Some(workbook),
+            named_ranges: names,
+            workbook,
             local_scope: std::cell::RefCell::new(Vec::new()),
         }
     }
@@ -155,24 +134,10 @@ impl<'a> ExpressionEvaluator<'a> {
             }
 
             Expr::CellRef(cell_ref) => {
-                let parsed = crate::domain::models::Spreadsheet::parse_qualified_reference(cell_ref)
-                    .ok_or_else(|| format!("Invalid cell reference: {}", cell_ref))?;
-                let (sheet_opt, row, col, _, _) = parsed;
-                let sheet = if let Some(name) = sheet_opt {
-                    let wb = self.workbook.ok_or_else(|| {
-                        format!("Cross-sheet ref {} but no workbook context", cell_ref)
-                    })?;
-                    // Sheet names are case-insensitive (Excel convention),
-                    // and the lexer uppercases unquoted identifiers.
-                    let idx = wb
-                        .sheet_names
-                        .iter()
-                        .position(|n| n.eq_ignore_ascii_case(&name))
-                        .ok_or_else(|| format!("Unknown sheet: {}", name))?;
-                    &wb.sheets[idx]
-                } else {
-                    self.spreadsheet
-                };
+                let (sheet_opt, row, col, _, _) =
+                    crate::domain::models::Spreadsheet::parse_qualified_reference(cell_ref)
+                        .ok_or_else(|| format!("Invalid cell reference: {}", cell_ref))?;
+                let sheet = self.resolve_sheet(sheet_opt.as_deref())?;
                 let cell = sheet.get_cell(row, col);
                 if let Ok(num) = cell.value.parse::<f64>() {
                     Ok(Value::Number(num))
@@ -494,11 +459,9 @@ impl<'a> ExpressionEvaluator<'a> {
         }
         // Qualified `Sheet!A1` resolves through the workbook; unqualified
         // refs read the current sheet. Match Expr::CellRef semantics.
-        let parsed = Spreadsheet::parse_qualified_reference(&ref_text)
+        let (sheet_opt, row, col, _, _) = Spreadsheet::parse_qualified_reference(&ref_text)
             .ok_or_else(|| format!("INDIRECT: invalid reference: {}", ref_text))?;
-        let (sheet_opt, row, col, _, _) = parsed;
-        let sheet = self.resolve_sheet(sheet_opt.as_deref())
-            .ok_or_else(|| format!("INDIRECT: unknown sheet in {}", ref_text))?;
+        let sheet = self.resolve_sheet(sheet_opt.as_deref())?;
         let cell = sheet.get_cell(row, col);
         if let Ok(n) = cell.value.parse::<f64>() {
             Ok(Value::Number(n))
@@ -508,13 +471,42 @@ impl<'a> ExpressionEvaluator<'a> {
     }
 
     /// Map an optional sheet name (case-insensitive) to a `&Spreadsheet`.
-    /// Returns the current sheet for `None`. Returns `None` only if the name
-    /// is unknown in the workbook.
-    fn resolve_sheet(&self, sheet_name: Option<&str>) -> Option<&Spreadsheet> {
-        let Some(name) = sheet_name else { return Some(self.spreadsheet); };
-        let wb = self.workbook?;
-        let idx = wb.sheet_names.iter().position(|n| n.eq_ignore_ascii_case(name))?;
-        Some(&wb.sheets[idx])
+    /// Returns the current sheet for `None`. Returns `Err` with a typed
+    /// message when the name is unknown (or no workbook is in scope).
+    /// The single point where the dual "workbook-present / workbook-absent"
+    /// modes are handled — every cross-sheet ref path funnels through here
+    /// so the conditional doesn't have to be repeated at every call site.
+    fn resolve_sheet(&self, sheet_name: Option<&str>) -> Result<&Spreadsheet, String> {
+        let Some(name) = sheet_name else { return Ok(self.spreadsheet); };
+        let wb = self
+            .workbook
+            .ok_or_else(|| format!("Cross-sheet ref to '{}' requires workbook context", name))?;
+        let idx = wb
+            .sheet_names
+            .iter()
+            .position(|n| n.eq_ignore_ascii_case(name))
+            .ok_or_else(|| format!("Unknown sheet: {}", name))?;
+        Ok(&wb.sheets[idx])
+    }
+
+    /// Walk a Sheet1:Sheet3 range and produce every sheet in `[lo..=hi]`.
+    /// Errors if either endpoint is unknown or no workbook is in scope.
+    fn resolve_3d_range(&self, s1: &str, s2: &str) -> Result<Vec<&Spreadsheet>, String> {
+        let wb = self
+            .workbook
+            .ok_or_else(|| format!("3-D range '{}:{}' requires workbook context", s1, s2))?;
+        let i1 = wb
+            .sheet_names
+            .iter()
+            .position(|n| n.eq_ignore_ascii_case(s1))
+            .ok_or_else(|| format!("Unknown sheet: {}", s1))?;
+        let i2 = wb
+            .sheet_names
+            .iter()
+            .position(|n| n.eq_ignore_ascii_case(s2))
+            .ok_or_else(|| format!("Unknown sheet: {}", s2))?;
+        let (lo, hi) = if i1 <= i2 { (i1, i2) } else { (i2, i1) };
+        Ok(wb.sheets[lo..=hi].iter().collect())
     }
 
     /// OFFSET(base, rows, cols, [height], [width]) → value or range starting
@@ -543,8 +535,7 @@ impl<'a> ExpressionEvaluator<'a> {
             }
             _ => return Err("OFFSET: base must be a cell ref".to_string()),
         };
-        let sheet = self.resolve_sheet(base_sheet.as_deref())
-            .ok_or_else(|| format!("OFFSET: unknown sheet: {}", base_sheet.unwrap_or_default()))?;
+        let sheet = self.resolve_sheet(base_sheet.as_deref())?;
         let row_off = self.evaluate(&args[1])?.to_number() as i64;
         let col_off = self.evaluate(&args[2])?.to_number() as i64;
         let height = args
@@ -626,26 +617,13 @@ impl<'a> ExpressionEvaluator<'a> {
                     if let Some((s1, s2, cell)) =
                         crate::domain::models::Spreadsheet::parse_three_d_marker(start_cell)
                     {
-                        let wb = self.workbook.ok_or_else(|| {
-                            "3-D range needs workbook context".to_string()
-                        })?;
-                        let i1 = wb
-                            .sheet_names
-                            .iter()
-                            .position(|n| n.eq_ignore_ascii_case(&s1))
-                            .ok_or_else(|| format!("Unknown sheet: {}", s1))?;
-                        let i2 = wb
-                            .sheet_names
-                            .iter()
-                            .position(|n| n.eq_ignore_ascii_case(&s2))
-                            .ok_or_else(|| format!("Unknown sheet: {}", s2))?;
-                        let (lo, hi) = if i1 <= i2 { (i1, i2) } else { (i2, i1) };
+                        let sheets = self.resolve_3d_range(&s1, &s2)?;
                         let (row, col) =
                             crate::domain::models::Spreadsheet::parse_cell_reference(&cell)
                                 .ok_or_else(|| format!("Invalid cell: {}", cell))?;
-                        let mut list = Vec::new();
-                        for i in lo..=hi {
-                            let c = wb.sheets[i].get_cell(row, col);
+                        let mut list = Vec::with_capacity(sheets.len());
+                        for sheet in sheets {
+                            let c = sheet.get_cell(row, col);
                             if let Ok(n) = c.value.parse::<f64>() {
                                 list.push(Value::Number(n));
                             } else {
@@ -661,19 +639,7 @@ impl<'a> ExpressionEvaluator<'a> {
                         .ok_or_else(|| format!("Invalid cell reference: {}", start_cell))?;
                     let ep = crate::domain::models::Spreadsheet::parse_qualified_reference(end_cell)
                         .ok_or_else(|| format!("Invalid cell reference: {}", end_cell))?;
-                    let sheet = if let Some(name) = &sp.0 {
-                        let wb = self.workbook.ok_or_else(|| {
-                            "Cross-sheet range needs workbook context".to_string()
-                        })?;
-                        let idx = wb
-                            .sheet_names
-                            .iter()
-                            .position(|n| n.eq_ignore_ascii_case(name))
-                            .ok_or_else(|| format!("Unknown sheet: {}", name))?;
-                        &wb.sheets[idx]
-                    } else {
-                        self.spreadsheet
-                    };
+                    let sheet = self.resolve_sheet(sp.0.as_deref())?;
                     let start = (sp.1, sp.2);
                     let end = (ep.1, ep.2);
                     let r0 = start.0.min(end.0);
@@ -726,7 +692,7 @@ mod tests {
     fn test_expression_evaluator_numbers() {
         let sheet = create_test_spreadsheet();
         let registry = FunctionRegistry::new();
-        let evaluator = ExpressionEvaluator::new(&sheet, &registry);
+        let evaluator = ExpressionEvaluator::new(&sheet, &registry, None, None);
         
         let expr = Expr::Number(42.5);
         match evaluator.evaluate(&expr).unwrap() {
@@ -745,7 +711,7 @@ mod tests {
     fn test_expression_evaluator_cell_refs() {
         let sheet = create_test_spreadsheet();
         let registry = FunctionRegistry::new();
-        let evaluator = ExpressionEvaluator::new(&sheet, &registry);
+        let evaluator = ExpressionEvaluator::new(&sheet, &registry, None, None);
         
         let expr = Expr::CellRef("A1".to_string());
         match evaluator.evaluate(&expr).unwrap() {
@@ -768,7 +734,7 @@ mod tests {
         sheet.set_cell(0, 2, CellData { value: "123".to_string(), formula: None, format: None, comment: None, spill_anchor: None }); // Number as string
         
         let registry = FunctionRegistry::new();
-        let evaluator = ExpressionEvaluator::new(&sheet, &registry);
+        let evaluator = ExpressionEvaluator::new(&sheet, &registry, None, None);
         
         // String cell reference
         let expr = Expr::CellRef("A1".to_string());
@@ -789,7 +755,7 @@ mod tests {
     fn test_expression_evaluator_binary_ops() {
         let sheet = create_test_spreadsheet();
         let registry = FunctionRegistry::new();
-        let evaluator = ExpressionEvaluator::new(&sheet, &registry);
+        let evaluator = ExpressionEvaluator::new(&sheet, &registry, None, None);
         
         let expr = Expr::Binary {
             left: Box::new(Expr::Number(10.0)),
@@ -816,7 +782,7 @@ mod tests {
     fn test_expression_evaluator_unary_ops() {
         let sheet = create_test_spreadsheet();
         let registry = FunctionRegistry::new();
-        let evaluator = ExpressionEvaluator::new(&sheet, &registry);
+        let evaluator = ExpressionEvaluator::new(&sheet, &registry, None, None);
         
         let expr = Expr::Unary {
             operator: UnaryOp::Minus,
@@ -842,7 +808,7 @@ mod tests {
     fn test_expression_evaluator_functions() {
         let sheet = create_test_spreadsheet();
         let registry = FunctionRegistry::new();
-        let evaluator = ExpressionEvaluator::new(&sheet, &registry);
+        let evaluator = ExpressionEvaluator::new(&sheet, &registry, None, None);
         
         let expr = Expr::FunctionCall {
             name: "SUM".to_string(),
@@ -874,7 +840,7 @@ mod tests {
     fn test_expression_evaluator_string_functions() {
         let sheet = create_test_spreadsheet();
         let registry = FunctionRegistry::new();
-        let evaluator = ExpressionEvaluator::new(&sheet, &registry);
+        let evaluator = ExpressionEvaluator::new(&sheet, &registry, None, None);
         
         // Test CONCAT function
         let expr = Expr::FunctionCall {
@@ -941,7 +907,7 @@ mod tests {
     fn test_expression_evaluator_string_concatenation() {
         let sheet = create_test_spreadsheet();
         let registry = FunctionRegistry::new();
-        let evaluator = ExpressionEvaluator::new(&sheet, &registry);
+        let evaluator = ExpressionEvaluator::new(&sheet, &registry, None, None);
         
         let expr = Expr::Binary {
             left: Box::new(Expr::String("Hello".to_string())),
@@ -969,7 +935,7 @@ mod tests {
     fn test_expression_evaluator_string_equality() {
         let sheet = create_test_spreadsheet();
         let registry = FunctionRegistry::new();
-        let evaluator = ExpressionEvaluator::new(&sheet, &registry);
+        let evaluator = ExpressionEvaluator::new(&sheet, &registry, None, None);
         
         // String equality
         let expr = Expr::Binary {
@@ -998,7 +964,7 @@ mod tests {
     fn test_expression_evaluator_ranges() {
         let sheet = create_test_spreadsheet();
         let registry = FunctionRegistry::new();
-        let evaluator = ExpressionEvaluator::new(&sheet, &registry);
+        let evaluator = ExpressionEvaluator::new(&sheet, &registry, None, None);
         
         let expr = Expr::FunctionCall {
             name: "SUM".to_string(),
@@ -1058,7 +1024,7 @@ mod tests {
     fn test_complex_expression_parsing_and_evaluation() {
         let sheet = create_test_spreadsheet();
         let registry = FunctionRegistry::new();
-        let evaluator = ExpressionEvaluator::new(&sheet, &registry);
+        let evaluator = ExpressionEvaluator::new(&sheet, &registry, None, None);
         
         // Test complex expression: IF(SUM(A1:B1) > 25, MAX(A1:C1), MIN(A1:C1))
         let mut parser = Parser::new("IF(SUM(A1:B1) > 25, MAX(A1:C1), MIN(A1:C1))").unwrap();
@@ -1094,7 +1060,7 @@ mod tests {
     fn test_error_handling() {
         let sheet = create_test_spreadsheet();
         let registry = FunctionRegistry::new();
-        let evaluator = ExpressionEvaluator::new(&sheet, &registry);
+        let evaluator = ExpressionEvaluator::new(&sheet, &registry, None, None);
         
         // Division by zero now yields a typed Value::Error(Div0).
         let expr = Expr::Binary {

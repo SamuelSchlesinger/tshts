@@ -228,11 +228,12 @@ impl Spreadsheet {
             Err(_) => return,
         };
         let registry = FunctionRegistry::new();
-        let evaluator = if self.named_ranges.is_empty() {
-            ExpressionEvaluator::new(self, &registry)
+        let names = if self.named_ranges.is_empty() {
+            None
         } else {
-            ExpressionEvaluator::with_names(self, &registry, &self.named_ranges)
+            Some(&self.named_ranges)
         };
+        let evaluator = ExpressionEvaluator::new(self, &registry, names, None);
         let value = match evaluator.evaluate(&ast) {
             Ok(v) => v,
             Err(_) => return,
@@ -325,7 +326,7 @@ impl Spreadsheet {
         let evaluator = if self.named_ranges.is_empty() {
             FormulaEvaluator::new(self)
         } else {
-            FormulaEvaluator::with_names(self, &self.named_ranges)
+            FormulaEvaluator::new(self).with_names(&self.named_ranges)
         };
         let dependencies = evaluator.extract_cell_references(formula);
         let cell_pos = (row, col);
@@ -543,7 +544,7 @@ impl Spreadsheet {
                 let evaluator = if self.named_ranges.is_empty() {
                     FormulaEvaluator::new(self)
                 } else {
-                    FormulaEvaluator::with_names(self, &self.named_ranges)
+                    FormulaEvaluator::new(self).with_names(&self.named_ranges)
                 };
                 let new_value = evaluator.evaluate_formula(formula);
                 let mut updated_cell = cell;
@@ -1021,7 +1022,7 @@ impl Spreadsheet {
             let evaluator = if self.named_ranges.is_empty() {
                 FormulaEvaluator::new(self)
             } else {
-                FormulaEvaluator::with_names(self, &self.named_ranges)
+                FormulaEvaluator::new(self).with_names(&self.named_ranges)
             };
             let v = evaluator.evaluate_formula(&formula);
             let truthy = match v.as_str() {
