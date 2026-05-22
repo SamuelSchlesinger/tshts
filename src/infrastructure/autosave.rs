@@ -72,7 +72,10 @@ pub fn is_enabled() -> bool {
 /// once per dirtying action; the autosave thread waits for the idle window
 /// before writing.
 pub fn mark_dirty() {
-    *inner().last_mark.lock().unwrap() = Some(Instant::now());
+    *inner()
+        .last_mark
+        .lock()
+        .expect("autosave last_mark mutex poisoned") = Some(Instant::now());
 }
 
 /// Called from the main loop each tick. If autosave is enabled, the workbook
@@ -84,7 +87,10 @@ pub fn maybe_save(workbook: &Workbook, filename: Option<&str>) -> bool {
         return false;
     }
     let Some(filename) = filename else { return false; };
-    let mut guard = i.last_mark.lock().unwrap();
+    let mut guard = i
+        .last_mark
+        .lock()
+        .expect("autosave last_mark mutex poisoned");
     let Some(when) = *guard else { return false; };
     if when.elapsed() < IDLE {
         return false;

@@ -13,7 +13,7 @@ impl Lexer {
     /// Creates a new lexer for the given input string.
     pub fn new(input: &str) -> Self {
         let chars: Vec<char> = input.chars().collect();
-        let current_char = chars.get(0).copied();
+        let current_char = chars.first().copied();
         
         Self {
             input: chars,
@@ -179,6 +179,40 @@ impl Lexer {
     }
     
     /// Gets the next token from the input.
+    /// Match the longest known Excel error literal starting at the current
+    /// `#`. Longest-first ordering matters: `#DIV/0!` must be tried before
+    /// any potential shorter prefix collisions. Returns Err if `#` is
+    /// followed by something we don't recognize so callers see a clean
+    /// parse error instead of mis-tokenizing.
+    fn read_error_literal(&mut self) -> Result<Token, String> {
+        // Build the remaining slice from the current position so we can
+        // do simple prefix matching. The input is Vec<char>, so we collect
+        // a temporary String — error literals are short (max 7 chars) so
+        // this stays cheap.
+        let rest: String = self.input[self.position..].iter().collect();
+        // (literal_str, kind). Order longest-first so e.g. `#NULL!` can't
+        // be mis-matched as a hypothetical prefix.
+        const LITERALS: &[(&str, ErrorKind)] = &[
+            ("#DIV/0!", ErrorKind::Div0),
+            ("#VALUE!", ErrorKind::Value),
+            ("#SPILL!", ErrorKind::Spill),
+            ("#NAME?", ErrorKind::Name),
+            ("#NULL!", ErrorKind::Null),
+            ("#REF!", ErrorKind::Ref),
+            ("#NUM!", ErrorKind::Num),
+            ("#N/A", ErrorKind::NA),
+        ];
+        for (lit, kind) in LITERALS {
+            if rest.starts_with(lit) {
+                for _ in 0..lit.chars().count() {
+                    self.advance();
+                }
+                return Ok(Token::ErrorLit(*kind));
+            }
+        }
+        Err(format!("Unrecognized error literal after '#': {}", rest))
+    }
+
     pub fn next_token(&mut self) -> Result<Token, String> {
         self.skip_whitespace();
         
@@ -338,6 +372,13 @@ impl Lexer {
                     Ok(Token::String(string_value))
                 }
 
+                // Excel-style error literals: `#REF!`, `#N/A`, `#DIV/0!`, etc.
+                // These are first-class expressions — they evaluate to
+                // Value::Error and propagate through arithmetic the same way
+                // a #DIV/0! produced at runtime would. The lexer matches the
+                // longest known literal greedily.
+                '#' => self.read_error_literal(),
+
                 _ => Err(format!("Unexpected character: '{}'", ch)),
             }
         }
@@ -349,6 +390,37 @@ mod tests {
     use super::*;
     use crate::domain::{Spreadsheet, CellData, FormulaEvaluator};
     use crate::domain::parser::*;
+
+    #[test]
+    fn test_lexer_error_literals() {
+        // All Excel error literals tokenize cleanly. Longest-match-first
+        // matters for `#DIV/0!` and `#N/A` (which contain `/`).
+        let mut lexer = Lexer::new("#REF! #N/A #DIV/0! #VALUE! #NAME? #NUM! #NULL! #SPILL!");
+        assert_eq!(lexer.next_token().unwrap(), Token::ErrorLit(ErrorKind::Ref));
+        assert_eq!(lexer.next_token().unwrap(), Token::ErrorLit(ErrorKind::NA));
+        assert_eq!(lexer.next_token().unwrap(), Token::ErrorLit(ErrorKind::Div0));
+        assert_eq!(lexer.next_token().unwrap(), Token::ErrorLit(ErrorKind::Value));
+        assert_eq!(lexer.next_token().unwrap(), Token::ErrorLit(ErrorKind::Name));
+        assert_eq!(lexer.next_token().unwrap(), Token::ErrorLit(ErrorKind::Num));
+        assert_eq!(lexer.next_token().unwrap(), Token::ErrorLit(ErrorKind::Null));
+        assert_eq!(lexer.next_token().unwrap(), Token::ErrorLit(ErrorKind::Spill));
+        assert_eq!(lexer.next_token().unwrap(), Token::Eof);
+    }
+
+    #[test]
+    fn test_lexer_error_literal_in_expression() {
+        // Errors compose: `#REF!+1` lexes as three tokens, not one.
+        let mut lexer = Lexer::new("#REF!+1");
+        assert_eq!(lexer.next_token().unwrap(), Token::ErrorLit(ErrorKind::Ref));
+        assert_eq!(lexer.next_token().unwrap(), Token::Plus);
+        assert_eq!(lexer.next_token().unwrap(), Token::Number(1.0));
+    }
+
+    #[test]
+    fn test_lexer_unknown_hash_literal_errors() {
+        let mut lexer = Lexer::new("#NOTREAL!");
+        assert!(lexer.next_token().is_err());
+    }
 
     #[test]
     fn test_lexer_numbers() {

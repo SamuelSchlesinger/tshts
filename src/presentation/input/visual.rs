@@ -80,7 +80,6 @@ impl InputHandler {
             KeyCode::Esc => {
                 app.vim_exit_visual();
                 app.dismiss_transients();
-                return;
             }
             KeyCode::Char('v') => {
                 // Toggle: in Cell visual `v` exits; from Row/Block it swaps
@@ -98,7 +97,6 @@ impl InputHandler {
                     app.selected_col = cursor.1;
                     app.update_selection(cursor.0, cursor.1);
                 }
-                return;
             }
             KeyCode::Char('V') => {
                 if matches!(kind, VisualKind::Row) {
@@ -114,7 +112,6 @@ impl InputHandler {
                     let last_col = app.workbook.current_sheet().cols.saturating_sub(1);
                     app.selection_end = Some((cursor_row, last_col));
                 }
-                return;
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 for _ in 0..take_count {
@@ -199,7 +196,6 @@ impl InputHandler {
                 // Exit visual first, then request_quit (with dirty-check).
                 app.vim_exit_visual();
                 app.request_quit();
-                return;
             }
             KeyCode::Char(c) if c.is_ascii_digit() && !(c == '0' && app.vim_count.is_none()) => {
                 let d = c.to_digit(10).unwrap() as usize;

@@ -17,27 +17,23 @@ impl InputHandler {
             KeyCode::Esc => {
                 app.cancel_editing();
             }
-            KeyCode::Backspace => {
-                if app.cursor_position > 0 {
+            KeyCode::Backspace
+                if app.cursor_position > 0 => {
                     app.input.remove(char_to_byte_pos(&app.input, app.cursor_position - 1));
                     app.cursor_position -= 1;
                 }
-            }
-            KeyCode::Delete => {
-                if app.cursor_position < char_count(&app.input) {
+            KeyCode::Delete
+                if app.cursor_position < char_count(&app.input) => {
                     app.input.remove(char_to_byte_pos(&app.input, app.cursor_position));
                 }
-            }
-            KeyCode::Left => {
-                if app.cursor_position > 0 {
+            KeyCode::Left
+                if app.cursor_position > 0 => {
                     app.cursor_position -= 1;
                 }
-            }
-            KeyCode::Right => {
-                if app.cursor_position < char_count(&app.input) {
+            KeyCode::Right
+                if app.cursor_position < char_count(&app.input) => {
                     app.cursor_position += 1;
                 }
-            }
             KeyCode::Home => {
                 app.cursor_position = 0;
             }

@@ -71,7 +71,8 @@ pub fn write(cells: Vec<(usize, usize, CellData)>, source_row: usize, source_col
             let _ = std::fs::remove_file(&path);
             return;
         }
-        let _ = std::fs::write(&path, json);
+        let Some(path_str) = path.to_str() else { return; };
+        let _ = crate::infrastructure::atomic::atomic_write(path_str, json.as_bytes());
     }
 }
 

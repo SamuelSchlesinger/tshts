@@ -134,7 +134,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
             let serial = args[0].to_number().floor() as i64;
             let ty = args.get(1).map(|v| v.to_number() as i64).unwrap_or(1);
             // 1899-12-30 (serial 0) was a Saturday → (0 + 6) % 7 = 6 (Sat in 0-based Mon=0).
-            let mon_based = ((serial + 5).rem_euclid(7)) as i64; // Mon=0..Sun=6
+            let mon_based = (serial + 5).rem_euclid(7); // Mon=0..Sun=6
             let v = match ty {
                 1 => ((mon_based + 1) % 7) + 1, // Sun=1..Sat=7
                 2 => mon_based + 1,             // Mon=1..Sun=7
@@ -236,8 +236,8 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
             }
             // M/D/YYYY (US-ish)
             let parts: Vec<&str> = s.split('/').collect();
-            if parts.len() == 3 {
-                if let (Ok(m), Ok(d), Ok(y)) = (
+            if parts.len() == 3
+                && let (Ok(m), Ok(d), Ok(y)) = (
                     parts[0].parse::<u32>(),
                     parts[1].parse::<u32>(),
                     parts[2].parse::<i32>(),
@@ -245,7 +245,6 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
                     let year = if y < 100 { 2000 + y } else { y };
                     return Ok(Value::Number(date_to_serial(year, m, d)));
                 }
-            }
             Ok(Value::Error(ErrorKind::Value))
         });
         reg.register_function("TIMEVALUE", |args| {

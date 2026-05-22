@@ -82,7 +82,6 @@ where
 /// assert_eq!(evaluator.evaluate_formula("=2+3*4"), "14");
 /// assert_eq!(evaluator.evaluate_formula("=AND(1>0, 2<5)"), "1");
 /// ```
-
 // Submodules.
 mod evaluator;
 mod autofill_pattern;

@@ -99,8 +99,8 @@ impl InputHandler {
 
         // ----- Count-prefix accumulation -----
         // Digits (other than a leading 0) build up a count.
-        if let KeyCode::Char(c) = key {
-            if c.is_ascii_digit() {
+        if let KeyCode::Char(c) = key
+            && c.is_ascii_digit() {
                 let d = c.to_digit(10).unwrap() as usize;
                 // '0' at the start is the row-start motion, not a count.
                 if !(d == 0 && app.vim_count.is_none()) {
@@ -108,7 +108,6 @@ impl InputHandler {
                     return;
                 }
             }
-        }
 
         // ----- Pending operator (d/y/c waiting for a motion) -----
         if let Some(op) = pending_op {
@@ -1132,6 +1131,28 @@ mod tests {
         assert_eq!(cb.source_col, 0);
         // No data changed
         assert_eq!(app.workbook.current_sheet().get_cell(0, 0).value, "r0c0");
+    }
+
+    #[test]
+    fn esc_after_d_then_y_does_not_inherit_delete() {
+        // d-Esc-y must not delete: the Esc cancels the pending delete and
+        // the y starts fresh as a yank operator. Regression test for the
+        // claim that Esc leaves vim_pending_op set.
+        let mut app = App::default();
+        app.workbook.current_sheet_mut().rows = 5;
+        fill_col(&mut app, 0, 3);
+        let original = app.workbook.current_sheet().get_cell(0, 0).value.clone();
+        typestr(&mut app, "d");
+        assert!(app.vim_pending_op.is_some(), "d should leave a pending delete");
+        key(&mut app, KeyCode::Esc);
+        assert!(app.vim_pending_op.is_none(), "Esc must clear the pending operator");
+        typestr(&mut app, "yy");
+        // The cell must still have its original value — yy yanks, doesn't delete.
+        assert_eq!(
+            app.workbook.current_sheet().get_cell(0, 0).value,
+            original,
+            "yy after d-Esc must yank, not inherit the cancelled delete"
+        );
     }
 
     #[test]

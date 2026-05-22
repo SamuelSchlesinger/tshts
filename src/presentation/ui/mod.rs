@@ -102,7 +102,7 @@ pub fn render_ui(f: &mut Frame, app: &mut App) {
     if matches!(app.mode, AppMode::LoadFile) {
         render_recent_files(f, chunks[4]);
     }
-    if let Some(_) = &app.chart_popup {
+    if app.chart_popup.is_some() {
         render_chart_popup(f, app);
     }
 }

@@ -11,6 +11,7 @@ impl App {
             self.scroll_row = 0;
             self.scroll_col = 0;
             self.clear_selection();
+            self.invalidate_cross_sheet_state();
             self.status_message = Some(format!("Sheet: {}", self.workbook.sheet_names[self.workbook.active_sheet]));
         }
     }
@@ -23,8 +24,19 @@ impl App {
             self.scroll_row = 0;
             self.scroll_col = 0;
             self.clear_selection();
+            self.invalidate_cross_sheet_state();
             self.status_message = Some(format!("Sheet: {}", self.workbook.sheet_names[self.workbook.active_sheet]));
         }
+    }
+
+    /// Drop per-sheet state that would be misleading on the new sheet:
+    /// search results are stored as (row, col) only, so following them with
+    /// n/N after a sheet switch would jump to phantom cells.
+    pub(crate) fn invalidate_cross_sheet_state(&mut self) {
+        self.search_results.clear();
+        self.search_result_index = 0;
+        self.find_replace_results.clear();
+        self.find_replace_index = 0;
     }
 
     pub fn jump_to_home(&mut self) {

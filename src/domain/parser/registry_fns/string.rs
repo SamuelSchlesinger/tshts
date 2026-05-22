@@ -236,7 +236,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
             }
         });
         reg.register_function("TEXT", |args| {
-            if args.len() < 1 || args.len() > 2 {
+            if args.is_empty() || args.len() > 2 {
                 Err("TEXT requires 1 or 2 arguments".to_string())
             } else {
                 Ok(Value::String(args[0].to_string()))

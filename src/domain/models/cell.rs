@@ -7,6 +7,7 @@ use super::*;
 
 /// Represents the data contained within a single spreadsheet cell.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct CellData {
     /// The display value of the cell (either user input or formula result)
     pub value: String,
@@ -23,17 +24,6 @@ pub struct CellData {
     pub spill_anchor: Option<(usize, usize)>,
 }
 
-impl Default for CellData {
-    fn default() -> Self {
-        Self {
-            value: String::new(),
-            formula: None,
-            format: None,
-            comment: None,
-            spill_anchor: None,
-        }
-    }
-}
 
 impl CellData {
     /// True if this cell is a spill ghost (derived from another cell's

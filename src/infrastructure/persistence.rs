@@ -1,6 +1,7 @@
 //! JSON serialization for Workbook/Spreadsheet.
 
 use crate::domain::{Spreadsheet, Workbook};
+use crate::infrastructure::atomic::atomic_write;
 use std::fs;
 
 pub struct FileRepository;
@@ -11,7 +12,7 @@ impl FileRepository {
     pub fn save_spreadsheet(spreadsheet: &Spreadsheet, filename: &str) -> Result<String, String> {
         match serde_json::to_string_pretty(spreadsheet) {
             Ok(json) => {
-                match fs::write(filename, &json) {
+                match atomic_write(filename, json.as_bytes()) {
                     Ok(_) => Ok(filename.to_string()),
                     Err(e) => Err(e.to_string()),
                 }
@@ -41,7 +42,7 @@ impl FileRepository {
     pub fn save_workbook(workbook: &Workbook, filename: &str) -> Result<String, String> {
         match serde_json::to_string_pretty(workbook) {
             Ok(json) => {
-                match fs::write(filename, &json) {
+                match atomic_write(filename, json.as_bytes()) {
                     Ok(_) => Ok(filename.to_string()),
                     Err(e) => Err(e.to_string()),
                 }
@@ -57,9 +58,30 @@ impl FileRepository {
             Ok(content) => {
                 // Try workbook format first
                 if let Ok(mut workbook) = serde_json::from_str::<Workbook>(&content) {
+                    // Refuse a file written by a future incompatible version
+                    // rather than silently loading partial state.
+                    if workbook.version > crate::domain::models::WORKBOOK_SCHEMA_VERSION {
+                        return Err(format!(
+                            "Workbook schema version {} is newer than this build understands ({}). \
+                             Update tshts to open this file.",
+                            workbook.version,
+                            crate::domain::models::WORKBOOK_SCHEMA_VERSION
+                        ));
+                    }
                     // Validate invariants: a file with `active_sheet` past
                     // `sheets.len()` or mismatched `sheet_names.len()` would
-                    // panic on the first UI read. Clamp + pad here.
+                    // panic on the first UI read. The order here matters:
+                    // an empty-sheets file gets a single default Sheet1 BEFORE
+                    // any sheet-relative bookkeeping, so the later clamps run
+                    // against a non-degenerate state. We preserve the loaded
+                    // `named_ranges`, `version`, etc. — only the sheets and
+                    // sheet_names arrays are reset.
+                    if workbook.sheets.is_empty() {
+                        workbook.sheets.push(Spreadsheet::default());
+                        workbook.sheet_names.clear();
+                        workbook.sheet_names.push("Sheet1".to_string());
+                        workbook.active_sheet = 0;
+                    }
                     if workbook.sheet_names.len() < workbook.sheets.len() {
                         let needed = workbook.sheets.len() - workbook.sheet_names.len();
                         for i in 0..needed {
@@ -69,10 +91,6 @@ impl FileRepository {
                         }
                     } else if workbook.sheet_names.len() > workbook.sheets.len() {
                         workbook.sheet_names.truncate(workbook.sheets.len());
-                    }
-                    if workbook.sheets.is_empty() {
-                        // Pathological: empty sheets array. Replace with default.
-                        workbook = Workbook::default();
                     }
                     if workbook.active_sheet >= workbook.sheets.len() {
                         workbook.active_sheet = 0;

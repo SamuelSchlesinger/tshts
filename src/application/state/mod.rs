@@ -452,6 +452,16 @@ impl App {
         }
     }
 
+    /// Run register_cross_sheet_deps + propagate_cross_sheet_changes for
+    /// `(row, col)` on the active sheet. Use this from any mutation path
+    /// that writes/clears a cell without going through set_cell_with_undo /
+    /// clear_cell_with_undo, so cross-sheet dependents stay coherent.
+    pub(crate) fn propagate_cell_change(&mut self, row: usize, col: usize) {
+        let sheet_name = self.workbook.sheet_names[self.workbook.active_sheet].clone();
+        self.workbook.register_cross_sheet_deps(&sheet_name, row, col);
+        self.workbook.propagate_cross_sheet_changes(&sheet_name, row, col);
+    }
+
     fn apply_undo(&mut self, action: &UndoAction) {
         match action {
             UndoAction::CellModified { row, col, old_cell, new_cell: _ } => {
@@ -460,6 +470,9 @@ impl App {
                 } else {
                     self.workbook.current_sheet_mut().clear_cell(*row, *col);
                 }
+                // Cross-sheet listeners need to recalc against the restored
+                // value just as they would for a forward write.
+                self.propagate_cell_change(*row, *col);
             }
             UndoAction::Batch(actions) => {
                 // Undo in reverse order
@@ -486,6 +499,7 @@ impl App {
                 } else {
                     self.workbook.current_sheet_mut().clear_cell(*row, *col);
                 }
+                self.propagate_cell_change(*row, *col);
             }
             UndoAction::Batch(actions) => {
                 for a in actions {
@@ -549,7 +563,7 @@ impl App {
         } else {
             None
         };
-        
+
         // Record the action
         let action = UndoAction::CellModified {
             row,
@@ -566,9 +580,33 @@ impl App {
         // Workbook-level cross-sheet dep maintenance: register this cell's
         // (new) dependencies, then propagate changes to anything that
         // depended on its old value.
-        let sheet_name = self.workbook.sheet_names[self.workbook.active_sheet].clone();
-        self.workbook.register_cross_sheet_deps(&sheet_name, row, col);
-        self.workbook.propagate_cross_sheet_changes(&sheet_name, row, col);
+        self.propagate_cell_change(row, col);
+    }
+
+    /// Write many cells as a single undo-able action. Use for bulk writes
+    /// like pivot table generation where per-cell undo entries would force
+    /// the user to press `u` dozens of times to back out one logical action.
+    pub fn set_many_with_undo(&mut self, cells: Vec<(usize, usize, CellData)>) {
+        if cells.is_empty() {
+            return;
+        }
+        let mut batch = Vec::with_capacity(cells.len());
+        for (row, col, new_data) in cells {
+            let old_cell = if self.workbook.current_sheet().cells.contains_key(&(row, col)) {
+                Some(self.workbook.current_sheet().get_cell(row, col))
+            } else {
+                None
+            };
+            batch.push(UndoAction::CellModified {
+                row,
+                col,
+                old_cell,
+                new_cell: Some(new_data.clone()),
+            });
+            self.workbook.current_sheet_mut().set_cell(row, col, new_data);
+            self.propagate_cell_change(row, col);
+        }
+        self.record_action(UndoAction::Batch(batch));
     }
 
     pub fn clear_cell_with_undo(&mut self, row: usize, col: usize) {
@@ -594,9 +632,7 @@ impl App {
         self.workbook.current_sheet_mut().clear_cell(row, col);
 
         // Cross-sheet maintenance.
-        let sheet_name = self.workbook.sheet_names[self.workbook.active_sheet].clone();
-        self.workbook.register_cross_sheet_deps(&sheet_name, row, col);
-        self.workbook.propagate_cross_sheet_changes(&sheet_name, row, col);
+        self.propagate_cell_change(row, col);
     }
 
     pub fn start_selection(&mut self) {
@@ -683,11 +719,10 @@ impl App {
         if start == end {
             return None; // Single cell, no stats
         }
-        if let Some((cs, ce, v)) = &self.stats_cache {
-            if *cs == start && *ce == end {
+        if let Some((cs, ce, v)) = &self.stats_cache
+            && *cs == start && *ce == end {
                 return *v;
             }
-        }
         let ((start_row, start_col), (end_row, end_col)) = (start, end);
         let mut sum = 0.0;
         let mut count = 0usize;

@@ -49,6 +49,18 @@ impl CsvExporter {
     /// use tshts::domain::CsvExporter;
     /// let _ = CsvExporter::import_from_csv("data.csv");
     /// ```
+    /// Best-effort parse check on a leading-`=` field. Returns true only if
+    /// the body parses cleanly. Used during CSV import to avoid storing
+    /// gibberish like `=help me` as a formula that errors at recalc time.
+    fn looks_like_formula(field: &str) -> bool {
+        use crate::domain::parser::Parser;
+        let body = &field[1..];
+        match Parser::new(body) {
+            Ok(mut p) => p.parse().is_ok(),
+            Err(_) => false,
+        }
+    }
+
     pub fn import_from_csv(filename: &str) -> Result<Spreadsheet, String> {
         let file = File::open(filename).map_err(|e| format!("Failed to open file: {}", e))?;
         let mut reader = ::csv::ReaderBuilder::new()
@@ -65,7 +77,11 @@ impl CsvExporter {
 
             for (col_index, field) in record.iter().enumerate() {
                 if !field.is_empty() {
-                    let formula = if field.starts_with('=') {
+                    // Validate `=...` as a parseable formula. If parsing
+                    // fails, fall through to plain-text storage so the user
+                    // sees the raw input instead of getting an evaluator
+                    // error at recalc time with no idea what's wrong.
+                    let formula = if field.starts_with('=') && Self::looks_like_formula(field) {
                         Some(field.to_string())
                     } else {
                         None
@@ -115,7 +131,7 @@ impl CsvExporter {
             let record = record.map_err(|e| e.to_string())?;
             for (col_index, field) in record.iter().enumerate() {
                 if !field.is_empty() {
-                    let formula = if field.starts_with('=') {
+                    let formula = if field.starts_with('=') && Self::looks_like_formula(field) {
                         Some(field.to_string())
                     } else {
                         None

@@ -157,6 +157,38 @@ impl Spreadsheet {
         self.recalculate_dependents(row, col);
     }
 
+    /// Drop every spill ghost on the sheet, then re-evaluate `maybe_spill`
+    /// for each cell that has a formula. Called after row/col insert/delete
+    /// because structural shifts can leave ghosts pointing to a moved or
+    /// vanished anchor, or leave gaps between an anchor and its surviving
+    /// ghosts. Cheap on TUI-scale sheets; insert/delete are uncommon.
+    pub(crate) fn resweep_all_spills(&mut self) {
+        let ghosts: Vec<(usize, usize)> = self
+            .cells
+            .iter()
+            .filter(|(_, cd)| cd.spill_anchor.is_some())
+            .map(|(&pos, _)| pos)
+            .collect();
+        for pos in ghosts {
+            self.cells.remove(&pos);
+        }
+        // Sort anchors so two formulas competing for the same spill region
+        // resolve identically across runs. HashMap iteration order is not
+        // stable, which would otherwise let `=ARRAY()` at A1 vs B1 produce
+        // different #SPILL!/winner outcomes between sessions on the same
+        // saved file.
+        let mut anchors: Vec<(usize, usize)> = self
+            .cells
+            .iter()
+            .filter(|(_, cd)| cd.formula.is_some())
+            .map(|(&pos, _)| pos)
+            .collect();
+        anchors.sort();
+        for (r, c) in anchors {
+            self.maybe_spill(r, c);
+        }
+    }
+
     /// Clear any spill ghosts whose anchor is the given cell. Called before
     /// the cell is rewritten so we don't leak stale ghosts when the
     /// formula's array shape shrinks (or disappears entirely).
@@ -230,8 +262,8 @@ impl Spreadsheet {
                 if r == row && c == col {
                     continue;
                 }
-                if let Some(existing) = self.cells.get(&(r, c)) {
-                    if existing.spill_anchor != Some((row, col))
+                if let Some(existing) = self.cells.get(&(r, c))
+                    && existing.spill_anchor != Some((row, col))
                         && (!existing.value.is_empty() || existing.formula.is_some())
                     {
                         if let Some(cd) = self.cells.get_mut(&(row, col)) {
@@ -239,7 +271,6 @@ impl Spreadsheet {
                         }
                         return;
                     }
-                }
             }
         }
         // Write the anchor's value (the first element of the array) and the
@@ -302,7 +333,7 @@ impl Spreadsheet {
         if !dependencies.is_empty() {
             self.dependencies.insert(cell_pos, dependencies.iter().cloned().collect());
             for dep in dependencies {
-                self.dependents.entry(dep).or_insert_with(HashSet::new).insert(cell_pos);
+                self.dependents.entry(dep).or_default().insert(cell_pos);
             }
         }
     }
@@ -352,13 +383,12 @@ impl Spreadsheet {
             }
         }
         while let Some(dep) = queue.pop_front() {
-            if to_recalc.insert(dep) {
-                if let Some(next) = self.dependents.get(&dep).cloned() {
+            if to_recalc.insert(dep)
+                && let Some(next) = self.dependents.get(&dep).cloned() {
                     for n in next {
                         queue.push_back(n);
                     }
                 }
-            }
         }
         if to_recalc.is_empty() {
             return;
@@ -407,13 +437,12 @@ impl Spreadsheet {
             }
         }
         while let Some(dep) = queue.pop_front() {
-            if to_recalc.insert(dep) {
-                if let Some(next) = self.dependents.get(&dep).cloned() {
+            if to_recalc.insert(dep)
+                && let Some(next) = self.dependents.get(&dep).cloned() {
                     for n in next {
                         queue.push_back(n);
                     }
                 }
-            }
         }
 
         if to_recalc.is_empty() {
@@ -487,8 +516,8 @@ impl Spreadsheet {
     /// Recalculates a single cell's value based on its formula.
     fn recalculate_cell(&mut self, row: usize, col: usize) {
         let cell_pos = (row, col);
-        if let Some(cell) = self.cells.get(&cell_pos).cloned() {
-            if let Some(ref formula) = cell.formula {
+        if let Some(cell) = self.cells.get(&cell_pos).cloned()
+            && let Some(ref formula) = cell.formula {
                 use crate::domain::services::FormulaEvaluator;
                 let evaluator = if self.named_ranges.is_empty() {
                     FormulaEvaluator::new(self)
@@ -500,7 +529,6 @@ impl Spreadsheet {
                 updated_cell.value = new_value;
                 self.set_cell_internal(row, col, updated_cell);
             }
-        }
     }
 
     /// Converts a zero-based column index to an Excel-style label (A, Z, AA, ...).
@@ -744,6 +772,7 @@ impl Spreadsheet {
         }
 
         self.rebuild_dependencies();
+        self.resweep_all_spills();
     }
 
     /// Deletes the row at the given index, shifting all rows below up by 1.
@@ -752,7 +781,7 @@ impl Spreadsheet {
         use crate::domain::services::FormulaEvaluator;
 
         let mut entries: Vec<((usize, usize), CellData)> = self.cells.drain().collect();
-        entries.sort_by(|a, b| a.0.0.cmp(&b.0.0));
+        entries.sort_by_key(|a| a.0.0);
 
         let mut new_cells = std::collections::HashMap::new();
         for ((row, col), cell) in entries {
@@ -796,6 +825,7 @@ impl Spreadsheet {
         }
 
         self.rebuild_dependencies();
+        self.resweep_all_spills();
     }
 
     /// Inserts a column at the given index, shifting all columns at or to the right by 1.
@@ -857,6 +887,7 @@ impl Spreadsheet {
         }
 
         self.rebuild_dependencies();
+        self.resweep_all_spills();
     }
 
     /// Deletes the column at the given index, shifting all columns to the right left by 1.
@@ -865,7 +896,7 @@ impl Spreadsheet {
         use crate::domain::services::FormulaEvaluator;
 
         let mut entries: Vec<((usize, usize), CellData)> = self.cells.drain().collect();
-        entries.sort_by(|a, b| a.0.1.cmp(&b.0.1));
+        entries.sort_by_key(|a| a.0.1);
 
         let mut new_cells = std::collections::HashMap::new();
         for ((row, col), cell) in entries {
@@ -922,6 +953,7 @@ impl Spreadsheet {
         }
 
         self.rebuild_dependencies();
+        self.resweep_all_spills();
     }
 
     /// Compute the conditional-format style for the given cell, if any rule

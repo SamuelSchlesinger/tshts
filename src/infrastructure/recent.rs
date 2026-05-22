@@ -23,15 +23,21 @@ fn config_path() -> Option<PathBuf> {
     Some(p)
 }
 
-/// Load the recent-files list. Returns an empty vec on any error.
+/// Load the recent-files list. Returns an empty vec on any error. Lazily
+/// purges entries whose backing file no longer exists so the UI doesn't show
+/// dead paths.
 pub fn load() -> Vec<String> {
     let Some(path) = config_path() else { return Vec::new(); };
     let Ok(content) = std::fs::read_to_string(&path) else { return Vec::new(); };
-    serde_json::from_str::<Vec<String>>(&content).unwrap_or_default()
+    let list: Vec<String> = serde_json::from_str(&content).unwrap_or_default();
+    list.into_iter()
+        .filter(|p| std::path::Path::new(p).exists())
+        .collect()
 }
 
 /// Record a file as most-recently-used, deduping prior entries and capping
-/// to `MAX_ENTRIES`. Errors are silently ignored.
+/// to `MAX_ENTRIES`. Errors are silently ignored. Written atomically so a
+/// crash mid-write can't corrupt the recent-files list.
 pub fn add(filename: &str) {
     let mut list = load();
     list.retain(|f| f != filename);
@@ -40,7 +46,9 @@ pub fn add(filename: &str) {
     let Some(dir) = config_dir() else { return; };
     let _ = std::fs::create_dir_all(&dir);
     let Some(path) = config_path() else { return; };
-    if let Ok(json) = serde_json::to_string_pretty(&list) {
-        let _ = std::fs::write(&path, json);
+    if let Ok(json) = serde_json::to_string_pretty(&list)
+        && let Some(path_str) = path.to_str()
+    {
+        let _ = crate::infrastructure::atomic::atomic_write(path_str, json.as_bytes());
     }
 }

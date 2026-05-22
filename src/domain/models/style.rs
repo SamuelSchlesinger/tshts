@@ -64,6 +64,7 @@ impl TerminalColor {
 
 /// Visual style for a cell.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct CellStyle {
     pub bold: bool,
     pub underline: bool,
@@ -71,11 +72,6 @@ pub struct CellStyle {
     pub bg_color: Option<TerminalColor>,
 }
 
-impl Default for CellStyle {
-    fn default() -> Self {
-        Self { bold: false, underline: false, fg_color: None, bg_color: None }
-    }
-}
 
 /// Cell formatting options.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

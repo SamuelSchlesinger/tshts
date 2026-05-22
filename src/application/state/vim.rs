@@ -68,6 +68,10 @@ impl App {
                             .cloned();
                         if old.is_some() {
                             self.workbook.current_sheet_mut().clear_cell(row, col);
+                            // Match cut_selection/clear_cell_with_undo:
+                            // cleared cells may be referenced by formulas on
+                            // other sheets, which need to recalc.
+                            self.propagate_cell_change(row, col);
                             batch.push(UndoAction::CellModified {
                                 row,
                                 col,

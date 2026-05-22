@@ -67,14 +67,13 @@ impl App {
         let max_row_bound = max_row;
         for (_, row_cells) in rows.iter_mut() {
             for cell_opt in row_cells.iter_mut() {
-                if let Some(cell) = cell_opt.as_mut() {
-                    if let Some(formula) = cell.formula.clone() {
+                if let Some(cell) = cell_opt.as_mut()
+                    && let Some(formula) = cell.formula.clone() {
                         let adjusted = evaluator.remap_row_references(&formula, &row_map, max_row_bound);
                         if adjusted != formula {
                             cell.formula = Some(adjusted);
                         }
                     }
-                }
             }
         }
 

@@ -11,43 +11,49 @@ impl App {
             // Determine fill direction: true = fill down (by rows), false = fill right (by cols)
             let fill_down = num_rows >= num_cols;
 
-            // Collect cells along the fill direction
-            // For fill_down: iterate through rows for each column
-            // For fill_right: iterate through columns for each row
             let mut changes = Vec::new();
             let mut pattern_desc = String::new();
+            let mut skipped = 0_usize;
 
             if fill_down {
-                // Process each column independently
                 for col in start_col..=end_col {
-                    let (filled, desc) = self.autofill_column(start_row, end_row, col);
+                    let (filled, desc, skip) = self.autofill_column(start_row, end_row, col);
                     changes.extend(filled);
+                    skipped += skip;
                     if pattern_desc.is_empty() && !desc.is_empty() {
                         pattern_desc = desc;
                     }
                 }
             } else {
-                // Process each row independently
                 for row in start_row..=end_row {
-                    let (filled, desc) = self.autofill_row(row, start_col, end_col);
+                    let (filled, desc, skip) = self.autofill_row(row, start_col, end_col);
                     changes.extend(filled);
+                    skipped += skip;
                     if pattern_desc.is_empty() && !desc.is_empty() {
                         pattern_desc = desc;
                     }
                 }
             }
 
-            // Apply all changes
             let num_changes = changes.len();
             for (row, col, cell_data) in changes {
                 self.set_cell_with_undo(row, col, cell_data);
             }
 
             if num_changes > 0 {
+                let suffix = if skipped > 0 {
+                    format!(" ({} skipped: would create circular ref)", skipped)
+                } else {
+                    String::new()
+                };
                 self.status_message = Some(format!(
-                    "Autofilled {} cells using {}",
-                    num_changes,
-                    pattern_desc
+                    "Autofilled {} cells using {}{}",
+                    num_changes, pattern_desc, suffix
+                ));
+            } else if skipped > 0 {
+                self.status_message = Some(format!(
+                    "No cells filled ({} skipped: would create circular ref)",
+                    skipped
                 ));
             } else {
                 self.status_message = Some("No cells to fill".to_string());
@@ -55,10 +61,11 @@ impl App {
         }
     }
 
-    fn autofill_column(&self, start_row: usize, end_row: usize, col: usize) -> (Vec<(usize, usize, CellData)>, String) {
+    fn autofill_column(&self, start_row: usize, end_row: usize, col: usize) -> (Vec<(usize, usize, CellData)>, String, usize) {
         use crate::domain::services::{FormulaEvaluator, AutofillPattern};
 
         let mut changes = Vec::new();
+        let mut skipped = 0_usize;
 
         // Collect non-empty cells (pattern cells) and empty cells (target cells)
         let mut pattern_cells: Vec<(usize, CellData)> = Vec::new();
@@ -73,16 +80,13 @@ impl App {
             }
         }
 
-        // If no pattern cells or no targets, nothing to do
         if pattern_cells.is_empty() || target_rows.is_empty() {
-            return (changes, String::new());
+            return (changes, String::new(), 0);
         }
 
-        // Check if any pattern cell has a formula - if so, use formula-based fill
         let has_formula = pattern_cells.iter().any(|(_, cell)| cell.formula.is_some());
 
         if has_formula {
-            // Use the first cell with a formula as source, adjust references for targets
             let (source_row, source_cell) = pattern_cells.iter()
                 .find(|(_, cell)| cell.formula.is_some())
                 .unwrap();
@@ -96,6 +100,7 @@ impl App {
                     let adjusted_formula = evaluator.adjust_formula_references(formula, row_offset, 0);
 
                     if evaluator.would_create_circular_reference(&adjusted_formula, (*target_row, col)) {
+                        skipped += 1;
                         continue;
                     }
 
@@ -110,7 +115,7 @@ impl App {
                 }
             }
 
-            return (changes, "formula".to_string());
+            return (changes, "formula".to_string(), skipped);
         }
 
         // Extract values from pattern cells for pattern detection
@@ -138,15 +143,15 @@ impl App {
             }));
         }
 
-        (changes, pattern_desc)
+        (changes, pattern_desc, skipped)
     }
 
-    fn autofill_row(&self, row: usize, start_col: usize, end_col: usize) -> (Vec<(usize, usize, CellData)>, String) {
+    fn autofill_row(&self, row: usize, start_col: usize, end_col: usize) -> (Vec<(usize, usize, CellData)>, String, usize) {
         use crate::domain::services::{FormulaEvaluator, AutofillPattern};
 
         let mut changes = Vec::new();
+        let mut skipped = 0_usize;
 
-        // Collect non-empty cells (pattern cells) and empty cells (target cells)
         let mut pattern_cells: Vec<(usize, CellData)> = Vec::new();
         let mut target_cols: Vec<usize> = Vec::new();
 
@@ -159,16 +164,13 @@ impl App {
             }
         }
 
-        // If no pattern cells or no targets, nothing to do
         if pattern_cells.is_empty() || target_cols.is_empty() {
-            return (changes, String::new());
+            return (changes, String::new(), 0);
         }
 
-        // Check if any pattern cell has a formula - if so, use formula-based fill
         let has_formula = pattern_cells.iter().any(|(_, cell)| cell.formula.is_some());
 
         if has_formula {
-            // Use the first cell with a formula as source, adjust references for targets
             let (source_col, source_cell) = pattern_cells.iter()
                 .find(|(_, cell)| cell.formula.is_some())
                 .unwrap();
@@ -182,6 +184,7 @@ impl App {
                     let adjusted_formula = evaluator.adjust_formula_references(formula, 0, col_offset);
 
                     if evaluator.would_create_circular_reference(&adjusted_formula, (row, *target_col)) {
+                        skipped += 1;
                         continue;
                     }
 
@@ -196,7 +199,7 @@ impl App {
                 }
             }
 
-            return (changes, "formula".to_string());
+            return (changes, "formula".to_string(), skipped);
         }
 
         // Extract values from pattern cells for pattern detection
@@ -224,7 +227,7 @@ impl App {
             }));
         }
 
-        (changes, pattern_desc)
+        (changes, pattern_desc, skipped)
     }
 
 }

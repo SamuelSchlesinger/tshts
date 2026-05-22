@@ -9,9 +9,25 @@ use super::*;
 /// the workbook-level cross-sheet dependency graph.
 pub type CrossSheetKey = (String, usize, usize);
 
+/// Current on-disk schema version for `.tshts` workbooks. Bump this when a
+/// schema change is NOT backwards-compatible (e.g. a new required field or
+/// a semantic change to an existing field). Backwards-compatible additions
+/// (new optional fields with `#[serde(default)]`) do not require a bump.
+pub const WORKBOOK_SCHEMA_VERSION: u32 = 1;
+
+fn default_workbook_version() -> u32 {
+    // Pre-versioning files implicitly carry version 1.
+    1
+}
+
 /// A workbook containing multiple spreadsheets (tabs).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Workbook {
+    /// On-disk schema version. Files without this field deserialize as
+    /// version 1 via the serde default. `load_workbook` rejects versions
+    /// it doesn't understand.
+    #[serde(default = "default_workbook_version")]
+    pub version: u32,
     /// The sheets in this workbook
     pub sheets: Vec<Spreadsheet>,
     /// Names for each sheet
@@ -36,6 +52,7 @@ pub struct Workbook {
 impl Default for Workbook {
     fn default() -> Self {
         Self {
+            version: WORKBOOK_SCHEMA_VERSION,
             sheets: vec![Spreadsheet::default()],
             sheet_names: vec!["Sheet1".to_string()],
             active_sheet: 0,
@@ -63,6 +80,123 @@ impl Workbook {
         self.sheet_names.push(name);
     }
 
+    /// Structural row insert on the active sheet, with cross-sheet ref
+    /// adjustment on every other sheet. If Sheet2 has `=Sheet1!A5` and we
+    /// insert a row above A5 in Sheet1, Sheet2's ref shifts to `=Sheet1!A6`.
+    /// Matches Excel's structural-edit semantics.
+    pub fn insert_row_on_active(&mut self, at: usize) {
+        let active_idx = self.active_sheet;
+        self.sheets[active_idx].insert_row(at);
+        self.adjust_other_sheets_for_structural(active_idx, |evaluator, formula, target| {
+            evaluator.adjust_formula_for_sheet_row_insert(formula, target, at)
+        });
+    }
+
+    /// Structural row delete on the active sheet, with cross-sheet ref
+    /// adjustment. Refs to the deleted row on other sheets become `#REF!`.
+    pub fn delete_row_on_active(&mut self, at: usize) {
+        let active_idx = self.active_sheet;
+        self.sheets[active_idx].delete_row(at);
+        self.adjust_other_sheets_for_structural(active_idx, |evaluator, formula, target| {
+            evaluator.adjust_formula_for_sheet_row_delete(formula, target, at)
+        });
+    }
+
+    pub fn insert_col_on_active(&mut self, at: usize) {
+        let active_idx = self.active_sheet;
+        self.sheets[active_idx].insert_col(at);
+        self.adjust_other_sheets_for_structural(active_idx, |evaluator, formula, target| {
+            evaluator.adjust_formula_for_sheet_col_insert(formula, target, at)
+        });
+    }
+
+    pub fn delete_col_on_active(&mut self, at: usize) {
+        let active_idx = self.active_sheet;
+        self.sheets[active_idx].delete_col(at);
+        self.adjust_other_sheets_for_structural(active_idx, |evaluator, formula, target| {
+            evaluator.adjust_formula_for_sheet_col_delete(formula, target, at)
+        });
+    }
+
+    /// Walk every sheet OTHER than `mutated_idx` and apply `adjust` to each
+    /// formula. `adjust` receives a fresh evaluator (bound to the sheet it's
+    /// rewriting), the formula source, and the name of the sheet that was
+    /// mutated. Used by structural ops to keep cross-sheet refs coherent.
+    fn adjust_other_sheets_for_structural<F>(&mut self, mutated_idx: usize, adjust: F)
+    where
+        F: Fn(&crate::domain::services::FormulaEvaluator, &str, &str) -> String,
+    {
+        let mutated_name = self.sheet_names[mutated_idx].clone();
+        // Walk EVERY sheet, including the mutated one. The mutated sheet's
+        // unqualified refs were already shifted by `Spreadsheet::insert_row`
+        // / `delete_row` etc.; the qualified-only `adjust` closure here is
+        // safe to re-run on it because it only touches refs of the form
+        // `<sheet>!<cell>` — leaving the unqualified ones intact. This also
+        // catches self-qualified refs like `=Sheet1!A5` on Sheet1, which the
+        // same-sheet adjustment misses.
+        for (idx, sheet) in self.sheets.iter_mut().enumerate() {
+            let updates: Vec<((usize, usize), String)> = {
+                let evaluator = crate::domain::services::FormulaEvaluator::new(sheet);
+                sheet
+                    .cells
+                    .iter()
+                    .filter_map(|(&(r, c), cd)| {
+                        cd.formula
+                            .as_ref()
+                            .map(|f| ((r, c), adjust(&evaluator, f, &mutated_name)))
+                    })
+                    .filter(|((r, c), new_f)| {
+                        sheet
+                            .cells
+                            .get(&(*r, *c))
+                            .and_then(|cd| cd.formula.as_ref())
+                            .map(|orig| orig != new_f)
+                            .unwrap_or(false)
+                    })
+                    .collect()
+            };
+            for ((r, c), new_formula) in updates {
+                if let Some(cd) = sheet.cells.get_mut(&(r, c)) {
+                    cd.formula = Some(new_formula);
+                }
+            }
+            sheet.rebuild_dependencies();
+            // Spill ranges may reference cells that shifted on the mutated
+            // sheet; force a re-evaluation so ghosts stay coherent.
+            // Skip the mutated sheet — `Spreadsheet::insert_row` already
+            // resweeps it as part of its own bookkeeping.
+            if idx != mutated_idx {
+                sheet.resweep_all_spills();
+            }
+        }
+        // Adjust workbook-level named-range values. `Revenue → Sheet2!A5:A10`
+        // is a string of formula shape sans leading `=`; wrap it temporarily
+        // so the same adjust closure works, then strip.
+        let evaluator = crate::domain::services::FormulaEvaluator::new(&self.sheets[mutated_idx]);
+        let name_updates: Vec<(String, String)> = self
+            .named_ranges
+            .iter()
+            .filter_map(|(k, v)| {
+                let wrapped = format!("={}", v);
+                let new_wrapped = adjust(&evaluator, &wrapped, &mutated_name);
+                if new_wrapped == wrapped {
+                    return None;
+                }
+                let new_v = new_wrapped.strip_prefix('=').unwrap_or(&new_wrapped).to_string();
+                Some((k.clone(), new_v))
+            })
+            .collect();
+        for (k, v) in name_updates {
+            self.named_ranges.insert(k.clone(), v.clone());
+            // Mirror onto each sheet's per-sheet named_ranges cache.
+            for sheet in &mut self.sheets {
+                sheet.named_ranges.insert(k.clone(), v.clone());
+            }
+        }
+        // Cross-sheet dep keys may reference shifted cells; rebuild.
+        self.rebuild_cross_sheet_deps();
+    }
+
     /// Removes a sheet by index. Adjusts active_sheet if needed.
     /// Won't remove the last sheet.
     pub fn remove_sheet(&mut self, index: usize) -> bool {
@@ -77,6 +211,35 @@ impl Workbook {
         } else if self.active_sheet > index {
             self.active_sheet -= 1;
         }
+        // Rewrite any surviving formula that referenced the removed sheet
+        // (e.g. `=Gone!A1`) to `=#REF!`. Excel does the same — leaving the
+        // literal sheet name in the formula would otherwise produce an
+        // "Unknown sheet" error instead of the Excel-standard #REF!.
+        for sheet in &mut self.sheets {
+            let updates: Vec<((usize, usize), String)> = sheet
+                .cells
+                .iter()
+                .filter_map(|(&(r, c), cd)| {
+                    cd.formula.as_ref().map(|f| {
+                        ((r, c), replace_sheet_refs_with_ref_error(f, &removed_name))
+                    })
+                })
+                .filter(|((r, c), new_f)| {
+                    sheet
+                        .cells
+                        .get(&(*r, *c))
+                        .and_then(|cd| cd.formula.as_ref())
+                        .map(|orig| orig != new_f)
+                        .unwrap_or(false)
+                })
+                .collect();
+            for ((r, c), new_formula) in updates {
+                if let Some(cd) = sheet.cells.get_mut(&(r, c)) {
+                    cd.formula = Some(new_formula);
+                }
+            }
+            sheet.rebuild_dependencies();
+        }
         // Purge any cross-sheet dep entries that touched the removed sheet.
         self.cross_sheet_dependents
             .retain(|k, _| !k.0.eq_ignore_ascii_case(&removed_name));
@@ -88,6 +251,7 @@ impl Workbook {
         for set in self.cross_sheet_dependencies.values_mut() {
             set.retain(|k| !k.0.eq_ignore_ascii_case(&removed_name));
         }
+        self.rebuild_cross_sheet_deps();
         true
     }
 
@@ -115,8 +279,15 @@ impl Workbook {
             return false;
         }
         self.sheet_names[self.active_sheet] = new_name.clone();
-        // Rewrite formulas in every sheet.
-        for sheet in &mut self.sheets {
+        // Rewrite formulas in every sheet. Track which cells were touched per
+        // sheet so we can propagate changes after the global rebuild — the
+        // rewrite is value-neutral in the steady state (the formula points
+        // at the same physical cell, just under a new name), but a sheet may
+        // currently be holding an "Unknown sheet" error string from a
+        // previous broken reference, and propagation forces a re-eval.
+        let sheet_count = self.sheets.len();
+        let mut touched_per_sheet: Vec<Vec<(usize, usize)>> = vec![Vec::new(); sheet_count];
+        for (sheet_idx, sheet) in self.sheets.iter_mut().enumerate() {
             let updates: Vec<(usize, usize, String)> = sheet
                 .cells
                 .iter()
@@ -137,6 +308,7 @@ impl Workbook {
             for (r, c, formula) in updates {
                 if let Some(cd) = sheet.cells.get_mut(&(r, c)) {
                     cd.formula = Some(formula);
+                    touched_per_sheet[sheet_idx].push((r, c));
                 }
             }
             sheet.rebuild_dependencies();
@@ -157,6 +329,14 @@ impl Workbook {
         }
         // Cross-sheet dep keys reference sheet names by string; rebuild.
         self.rebuild_cross_sheet_deps();
+        // Propagate from every cell whose formula was rewritten so any
+        // dependents that previously errored on the old name recompute.
+        for (sheet_idx, touched) in touched_per_sheet.iter().enumerate() {
+            let sheet_name = self.sheet_names[sheet_idx].clone();
+            for &(r, c) in touched {
+                self.propagate_cross_sheet_changes(&sheet_name, r, c);
+            }
+        }
         true
     }
 
@@ -185,6 +365,7 @@ impl Workbook {
     /// Creates a Workbook from a single Spreadsheet (for backward compatibility).
     pub fn from_spreadsheet(sheet: Spreadsheet) -> Self {
         Self {
+            version: WORKBOOK_SCHEMA_VERSION,
             sheets: vec![sheet],
             sheet_names: vec!["Sheet1".to_string()],
             active_sheet: 0,
@@ -258,11 +439,11 @@ impl Workbook {
             let prec: CrossSheetKey = (canon, ref_row, ref_col);
             self.cross_sheet_dependencies
                 .entry(key.clone())
-                .or_insert_with(HashSet::new)
+                .or_default()
                 .insert(prec.clone());
             self.cross_sheet_dependents
                 .entry(prec)
-                .or_insert_with(HashSet::new)
+                .or_default()
                 .insert(key.clone());
         }
     }
@@ -324,15 +505,12 @@ impl Workbook {
                     .sheet_names
                     .iter()
                     .position(|n| n.eq_ignore_ascii_case(&dep_sheet));
-                if let Some(idx) = dep_real_idx {
-                    if let Some(real_cd) = self.sheets[idx].cells.get_mut(&(dep_row, dep_col))
-                    {
-                        if real_cd.value != new_value {
+                if let Some(idx) = dep_real_idx
+                    && let Some(real_cd) = self.sheets[idx].cells.get_mut(&(dep_row, dep_col))
+                        && real_cd.value != new_value {
                             real_cd.value = new_value;
                             queue.push_back(dep);
                         }
-                    }
-                }
             }
         }
     }

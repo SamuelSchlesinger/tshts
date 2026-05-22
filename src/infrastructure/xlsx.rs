@@ -23,6 +23,7 @@ pub fn load_xlsx(path: &str) -> Result<Workbook, String> {
         return Err("xlsx has no sheets".to_string());
     }
     let mut out = Workbook {
+        version: crate::domain::models::WORKBOOK_SCHEMA_VERSION,
         sheets: Vec::with_capacity(sheet_names.len()),
         sheet_names: sheet_names.clone(),
         active_sheet: 0,
@@ -105,16 +106,75 @@ pub fn load_xlsx(path: &str) -> Result<Workbook, String> {
 
 /// Strip Excel's `_xlfn.` and `_xlfn._xlws.` prefixes from function names.
 /// These prefixes appear in formulas saved by newer Excel versions to
-/// disambiguate functions added after 2007.
+/// disambiguate functions added after 2007. Different writers normalize
+/// the case differently (some emit `_xlfn.`, some `_XLFN.`, occasionally
+/// mixed like `_Xlfn.`) so we scan case-insensitively.
 fn strip_xlfn_prefixes(formula: &str) -> String {
-    // Walk the string; on every `_xlfn.` or `_xlfn._xlws.` boundary,
-    // drop it. The replacement is order-sensitive — strip the longer
-    // prefix first.
-    formula
-        .replace("_xlfn._xlws.", "")
-        .replace("_xlfn.", "")
-        .replace("_XLFN._XLWS.", "")
-        .replace("_XLFN.", "")
+    fn ascii_prefix_match(rest: &str, prefix: &[u8]) -> bool {
+        // The prefixes are ASCII. Use byte-level compare so we don't try to
+        // slice through a multi-byte UTF-8 boundary when the prefix doesn't
+        // match. If the first `prefix.len()` bytes do match ASCII-wise, the
+        // slice itself is on a char boundary (each byte is single-byte ASCII).
+        let bytes = rest.as_bytes();
+        bytes.len() >= prefix.len() && bytes[..prefix.len()].eq_ignore_ascii_case(prefix)
+    }
+    let mut out = String::with_capacity(formula.len());
+    let mut rest = formula;
+    while !rest.is_empty() {
+        if ascii_prefix_match(rest, b"_xlfn._xlws.") {
+            rest = &rest["_xlfn._xlws.".len()..];
+        } else if ascii_prefix_match(rest, b"_xlfn.") {
+            rest = &rest["_xlfn.".len()..];
+        } else {
+            let ch = rest.chars().next().unwrap();
+            out.push(ch);
+            rest = &rest[ch.len_utf8()..];
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod xlfn_tests {
+    use super::strip_xlfn_prefixes;
+
+    #[test]
+    fn strips_lower_and_upper() {
+        assert_eq!(strip_xlfn_prefixes("_xlfn.XLOOKUP(A1,B:B,C:C)"), "XLOOKUP(A1,B:B,C:C)");
+        assert_eq!(strip_xlfn_prefixes("_XLFN.XLOOKUP(A1,B:B,C:C)"), "XLOOKUP(A1,B:B,C:C)");
+    }
+
+    #[test]
+    fn strips_mixed_case() {
+        assert_eq!(strip_xlfn_prefixes("_Xlfn.XLOOKUP(A1,B:B,C:C)"), "XLOOKUP(A1,B:B,C:C)");
+        assert_eq!(strip_xlfn_prefixes("_xLfN.XLOOKUP(A1,B:B,C:C)"), "XLOOKUP(A1,B:B,C:C)");
+    }
+
+    #[test]
+    fn strips_compound_prefix() {
+        assert_eq!(
+            strip_xlfn_prefixes("_xlfn._xlws.FILTER(A:A,B:B>0)"),
+            "FILTER(A:A,B:B>0)"
+        );
+        assert_eq!(
+            strip_xlfn_prefixes("_XLFN._XLWS.FILTER(A:A,B:B>0)"),
+            "FILTER(A:A,B:B>0)"
+        );
+    }
+
+    #[test]
+    fn preserves_non_xlfn() {
+        assert_eq!(strip_xlfn_prefixes("=SUM(A1:A10)"), "=SUM(A1:A10)");
+        assert_eq!(strip_xlfn_prefixes(""), "");
+    }
+
+    #[test]
+    fn preserves_utf8() {
+        // Multi-byte UTF-8 must round-trip unchanged. The old byte-then-as-char
+        // version would have mangled this.
+        assert_eq!(strip_xlfn_prefixes("=CONCAT(\"héllo\",A1)"), "=CONCAT(\"héllo\",A1)");
+        assert_eq!(strip_xlfn_prefixes("_xlfn.XLOOKUP(\"日本\",A:A,B:B)"), "XLOOKUP(\"日本\",A:A,B:B)");
+    }
 }
 
 /// Builds a deduplicated style table for the workbook. Index 0 is always
@@ -125,11 +185,10 @@ fn build_style_table(workbook: &Workbook) -> Vec<CellFormat> {
     let mut styles: Vec<CellFormat> = vec![CellFormat::default()];
     for sheet in &workbook.sheets {
         for cd in sheet.cells.values() {
-            if let Some(fmt) = &cd.format {
-                if !styles.iter().any(|s| s == fmt) {
+            if let Some(fmt) = &cd.format
+                && !styles.iter().any(|s| s == fmt) {
                     styles.push(fmt.clone());
                 }
-            }
         }
     }
     styles
@@ -275,11 +334,10 @@ fn build_styles_xml(styles: &[CellFormat]) -> String {
         if i > 0 && f.underline {
             s.push_str("<u/>");
         }
-        if i > 0 {
-            if let Some(c) = &f.fg_color {
+        if i > 0
+            && let Some(c) = &f.fg_color {
                 s.push_str(&format!("<color rgb=\"{}\"/>", color_to_argb(c)));
             }
-        }
         s.push_str("<name val=\"Calibri\"/>");
         s.push_str("</font>\n");
     }

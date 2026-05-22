@@ -237,7 +237,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
             }
             nums.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             let n = nums.len();
-            let m = if n % 2 == 0 {
+            let m = if n.is_multiple_of(2) {
                 (nums[n / 2 - 1] + nums[n / 2]) / 2.0
             } else {
                 nums[n / 2]

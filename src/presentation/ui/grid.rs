@@ -131,13 +131,11 @@ pub(super) fn build_row<'a>(app: &App, row: usize, visible_cols: usize, is_froze
         }
         // Data validation: if this column has a rule and the cell value
         // fails it, mark with a red bottom-modified style.
-        if !raw_value.is_empty() {
-            if let Some(predicate) = app.validations.get(&col) {
-                if !validation_passes(app, &raw_value, predicate) {
+        if !raw_value.is_empty()
+            && let Some(predicate) = app.validations.get(&col)
+                && !validation_passes(app, &raw_value, predicate) {
                     style = style.bg(Color::Rgb(80, 20, 20)).fg(Color::White);
                 }
-            }
-        }
         // Spill ghosts render dimmer so the user can tell them apart from
         // editable cells. Doesn't fire on the cursor cell — the cursor
         // highlight wins.
@@ -171,7 +169,10 @@ pub(super) fn validation_passes(app: &App, value: &str, predicate: &str) -> bool
 }
 
 pub(super) fn render_spreadsheet(f: &mut Frame, app: &mut App, area: Rect) {
-    let visible_rows = area.height as usize - 1;
+    // Reserve one row for the header. saturating_sub guards against a 0-row
+    // area (e.g. terminal resized to a single line) which would otherwise
+    // underflow to usize::MAX and crash the next loop iteration.
+    let visible_rows = (area.height as usize).saturating_sub(1);
 
     let mut total_width = 4;
     let mut visible_cols = 0;

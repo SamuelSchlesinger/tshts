@@ -26,6 +26,11 @@ use infrastructure::{autosave, fetcher, FileRepository};
 use presentation::{render_ui, InputHandler};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Restore the terminal on panic so a crash doesn't leave the user's shell
+    // stuck in raw mode with mouse capture spewing escape sequences. Chains
+    // to the default hook so the backtrace still prints.
+    install_panic_hook();
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     // Mouse capture is on by default. Users who want host-terminal text
@@ -73,6 +78,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn install_panic_hook() {
+    let original = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+        original(info);
+    }));
 }
 
 fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<()> {

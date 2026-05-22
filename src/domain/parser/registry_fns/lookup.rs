@@ -18,11 +18,10 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
             let sum_range = if args.len() == 3 { args[2].flatten() } else { range.clone() };
             let mut sum = 0.0;
             for (i, v) in range.iter().enumerate() {
-                if criteria_matches(v, &criteria) {
-                    if let Some(target) = sum_range.get(i) {
+                if criteria_matches(v, &criteria)
+                    && let Some(target) = sum_range.get(i) {
                         sum += target.to_number();
                     }
-                }
             }
             Ok(Value::Number(sum))
         });
@@ -45,12 +44,11 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
             let mut sum = 0.0;
             let mut count = 0usize;
             for (i, v) in range.iter().enumerate() {
-                if criteria_matches(v, &criteria) {
-                    if let Some(target) = sum_range.get(i) {
+                if criteria_matches(v, &criteria)
+                    && let Some(target) = sum_range.get(i) {
                         sum += target.to_number();
                         count += 1;
                     }
-                }
             }
             if count == 0 {
                 Err("AVERAGEIF: no matching values".to_string())
@@ -173,24 +171,22 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
                 }
                 if let (Some(t), Some(n)) = (needle_num, Some(k.to_number())) {
                     match match_mode {
-                        -1 if n <= t => {
-                            if next_smaller
+                        -1 if n <= t
+                            && next_smaller
                                 .map(|si| keys[si].to_number())
                                 .map(|sv| n > sv)
                                 .unwrap_or(true)
-                            {
+                            => {
                                 next_smaller = Some(*i);
                             }
-                        }
-                        1 if n >= t => {
-                            if next_larger
+                        1 if n >= t
+                            && next_larger
                                 .map(|li| keys[li].to_number())
                                 .map(|lv| n < lv)
                                 .unwrap_or(true)
-                            {
+                            => {
                                 next_larger = Some(*i);
                             }
-                        }
                         _ => {}
                     }
                 }
@@ -198,16 +194,14 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
             if let Some(i) = exact_hit {
                 return Ok(values[i].clone());
             }
-            if match_mode == -1 {
-                if let Some(i) = next_smaller {
+            if match_mode == -1
+                && let Some(i) = next_smaller {
                     return Ok(values[i].clone());
                 }
-            }
-            if match_mode == 1 {
-                if let Some(i) = next_larger {
+            if match_mode == 1
+                && let Some(i) = next_larger {
                     return Ok(values[i].clone());
                 }
-            }
             args.get(3)
                 .cloned()
                 .ok_or_else(|| "XLOOKUP: value not found".to_string())

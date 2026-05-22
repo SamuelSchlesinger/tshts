@@ -66,11 +66,10 @@ impl InputHandler {
                 app.help_search.clear();
                 app.help_search_active = false;
             }
-            KeyCode::Up | KeyCode::Char('k') => {
-                if app.help_scroll > 0 {
+            KeyCode::Up | KeyCode::Char('k')
+                if app.help_scroll > 0 => {
                     app.help_scroll -= 1;
                 }
-            }
             KeyCode::Down | KeyCode::Char('j') => {
                 app.help_scroll += 1;
             }
@@ -96,17 +95,16 @@ impl InputHandler {
                 app.help_search.clear();
             }
             KeyCode::Char('n') => {
-                if !app.help_search.is_empty() {
-                    if let Some(line) = crate::presentation::ui::find_help_match(
+                if !app.help_search.is_empty()
+                    && let Some(line) = crate::presentation::ui::find_help_match(
                         &app.help_search,
                         app.help_scroll + 1,
                     ) {
                         app.help_scroll = line;
                     }
-                }
             }
-            KeyCode::Char('N') => {
-                if !app.help_search.is_empty() {
+            KeyCode::Char('N')
+                if !app.help_search.is_empty() => {
                     // Search backward from current position, wrapping.
                     let q = app.help_search.to_lowercase();
                     let text = crate::presentation::ui::get_help_text();
@@ -123,7 +121,6 @@ impl InputHandler {
                         }
                     }
                 }
-            }
             _ => {}
         }
     }
@@ -158,27 +155,23 @@ impl InputHandler {
             KeyCode::Esc => {
                 app.cancel_filename_input();
             }
-            KeyCode::Backspace => {
-                if app.cursor_position > 0 {
+            KeyCode::Backspace
+                if app.cursor_position > 0 => {
                     app.filename_input.remove(char_to_byte_pos(&app.filename_input, app.cursor_position - 1));
                     app.cursor_position -= 1;
                 }
-            }
-            KeyCode::Delete => {
-                if app.cursor_position < char_count(&app.filename_input) {
+            KeyCode::Delete
+                if app.cursor_position < char_count(&app.filename_input) => {
                     app.filename_input.remove(char_to_byte_pos(&app.filename_input, app.cursor_position));
                 }
-            }
-            KeyCode::Left => {
-                if app.cursor_position > 0 {
+            KeyCode::Left
+                if app.cursor_position > 0 => {
                     app.cursor_position -= 1;
                 }
-            }
-            KeyCode::Right => {
-                if app.cursor_position < char_count(&app.filename_input) {
+            KeyCode::Right
+                if app.cursor_position < char_count(&app.filename_input) => {
                     app.cursor_position += 1;
                 }
-            }
             KeyCode::Home => {
                 app.cursor_position = 0;
             }
@@ -202,31 +195,27 @@ impl InputHandler {
             KeyCode::Esc => {
                 app.cancel_search();
             }
-            KeyCode::Backspace => {
-                if app.cursor_position > 0 {
+            KeyCode::Backspace
+                if app.cursor_position > 0 => {
                     app.search_query.remove(char_to_byte_pos(&app.search_query, app.cursor_position - 1));
                     app.cursor_position -= 1;
                     // Perform live search as user types
                     app.perform_search();
                 }
-            }
-            KeyCode::Delete => {
-                if app.cursor_position < char_count(&app.search_query) {
+            KeyCode::Delete
+                if app.cursor_position < char_count(&app.search_query) => {
                     app.search_query.remove(char_to_byte_pos(&app.search_query, app.cursor_position));
                     // Perform live search as user types
                     app.perform_search();
                 }
-            }
-            KeyCode::Left => {
-                if app.cursor_position > 0 {
+            KeyCode::Left
+                if app.cursor_position > 0 => {
                     app.cursor_position -= 1;
                 }
-            }
-            KeyCode::Right => {
-                if app.cursor_position < char_count(&app.search_query) {
+            KeyCode::Right
+                if app.cursor_position < char_count(&app.search_query) => {
                     app.cursor_position += 1;
                 }
-            }
             KeyCode::Home => {
                 app.cursor_position = 0;
             }
@@ -259,12 +248,11 @@ impl InputHandler {
             KeyCode::Esc => {
                 app.cancel_goto_cell();
             }
-            KeyCode::Backspace => {
-                if app.cursor_position > 0 {
+            KeyCode::Backspace
+                if app.cursor_position > 0 => {
                     app.goto_cell_input.remove(char_to_byte_pos(&app.goto_cell_input, app.cursor_position - 1));
                     app.cursor_position -= 1;
                 }
-            }
             KeyCode::Char(c) => {
                 app.goto_cell_input.insert(char_to_byte_pos(&app.goto_cell_input, app.cursor_position), c);
                 app.cursor_position += 1;
@@ -275,12 +263,11 @@ impl InputHandler {
 
     pub(super) fn handle_find_replace_mode(app: &mut App, key: KeyCode, modifiers: KeyModifiers) {
         // Ctrl+A: replace all
-        if modifiers.contains(KeyModifiers::CONTROL) {
-            if let KeyCode::Char('a') = key {
+        if modifiers.contains(KeyModifiers::CONTROL)
+            && let KeyCode::Char('a') = key {
                 app.replace_all();
                 return;
             }
-        }
         match key {
             KeyCode::Enter => {
                 if app.find_replace_on_replace {
@@ -318,19 +305,18 @@ impl InputHandler {
                     }
                 }
             }
-            KeyCode::Down => {
+            KeyCode::Down
                 // Next result
-                if !app.find_replace_results.is_empty() {
+                if !app.find_replace_results.is_empty() => {
                     app.find_replace_index = (app.find_replace_index + 1) % app.find_replace_results.len();
                     let (row, col) = app.find_replace_results[app.find_replace_index];
                     app.selected_row = row;
                     app.selected_col = col;
                     app.ensure_cursor_visible();
                 }
-            }
-            KeyCode::Up => {
+            KeyCode::Up
                 // Previous result
-                if !app.find_replace_results.is_empty() {
+                if !app.find_replace_results.is_empty() => {
                     if app.find_replace_index == 0 {
                         app.find_replace_index = app.find_replace_results.len() - 1;
                     } else {
@@ -341,7 +327,6 @@ impl InputHandler {
                     app.selected_col = col;
                     app.ensure_cursor_visible();
                 }
-            }
             KeyCode::Char(c) => {
                 if app.find_replace_on_replace {
                     app.find_replace_replace.insert(char_to_byte_pos(&app.find_replace_replace, app.cursor_position), c);
@@ -366,22 +351,19 @@ impl InputHandler {
                 app.command_input.clear();
                 app.cursor_position = 0;
             }
-            KeyCode::Backspace => {
-                if app.cursor_position > 0 {
+            KeyCode::Backspace
+                if app.cursor_position > 0 => {
                     app.command_input.remove(char_to_byte_pos(&app.command_input, app.cursor_position - 1));
                     app.cursor_position -= 1;
                 }
-            }
-            KeyCode::Left => {
-                if app.cursor_position > 0 {
+            KeyCode::Left
+                if app.cursor_position > 0 => {
                     app.cursor_position -= 1;
                 }
-            }
-            KeyCode::Right => {
-                if app.cursor_position < char_count(&app.command_input) {
+            KeyCode::Right
+                if app.cursor_position < char_count(&app.command_input) => {
                     app.cursor_position += 1;
                 }
-            }
             KeyCode::Char(c) => {
                 app.command_input.insert(char_to_byte_pos(&app.command_input, app.cursor_position), c);
                 app.cursor_position += 1;

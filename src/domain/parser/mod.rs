@@ -46,6 +46,10 @@ pub enum Token {
     String(String),
     CellRef(String),
     Identifier(String),
+    /// An Excel-style error literal lexed from the source (`#REF!`, `#N/A`,
+    /// `#DIV/0!`, …). The parser turns this into `Expr::ErrorLit` so error
+    /// propagation works through the AST in the same way evaluated errors do.
+    ErrorLit(ErrorKind),
     
     // Operators
     Plus,
@@ -326,6 +330,12 @@ pub enum Expr {
         name: String,
         args: Vec<Expr>,
     },
+    /// Excel-style error literal carried through the AST. Evaluates to
+    /// `Value::Error(kind)`, and the existing first-error propagation in
+    /// Binary/Unary/FunctionCall cascades it correctly. Emitted by the lexer
+    /// for source-level `#REF!` etc., and by `adjust_*` when a relative
+    /// shift takes a cell reference past the origin or onto a deleted row.
+    ErrorLit(ErrorKind),
 }
 
 /// Binary operators with their precedence and evaluation behavior.
@@ -362,8 +372,6 @@ pub enum UnaryOp {
     Plus,
     Minus,
 }
-
-/// Lexical analyzer for tokenizing expressions.
 
 // Submodules — separated by structural concern.
 mod lexer;
@@ -503,18 +511,18 @@ pub(super) fn date_to_serial(year: i32, month: u32, day: u32) -> f64 {
     let mut y_norm = year as i64;
     let m_signed = month as i64;
     let total_months = y_norm * 12 + (m_signed - 1);
-    let m_norm = total_months.rem_euclid(12) as i64 + 1;
+    let m_norm = total_months.rem_euclid(12) + 1;
     y_norm = total_months.div_euclid(12);
 
     let y_for_algo = if m_norm <= 2 { y_norm - 1 } else { y_norm };
     let m_for_algo = if m_norm <= 2 { m_norm + 12 } else { m_norm };
     let era = if y_for_algo >= 0 { y_for_algo } else { y_for_algo - 399 } / 400;
-    let yoe = (y_for_algo - era * 400) as i64;
+    let yoe = y_for_algo - era * 400;
     let doy = (153 * (m_for_algo - 3) + 2) / 5; // day-of-year for day=1
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days_since_1970 = era * 146097 + doe - 719468;
     // Add (day - 1) as a signed offset so day=0 rolls back.
-    let serial = (days_since_1970 + 25569) as i64 + (day as i64 - 1);
+    let serial = (days_since_1970 + 25569) + (day as i64 - 1);
     serial as f64
 }
 
@@ -587,10 +595,6 @@ pub(super) fn now_serial() -> f64 {
         .unwrap_or(0.0);
     25569.0 + secs / 86400.0
 }
-
-/// Registry for spreadsheet functions.
-
-/// Recursive descent parser for spreadsheet expressions.
 
 /// Tolerance-aware float equality.
 /// Returns true if numbers are within absolute or relative epsilon.

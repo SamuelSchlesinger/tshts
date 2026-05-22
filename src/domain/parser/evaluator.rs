@@ -74,11 +74,10 @@ impl<'a> ExpressionEvaluator<'a> {
         if let (Some(wb), Some((Some(sheet_name), _, _, _, _))) = (
             self.workbook,
             crate::domain::models::Spreadsheet::parse_qualified_reference(cell_ref),
-        ) {
-            if let Some(idx) = wb.sheet_names.iter().position(|n| n == &sheet_name) {
+        )
+            && let Some(idx) = wb.sheet_names.iter().position(|n| n == &sheet_name) {
                 return &wb.sheets[idx];
             }
-        }
         self.spreadsheet
     }
 
@@ -102,6 +101,12 @@ impl<'a> ExpressionEvaluator<'a> {
             Expr::Number(value) => Ok(Value::Number(*value)),
 
             Expr::String(text) => Ok(Value::String(text.clone())),
+
+            // Source-level error literal: surface as Value::Error so the
+            // existing first-error propagation in Binary/Unary/FunctionCall
+            // cascades it through containing expressions exactly like a
+            // runtime-produced error would.
+            Expr::ErrorLit(kind) => Ok(Value::Error(*kind)),
 
             Expr::NamedRef(name) => {
                 // Local scope (LET / LAMBDA params) takes priority over
@@ -131,10 +136,23 @@ impl<'a> ExpressionEvaluator<'a> {
                 result
             }
 
-            // A bare LAMBDA outside an invocation evaluates to itself as a
-            // single-cell value. The string form is its formula source so
-            // round-trip through named ranges works.
-            Expr::Lambda { .. } => Ok(Value::String(format!("[LAMBDA]"))),
+            // A bare LAMBDA outside an invocation produces a placeholder
+            // display value. The underlying formula source is preserved in
+            // `cell.formula`, so the lambda survives save/load and can be
+            // invoked by name (after being assigned to a named range or
+            // used inside a LET). Invoking a lambda stored in another cell
+            // via `=A1(5)` is NOT supported — that would require a dedicated
+            // `Value::Lambda` variant carrying the AST, which is a larger
+            // change. The Excel-equivalent error here would be `#CALC!`;
+            // we use a non-error string so the cell display is friendly.
+            Expr::Lambda { params, .. } => {
+                let summary = if params.is_empty() {
+                    "[LAMBDA]".to_string()
+                } else {
+                    format!("[LAMBDA({})]", params.join(","))
+                };
+                Ok(Value::String(summary))
+            }
 
             Expr::ArrayLiteral { rows } => {
                 let r = rows.len();
@@ -278,7 +296,14 @@ impl<'a> ExpressionEvaluator<'a> {
             
             Expr::Unary { operator, operand } => {
                 let operand_val = self.evaluate(operand)?;
-                
+
+                // Error propagation: an error-carrying operand returns the
+                // error directly, same as Binary does. Without this,
+                // `=-#REF!` would silently become `0` because to_number()
+                // converts Value::Error to 0.0.
+                if let Some(e) = operand_val.first_error() {
+                    return Ok(Value::Error(e));
+                }
                 match operator {
                     UnaryOp::Plus => Ok(Value::Number(operand_val.to_number())),
                     UnaryOp::Minus => Ok(Value::Number(-operand_val.to_number())),
@@ -300,13 +325,12 @@ impl<'a> ExpressionEvaluator<'a> {
                 // User-defined LAMBDA stored as a named range:
                 // `:name DOUBLE LAMBDA(x, x*2)` then `=DOUBLE(7)` looks up
                 // DOUBLE, parses it as a lambda, and invokes with the args.
-                if let Some(names) = self.named_ranges {
-                    if let Some(value) = names
+                if let Some(names) = self.named_ranges
+                    && let Some(value) = names
                         .get(&upper)
                         .or_else(|| names.get(name))
-                    {
-                        if let Ok(mut p) = Parser::new(value) {
-                            if let Ok(Expr::Lambda { params, body }) = p.parse() {
+                        && let Ok(mut p) = Parser::new(value)
+                            && let Ok(Expr::Lambda { params, body }) = p.parse() {
                                 if params.len() != args.len() {
                                     return Err(format!(
                                         "{}: expected {} arg(s), got {}",
@@ -325,9 +349,6 @@ impl<'a> ExpressionEvaluator<'a> {
                                 self.local_scope.borrow_mut().pop();
                                 return result;
                             }
-                        }
-                    }
-                }
                 let func = self.function_registry.get_function(name)
                     .ok_or_else(|| format!("Unknown function: {}", name))?;
                 let arg_values = self.evaluate_function_args(args)?;

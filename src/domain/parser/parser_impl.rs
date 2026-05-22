@@ -199,7 +199,7 @@ impl Parser {
     /// Builds an `Expr::Let` from a parsed argument list.
     /// LET(name1, value1, name2, value2, ..., body) — at least 3 args; odd count.
     fn build_let(mut args: Vec<Expr>) -> Result<Expr, String> {
-        if args.len() < 3 || args.len() % 2 == 0 {
+        if args.len() < 3 || args.len().is_multiple_of(2) {
             return Err("LET requires an odd number of arguments ≥ 3".to_string());
         }
         let body = args.pop().unwrap();
@@ -306,7 +306,16 @@ impl Parser {
                 self.advance()?;
                 Ok(Expr::String(text))
             }
-            
+
+            // Source-level error literal (`#REF!`, `#N/A`, etc.). Becomes
+            // Value::Error at eval time; error propagation in Binary,
+            // FunctionCall, etc. cascades it through containing expressions.
+            Token::ErrorLit(kind) => {
+                let kind = *kind;
+                self.advance()?;
+                Ok(Expr::ErrorLit(kind))
+            }
+
             Token::CellRef(cell) => {
                 let cell = cell.clone();
                 self.advance()?;
@@ -361,8 +370,6 @@ impl Parser {
                 }
                 // Quoted 3-D ref: 'Sheet1':'Sheet3'!A1 or 'Sheet1':Sheet3!A1
                 if self.current_token == Token::Colon {
-                    let lookahead = self.current_token.clone();
-                    let _ = lookahead;
                     // Peek ahead to see if we have a sheet name + Bang.
                     self.advance()?; // consume ':'
                     let second_name: Option<String> = match &self.current_token {

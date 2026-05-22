@@ -173,8 +173,13 @@ impl App {
             ["sort", "asc"] => self.sort_column_asc(),
             ["sort", "desc"] => self.sort_column_desc(),
             ["freeze"] => {
-                self.frozen_rows = self.selected_row;
-                self.frozen_cols = self.selected_col;
+                // Clamp to the active sheet's bounds so a stale cursor past
+                // the last row/col doesn't produce an unreachable frozen pane.
+                let sheet = self.workbook.current_sheet();
+                let max_r = sheet.rows.saturating_sub(1);
+                let max_c = sheet.cols.saturating_sub(1);
+                self.frozen_rows = self.selected_row.min(max_r);
+                self.frozen_cols = self.selected_col.min(max_c);
                 self.status_message = Some(format!("Frozen {} rows, {} cols", self.frozen_rows, self.frozen_cols));
             }
             ["unfreeze"] => {
@@ -238,6 +243,11 @@ impl App {
                     self.selected_col = 0;
                     self.scroll_row = 0;
                     self.scroll_col = 0;
+                    // remove_sheet may have shifted the active sheet (the
+                    // workbook re-anchors it). Drop search/find-replace state
+                    // since their (row, col) results belonged to the old
+                    // active sheet.
+                    self.invalidate_cross_sheet_state();
                     self.status_message = Some(format!("Deleted sheet '{}'", name));
                 } else {
                     self.status_message = Some("Cannot delete the last sheet".to_string());
@@ -418,12 +428,11 @@ impl App {
                     for (i, opt) in opts.iter().enumerate() {
                         if opt.starts_with("name=") {
                             // Pull the same position from the original (case-preserved) tokens.
-                            if let Some(orig) = original_opts.get(i) {
-                                if let Some(n) = orig.strip_prefix("name=") {
+                            if let Some(orig) = original_opts.get(i)
+                                && let Some(n) = orig.strip_prefix("name=") {
                                     name = n.to_string();
                                     continue;
                                 }
-                            }
                             // Fallback: use lowercased opt.
                             if let Some(n) = opt.strip_prefix("name=") {
                                 name = n.to_string();
@@ -694,8 +703,7 @@ impl App {
                             },
                         ));
                     }
-                    self.workbook.current_sheet_mut().set_many(rows);
-                    self.dirty = true;
+                    self.set_many_with_undo(rows);
                     self.status_message = Some(format!(
                         "Pivot written to {}{}: {} groups (auto-refreshes via formulas)",
                         crate::domain::Spreadsheet::column_label(t.1),
@@ -712,9 +720,12 @@ impl App {
                 let input_pos = crate::domain::Spreadsheet::parse_cell_reference(input);
                 let expected_v: f64 = expected.parse().unwrap_or(0.0);
                 if let (Some(t), Some(i)) = (target_pos, input_pos) {
+                    // Snapshot the original input cell before bisection so we
+                    // can either undo the final write or restore on failure
+                    // without leaking ~80 intermediate values into undo history.
+                    let original_cell = self.workbook.current_sheet().get_cell(i.0, i.1);
                     let mut lo = -1e9_f64;
                     let mut hi = 1e9_f64;
-                    let original_input = self.workbook.current_sheet().get_cell(i.0, i.1).value.clone();
                     let mut result: Option<f64> = None;
                     for _ in 0..80 {
                         let mid = (lo + hi) / 2.0;
@@ -723,7 +734,7 @@ impl App {
                             formula: None,
                             format: None,
                             comment: None,
-                        spill_anchor: None,
+                            spill_anchor: None,
                         };
                         self.workbook.current_sheet_mut().set_cell(i.0, i.1, cell);
                         let cur: f64 = self.workbook.current_sheet().get_cell(t.0, t.1).value.parse().unwrap_or(0.0);
@@ -738,18 +749,28 @@ impl App {
                         }
                     }
                     if let Some(v) = result {
-                        self.dirty = true;
-                        self.status_message = Some(format!("Goal seek: {} = {:.6}", input, v));
-                    } else {
-                        // Restore original input on failure.
-                        let cell = CellData {
-                            value: original_input,
+                        // Restore the cell to its pre-bisection state, then
+                        // perform the final write through set_cell_with_undo
+                        // so the recorded `old_cell` is the *original* value
+                        // (not the last bisection step).
+                        self.workbook
+                            .current_sheet_mut()
+                            .set_cell(i.0, i.1, original_cell);
+                        let final_cell = CellData {
+                            value: v.to_string(),
                             formula: None,
                             format: None,
                             comment: None,
-                        spill_anchor: None,
+                            spill_anchor: None,
                         };
-                        self.workbook.current_sheet_mut().set_cell(i.0, i.1, cell);
+                        self.set_cell_with_undo(i.0, i.1, final_cell);
+                        self.status_message = Some(format!("Goal seek: {} = {:.6}", input, v));
+                    } else {
+                        // No-op net effect: put the original cell back, no
+                        // undo entry needed.
+                        self.workbook
+                            .current_sheet_mut()
+                            .set_cell(i.0, i.1, original_cell);
                         self.status_message = Some("Goal seek did not converge".to_string());
                     }
                 } else {

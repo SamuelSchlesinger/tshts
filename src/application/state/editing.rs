@@ -30,7 +30,9 @@ impl App {
 
     pub fn vim_open_row_below(&mut self) {
         let at = self.selected_row + 1;
-        self.workbook.current_sheet_mut().insert_row(at);
+        // Route through the Workbook so cross-sheet refs to rows >= `at`
+        // shift along with the same-sheet ones.
+        self.workbook.insert_row_on_active(at);
         self.selected_row = at;
         self.dirty = true;
         self.ensure_cursor_visible();
@@ -39,7 +41,7 @@ impl App {
 
     pub fn vim_open_row_above(&mut self) {
         let at = self.selected_row;
-        self.workbook.current_sheet_mut().insert_row(at);
+        self.workbook.insert_row_on_active(at);
         self.dirty = true;
         self.ensure_cursor_visible();
         self.start_editing();

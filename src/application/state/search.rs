@@ -158,7 +158,21 @@ impl App {
         spill_anchor: None,
         };
         self.set_cell_with_undo(row, col, new_cell);
+        // Refresh the match list (the replacement may itself still match,
+        // or may no longer match) and resume from the cell right after the
+        // one we just replaced — otherwise repeated Replace would loop on
+        // results[0] instead of moving forward through the document.
         self.find_replace_search();
+        let next_idx = self
+            .find_replace_results
+            .iter()
+            .position(|&(r, c)| (r, c) > (row, col));
+        self.find_replace_index = next_idx.unwrap_or(0);
+        if let Some(&(r, c)) = self.find_replace_results.get(self.find_replace_index) {
+            self.selected_row = r;
+            self.selected_col = c;
+            self.ensure_cursor_visible();
+        }
     }
 
     pub fn replace_all(&mut self) {
@@ -193,6 +207,9 @@ impl App {
                 new_cell: Some(new_cell.clone()),
             });
             self.workbook.current_sheet_mut().set_cell(row, col, new_cell);
+            // Replaced cells may be referenced by formulas on other sheets;
+            // notify the cross-sheet propagator so they recalc.
+            self.propagate_cell_change(row, col);
         }
         let count = batch.len();
         if !batch.is_empty() {
@@ -218,12 +235,57 @@ impl App {
     }
 
     pub fn finish_goto_cell(&mut self) {
-        if let Some((row, col)) = crate::domain::Spreadsheet::parse_cell_reference(&self.goto_cell_input) {
-            if row < self.workbook.current_sheet().rows && col < self.workbook.current_sheet().cols {
+        // Accept sheet-qualified refs (`Sheet2!A1`) so :goto can jump
+        // across sheets, not just inside the active one. parse_qualified_reference
+        // returns (sheet_opt, row, col, abs_row, abs_col).
+        let parsed = crate::domain::Spreadsheet::parse_qualified_reference(&self.goto_cell_input);
+        if let Some((sheet_opt, row, col, _, _)) = parsed {
+            // Resolve the target sheet (current sheet if unqualified, by
+            // case-insensitive lookup otherwise).
+            let target_sheet_idx = if let Some(name) = sheet_opt.as_ref() {
+                self.workbook
+                    .sheet_names
+                    .iter()
+                    .position(|n| n.eq_ignore_ascii_case(name))
+            } else {
+                Some(self.workbook.active_sheet)
+            };
+            let Some(target_idx) = target_sheet_idx else {
+                self.status_message = Some(format!(
+                    "Unknown sheet: {}",
+                    sheet_opt.as_deref().unwrap_or("")
+                ));
+                self.mode = AppMode::Normal;
+                self.goto_cell_input.clear();
+                self.cursor_position = 0;
+                return;
+            };
+            let in_bounds = {
+                let sheet = &self.workbook.sheets[target_idx];
+                row < sheet.rows && col < sheet.cols
+            };
+            if in_bounds {
+                // Cross-sheet jump: switch the active sheet and invalidate
+                // (row, col)-keyed state that doesn't survive a sheet change.
+                if target_idx != self.workbook.active_sheet {
+                    self.workbook.active_sheet = target_idx;
+                    self.scroll_row = 0;
+                    self.scroll_col = 0;
+                    self.clear_selection();
+                    self.invalidate_cross_sheet_state();
+                }
                 self.selected_row = row;
                 self.selected_col = col;
                 self.ensure_cursor_visible();
-                self.status_message = Some(format!("Jumped to {}{}", crate::domain::Spreadsheet::column_label(col), row + 1));
+                self.status_message = Some(format!(
+                    "Jumped to {}{}{}",
+                    sheet_opt
+                        .as_ref()
+                        .map(|n| format!("{}!", n))
+                        .unwrap_or_default(),
+                    crate::domain::Spreadsheet::column_label(col),
+                    row + 1
+                ));
             } else {
                 self.status_message = Some("Cell reference out of range".to_string());
             }
@@ -364,6 +426,41 @@ mod tests {
         assert!(matches!(app.mode, AppMode::Normal));
         assert_eq!(app.selected_row, 4); // 0-indexed
         assert_eq!(app.selected_col, 2); // C = index 2
+    }
+
+    #[test]
+    fn test_goto_cell_cross_sheet_switches_active() {
+        let mut app = App::default();
+        app.workbook.add_sheet("Data".to_string());
+        // Seed a search result on Sheet1 to verify cross-sheet invalidation.
+        app.search_results.push((9, 9));
+        app.search_result_index = 0;
+        assert_eq!(app.workbook.active_sheet, 0);
+        app.start_goto_cell();
+        app.goto_cell_input = "Data!B3".to_string();
+        app.finish_goto_cell();
+        assert!(matches!(app.mode, AppMode::Normal));
+        assert_eq!(app.workbook.active_sheet, 1, "must switch to Data sheet");
+        assert_eq!(app.selected_row, 2);
+        assert_eq!(app.selected_col, 1);
+        // Cross-sheet jump should invalidate stale search results.
+        assert!(app.search_results.is_empty(), "search results must be cleared on cross-sheet goto");
+    }
+
+    #[test]
+    fn test_goto_cell_unknown_sheet_errors_gracefully() {
+        let mut app = App::default();
+        app.start_goto_cell();
+        app.goto_cell_input = "NoSuchSheet!A1".to_string();
+        app.finish_goto_cell();
+        assert!(matches!(app.mode, AppMode::Normal));
+        assert_eq!(app.workbook.active_sheet, 0, "must not switch on bogus sheet");
+        let msg = app.status_message.as_deref().unwrap_or("");
+        assert!(
+            msg.contains("Unknown sheet") || msg.contains("NoSuchSheet"),
+            "expected an error message about the unknown sheet, got: {}",
+            msg
+        );
     }
 
     #[test]

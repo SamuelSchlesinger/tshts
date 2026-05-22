@@ -46,6 +46,14 @@ src/
 
 **Formula Parser**: Recursive descent with operator precedence (low to high): equality, comparison, addition, concatenation, multiplication, power, unary, primary. Logical ops (AND, OR, NOT) are functions, not operators.
 
+**Error Literals**: Excel-style error values (`#REF!`, `#N/A`, `#DIV/0!`, `#VALUE!`, `#NAME?`, `#NUM!`, `#NULL!`, `#SPILL!`) are first-class AST nodes (`Expr::ErrorLit(ErrorKind)`), lexed greedily by the longest-match-first rule. They evaluate to `Value::Error(kind)` and propagate through arithmetic, function calls, and unary ops via the standard `first_error()` cascade. Formula adjustment (paste, row/col insert/delete) emits `Expr::ErrorLit(Ref)` when a relative shift takes a reference past the origin, instead of clamping or collapsing the formula. The serialized form round-trips cleanly: `=#REF!+B5` parses back to the same AST.
+
+**Cross-sheet structural edits**: `Workbook::insert_row_on_active`, `delete_row_on_active`, `insert_col_on_active`, `delete_col_on_active` perform the same-sheet structural mutation and also walk every OTHER sheet's formulas to shift any sheet-qualified refs to the mutated sheet (e.g. inserting a row at Sheet1!A5 shifts `=Sheet1!A5` to `=Sheet1!A6` on every other sheet). Refs to a deleted sheet's removed row/col become `#REF!`. Routes through `App::insert_row`/`delete_row`/etc.
+
+**Sheet rename/delete**: `Workbook::rename_sheet` rewrites all formula refs (and named-range values) from old to new name, then triggers cross-sheet propagation so dependents recompute. `Workbook::remove_sheet` rewrites every dangling `=GoneSheet!A1` on surviving sheets to `=#REF!` (Excel-equivalent), then purges the dep graph.
+
+**Cross-sheet propagation helper**: `App::propagate_cell_change(row, col)` runs `register_cross_sheet_deps` + `propagate_cross_sheet_changes` on the workbook for the current sheet. Use it from any mutation path (cut, paste, replace_all, vim delete, undo/redo) that writes/clears cells outside of `set_cell_with_undo` / `clear_cell_with_undo`, which already call it internally.
+
 ## Testing
 
 Two layers, both run by plain `cargo test`:

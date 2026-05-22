@@ -42,6 +42,14 @@ impl App {
         for row in start_row..=end_row {
             for col in start_col..=end_col {
                 let cell = self.workbook.current_sheet().get_cell(row, col);
+                // Skip spill ghosts: their value is derived from an anchor
+                // formula and they have no formula of their own, so pasting
+                // them as-is would produce inert duplicates of the anchor's
+                // top-left value. The anchor (when included in the range)
+                // carries the formula and will re-spill at the destination.
+                if cell.spill_anchor.is_some() {
+                    continue;
+                }
                 if !cell.value.is_empty() || cell.formula.is_some() {
                     cells.push((row - start_row, col - start_col, cell));
                 }
@@ -90,19 +98,23 @@ impl App {
         for row in start_row..=end_row {
             for col in start_col..=end_col {
                 let cell = self.workbook.current_sheet().get_cell(row, col);
+                if cell.spill_anchor.is_some() {
+                    continue;
+                }
                 if !cell.value.is_empty() || cell.formula.is_some() {
                     cells.push((row - start_row, col - start_col, cell));
                 }
             }
         }
-        let count = (end_row - start_row + 1) * (end_col - start_col + 1);
+        let count = cells.len();
         self.clipboard = Some(ClipboardData {
             cells,
             source_row: start_row,
             source_col: start_col,
             is_row_op: false,
         });
-        // Clear the cut cells
+        // Clear the cut cells and notify cross-sheet listeners so any
+        // formula on another sheet that referenced these now goes stale.
         let mut batch = Vec::new();
         for row in start_row..=end_row {
             for col in start_col..=end_col {
@@ -114,6 +126,7 @@ impl App {
                 if old.is_some() {
                     batch.push(UndoAction::CellModified { row, col, old_cell: old, new_cell: None });
                     self.workbook.current_sheet_mut().clear_cell(row, col);
+                    self.propagate_cell_change(row, col);
                 }
             }
         }
@@ -129,11 +142,11 @@ impl App {
         // back to internal clipboard, then plain-text TSV.
         // Skipped in tests because $HOME and ~/.cache/tshts persist between
         // test runs and would otherwise leak state between cases.
-        if !cfg!(test) {
-            if let Ok(mut board) = arboard::Clipboard::new() {
-                if let Ok(text) = board.get_text() {
-                    if crate::infrastructure::sidecar::strip_sentinel(&text).is_some() {
-                        if let Some(payload) = crate::infrastructure::sidecar::read() {
+        if !cfg!(test)
+            && let Ok(mut board) = arboard::Clipboard::new()
+                && let Ok(text) = board.get_text()
+                    && crate::infrastructure::sidecar::strip_sentinel(&text).is_some()
+                        && let Some(payload) = crate::infrastructure::sidecar::read() {
                             let cb = ClipboardData {
                                 cells: payload.cells,
                                 source_row: payload.source_row,
@@ -142,26 +155,19 @@ impl App {
                             };
                             self.clipboard = Some(cb);
                         }
-                    }
-                }
-            }
-        }
         let clipboard = if let Some(ref cb) = self.clipboard {
             cb.clone()
         } else {
             // Tests don't touch the system clipboard (cross-test contamination).
-            if !cfg!(test) {
-                if let Ok(mut board) = arboard::Clipboard::new() {
-                    if let Ok(text) = board.get_text() {
-                        if !text.is_empty() {
+            if !cfg!(test)
+                && let Ok(mut board) = arboard::Clipboard::new()
+                    && let Ok(text) = board.get_text()
+                        && !text.is_empty() {
                             let body = crate::infrastructure::sidecar::strip_sentinel(&text)
                                 .unwrap_or(&text);
                             self.paste_tsv(body);
                             return;
                         }
-                    }
-                }
-            }
             self.status_message = Some("Nothing to paste".to_string());
             return;
         };
@@ -216,7 +222,16 @@ impl App {
             writes.push((*target_row, *target_col, new_cell.clone()));
         }
         if !writes.is_empty() {
+            // Bulk-write via the domain `set_many` (single recalc pass for
+            // same-sheet dependents) and then replay cross-sheet bookkeeping
+            // per cell so formulas on OTHER sheets that reference the pasted
+            // cells (or pasted formulas that reference other sheets) recalc.
+            let positions: Vec<(usize, usize)> =
+                writes.iter().map(|(r, c, _)| (*r, *c)).collect();
             self.workbook.current_sheet_mut().set_many(writes);
+            for (r, c) in positions {
+                self.propagate_cell_change(r, c);
+            }
         }
         if !batch.is_empty() {
             self.record_action(UndoAction::Batch(batch));
@@ -244,7 +259,12 @@ impl App {
                     None
                 };
                 // If the pasted cell starts with `=`, treat it as a formula
-                // and evaluate it relative to the destination cell.
+                // and evaluate it at the destination. References are NOT
+                // adjusted: this path is only reached when the source was
+                // not tshts (no sentinel/sidecar), so we have no original
+                // anchor to shift against. Excel and Sheets behave the same
+                // way for plain-text formula paste. The tshts→tshts path in
+                // `paste()` (line ~184) handles relative adjustment properly.
                 let new_cell = if value.starts_with('=') {
                     let evaluator = FormulaEvaluator::new(self.workbook.current_sheet());
                     let evaluated = evaluator.evaluate_formula(value);
@@ -271,6 +291,9 @@ impl App {
                     new_cell: Some(new_cell.clone()),
                 });
                 self.workbook.current_sheet_mut().set_cell(target_row, target_col, new_cell);
+                // Cells on other sheets that reference this destination need
+                // to recalc against the pasted value.
+                self.propagate_cell_change(target_row, target_col);
                 count += 1;
             }
         }
@@ -282,14 +305,16 @@ impl App {
 
     pub fn insert_row(&mut self) {
         let insert_at = self.selected_row;
-        self.workbook.current_sheet_mut().insert_row(insert_at);
+        // Routes through Workbook so cross-sheet refs to this sheet adjust
+        // too (e.g. `Sheet2!A5` shifts to `Sheet2!A6` on insertion above A5).
+        self.workbook.insert_row_on_active(insert_at);
         self.dirty = true;
         self.status_message = Some(format!("Inserted row at {}", insert_at + 1));
     }
 
     pub fn delete_row(&mut self) {
         let delete_at = self.selected_row;
-        self.workbook.current_sheet_mut().delete_row(delete_at);
+        self.workbook.delete_row_on_active(delete_at);
         if self.selected_row >= self.workbook.current_sheet().rows {
             self.selected_row = self.workbook.current_sheet().rows.saturating_sub(1);
         }
@@ -299,14 +324,14 @@ impl App {
 
     pub fn insert_col(&mut self) {
         let insert_at = self.selected_col;
-        self.workbook.current_sheet_mut().insert_col(insert_at);
+        self.workbook.insert_col_on_active(insert_at);
         self.dirty = true;
         self.status_message = Some(format!("Inserted column at {}", crate::domain::Spreadsheet::column_label(insert_at)));
     }
 
     pub fn delete_col(&mut self) {
         let delete_at = self.selected_col;
-        self.workbook.current_sheet_mut().delete_col(delete_at);
+        self.workbook.delete_col_on_active(delete_at);
         if self.selected_col >= self.workbook.current_sheet().cols {
             self.selected_col = self.workbook.current_sheet().cols.saturating_sub(1);
         }

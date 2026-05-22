@@ -11,6 +11,7 @@ use ratatui::{
     Frame,
 };
 use super::{caret, layer_for_render, terminal_color_to_ratatui};
+use unicode_width::UnicodeWidthChar;
 
 pub(super) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
     // Pre-compute the stats up-front (mutable borrow) so we can hold immutable
@@ -24,11 +25,37 @@ pub(super) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
             if let Some(ref status) = app.status_message {
                 format!("{} {}", mode_label, status)
             } else {
-                let filename = app.filename.as_ref().map(|f| f.as_str()).unwrap_or("unsaved");
+                let filename = app.filename.as_deref().unwrap_or("unsaved");
                 let comment_info = {
                     let cell = app.workbook.current_sheet().get_cell(app.selected_row, app.selected_col);
                     if let Some(ref comment) = cell.comment {
-                        format!(" | Comment: {}", comment)
+                        // Truncate by display width so a long comment can't
+                        // overflow the status bar and corrupt rendering.
+                        // Newlines also break the single-line bar, so collapse
+                        // them. unicode-width gives us proper width for
+                        // CJK / emoji.
+                        const MAX_WIDTH: usize = 40;
+                        let mut width = 0;
+                        let mut truncated = String::new();
+                        let mut clipped = false;
+                        for ch in comment.chars() {
+                            if ch == '\n' || ch == '\r' {
+                                truncated.push(' ');
+                                width += 1;
+                            } else {
+                                let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+                                if width + w > MAX_WIDTH {
+                                    clipped = true;
+                                    break;
+                                }
+                                truncated.push(ch);
+                                width += w;
+                            }
+                        }
+                        if clipped {
+                            truncated.push('…');
+                        }
+                        format!(" | Comment: {}", truncated)
                     } else {
                         String::new()
                     }
