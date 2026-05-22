@@ -637,22 +637,26 @@ impl App {
         if cells.is_empty() {
             return;
         }
-        let mut batch = Vec::with_capacity(cells.len());
-        for (row, col, new_data) in cells {
-            let old_cell = if self.workbook.current_sheet().cells.contains_key(&(row, col)) {
-                Some(self.workbook.current_sheet().get_cell(row, col))
-            } else {
-                None
-            };
-            batch.push(UndoAction::CellModified {
-                row,
-                col,
-                old_cell,
-                new_cell: Some(new_data.clone()),
-            });
-            self.workbook.current_sheet_mut().set_cell(row, col, new_data);
-            self.propagate_cell_change(row, col);
-        }
+        // Snapshot pre-images for undo before any write lands.
+        let batch: Vec<UndoAction> = cells
+            .iter()
+            .map(|(row, col, new_data)| {
+                let old_cell = if self.workbook.current_sheet().cells.contains_key(&(*row, *col)) {
+                    Some(self.workbook.current_sheet().get_cell(*row, *col))
+                } else {
+                    None
+                };
+                UndoAction::CellModified {
+                    row: *row,
+                    col: *col,
+                    old_cell,
+                    new_cell: Some(new_data.clone()),
+                }
+            })
+            .collect();
+        // Single workbook API call handles same-sheet recalc + cross-sheet
+        // propagation for the whole batch.
+        self.workbook.write_cells_on_active(cells);
         self.record_action(UndoAction::Batch(batch));
     }
 

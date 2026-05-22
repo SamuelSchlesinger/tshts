@@ -221,18 +221,9 @@ impl App {
             });
             writes.push((*target_row, *target_col, new_cell.clone()));
         }
-        if !writes.is_empty() {
-            // Bulk-write via the domain `set_many` (single recalc pass for
-            // same-sheet dependents) and then replay cross-sheet bookkeeping
-            // per cell so formulas on OTHER sheets that reference the pasted
-            // cells (or pasted formulas that reference other sheets) recalc.
-            let positions: Vec<(usize, usize)> =
-                writes.iter().map(|(r, c, _)| (*r, *c)).collect();
-            self.workbook.current_sheet_mut().set_many(writes);
-            for (r, c) in positions {
-                self.propagate_cell_change(r, c);
-            }
-        }
+        // Single workbook API call handles same-sheet recalc + cross-sheet
+        // propagation for the whole paste batch.
+        self.workbook.write_cells_on_active(writes);
         if !batch.is_empty() {
             self.record_action(UndoAction::Batch(batch));
         }
@@ -294,18 +285,9 @@ impl App {
             }
         }
         let count = writes.len();
-        if !writes.is_empty() {
-            // Bulk-write via set_many (one same-sheet recalc pass) and replay
-            // cross-sheet bookkeeping per cell. Previously each cell hit
-            // set_cell + propagate_cell_change in the inner loop — O(N²) on
-            // wide pastes.
-            let positions: Vec<(usize, usize)> =
-                writes.iter().map(|(r, c, _)| (*r, *c)).collect();
-            self.workbook.current_sheet_mut().set_many(writes);
-            for (r, c) in positions {
-                self.propagate_cell_change(r, c);
-            }
-        }
+        // Single workbook API call handles same-sheet recalc + cross-sheet
+        // propagation for the whole paste batch.
+        self.workbook.write_cells_on_active(writes);
         if !batch.is_empty() {
             self.record_action(UndoAction::Batch(batch));
         }

@@ -198,6 +198,7 @@ impl App {
             self.search_case_sensitive,
         );
         let mut batch = Vec::new();
+        let mut writes: Vec<(usize, usize, CellData)> = Vec::new();
         let mut skipped_formulas = 0usize;
         let results = self.find_replace_results.clone();
         for (row, col) in results {
@@ -224,12 +225,12 @@ impl App {
                 old_cell,
                 new_cell: Some(new_cell.clone()),
             });
-            self.workbook.current_sheet_mut().set_cell(row, col, new_cell);
-            // Replaced cells may be referenced by formulas on other sheets;
-            // notify the cross-sheet propagator so they recalc.
-            self.propagate_cell_change(row, col);
+            writes.push((row, col, new_cell));
         }
-        let count = batch.len();
+        let count = writes.len();
+        // Single workbook API call handles same-sheet recalc + cross-sheet
+        // propagation for the whole batch.
+        self.workbook.write_cells_on_active(writes);
         if !batch.is_empty() {
             self.record_action(UndoAction::Batch(batch));
         }

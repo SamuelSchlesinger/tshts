@@ -58,6 +58,7 @@ impl App {
             }
             VimOperator::Delete | VimOperator::Change => {
                 let mut batch = Vec::new();
+                let mut positions = Vec::new();
                 for row in r0..=r1 {
                     for col in c0..=c1 {
                         let old = self
@@ -67,11 +68,7 @@ impl App {
                             .get(&(row, col))
                             .cloned();
                         if old.is_some() {
-                            self.workbook.current_sheet_mut().clear_cell(row, col);
-                            // Match cut_selection/clear_cell_with_undo:
-                            // cleared cells may be referenced by formulas on
-                            // other sheets, which need to recalc.
-                            self.propagate_cell_change(row, col);
+                            positions.push((row, col));
                             batch.push(UndoAction::CellModified {
                                 row,
                                 col,
@@ -82,6 +79,9 @@ impl App {
                     }
                 }
                 if !batch.is_empty() {
+                    // Single workbook API call handles clear + cross-sheet
+                    // propagation for the whole batch.
+                    self.workbook.clear_cells_on_active(positions);
                     self.record_action(UndoAction::Batch(batch));
                     self.dirty = true;
                 }

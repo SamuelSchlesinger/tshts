@@ -369,6 +369,47 @@ impl Workbook {
         existed
     }
 
+    /// Write a batch of cells to the active sheet, then propagate.
+    ///
+    /// Replaces the previous "call set_many then loop calling
+    /// propagate_cell_change at every site" discipline with a single API.
+    /// This is the only mutation path that callers outside of undo/redo
+    /// should use; using `current_sheet_mut().set_cell` directly bypasses
+    /// cross-sheet propagation and is reserved for the workbook's own
+    /// internals (load paths, recalc, undo/redo apply).
+    pub fn write_cells_on_active(
+        &mut self,
+        writes: Vec<(usize, usize, CellData)>,
+    ) {
+        if writes.is_empty() {
+            return;
+        }
+        let positions: Vec<(usize, usize)> =
+            writes.iter().map(|(r, c, _)| (*r, *c)).collect();
+        let sheet_name = self.sheet_names[self.active_sheet].clone();
+        self.sheets[self.active_sheet].set_many(writes);
+        for (r, c) in positions {
+            self.register_cross_sheet_deps(&sheet_name, r, c);
+            self.propagate_cross_sheet_changes(&sheet_name, r, c);
+        }
+    }
+
+    /// Clear a batch of cells on the active sheet, then propagate.
+    /// Symmetric counterpart to `write_cells_on_active`.
+    pub fn clear_cells_on_active(&mut self, positions: Vec<(usize, usize)>) {
+        if positions.is_empty() {
+            return;
+        }
+        let sheet_name = self.sheet_names[self.active_sheet].clone();
+        for (r, c) in &positions {
+            self.sheets[self.active_sheet].clear_cell(*r, *c);
+        }
+        for (r, c) in positions {
+            self.register_cross_sheet_deps(&sheet_name, r, c);
+            self.propagate_cross_sheet_changes(&sheet_name, r, c);
+        }
+    }
+
     /// Creates a Workbook from a single Spreadsheet (for backward compatibility).
     pub fn from_spreadsheet(sheet: Spreadsheet) -> Self {
         Self {

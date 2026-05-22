@@ -108,25 +108,12 @@ impl App {
                 }
             }
         }
-        // Clears first (so dependent invalidation happens), then bulk writes.
-        let touched: Vec<(usize, usize)> = clears
-            .iter()
-            .copied()
-            .chain(writes.iter().map(|(r, c, _)| (*r, *c)))
-            .collect();
-        for (r, c) in &clears {
-            self.workbook.current_sheet_mut().clear_cell(*r, *c);
-        }
-        if !writes.is_empty() {
-            self.workbook.current_sheet_mut().set_many(writes);
-        }
+        // Single workbook API call handles same-sheet recalc + cross-sheet
+        // propagation for both clears and writes.
+        self.workbook.clear_cells_on_active(clears);
+        self.workbook.write_cells_on_active(writes);
         if !batch.is_empty() {
             self.record_action(UndoAction::Batch(batch));
-        }
-        // Cross-sheet dependents on other sheets need to see the new values;
-        // set_many/clear_cell only handles the same-sheet dep graph.
-        for (r, c) in touched {
-            self.propagate_cell_change(r, c);
         }
         let dir = if ascending { "ascending" } else { "descending" };
         self.status_message = Some(format!(
