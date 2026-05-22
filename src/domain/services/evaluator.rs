@@ -113,10 +113,9 @@ impl<'a> FormulaEvaluator<'a> {
             let mut parser = Parser::new(s)?;
             parser.parse()
         })?;
-        let function_registry = FunctionRegistry::new();
-        // Single constructor takes all the optional context. Three-way fork
-        // collapsed — `parse_and_evaluate` no longer cares which subset of
-        // the context is present.
+        // Reuse the thread-local shared built-in registry instead of
+        // rebuilding a ~140-entry HashMap on every formula evaluation.
+        let function_registry = FunctionRegistry::shared_builtin();
         let evaluator = ExpressionEvaluator::new(
             self.spreadsheet,
             &function_registry,

@@ -3,9 +3,15 @@
 #![allow(unused_imports)]
 use super::*;
 
+/// Hard cap on recursive parser descents. Prevents stack overflow on
+/// adversarial input like `=(((((...)))))` thousands deep. Excel's nesting
+/// limit is 64 — we go higher for tooling but still bounded.
+pub(crate) const MAX_PARSE_DEPTH: u32 = 256;
+
 pub struct Parser {
     lexer: Lexer,
     current_token: Token,
+    depth: u32,
 }
 
 impl Parser {
@@ -13,11 +19,27 @@ impl Parser {
     pub fn new(input: &str) -> Result<Self, String> {
         let mut lexer = Lexer::new(input);
         let current_token = lexer.next_token()?;
-        
+
         Ok(Self {
             lexer,
             current_token,
+            depth: 0,
         })
+    }
+
+    /// Bump the recursion counter on entry to a recursive rule. Caller must
+    /// pair with `ascend()` on every return path; a `?` after `descend` keeps
+    /// the parser interruptible at the deepest level the cap allows.
+    fn descend(&mut self) -> Result<(), String> {
+        if self.depth >= MAX_PARSE_DEPTH {
+            return Err("Formula nests too deeply".to_string());
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
+    fn ascend(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
     }
     
     
@@ -38,6 +60,7 @@ impl Parser {
     
     /// Parses the top-level expression.
     pub fn parse(&mut self) -> Result<Expr, String> {
+        self.depth = 0;
         let expr = self.parse_equality()?;
         
         if self.current_token != Token::Eof {
@@ -72,36 +95,14 @@ impl Parser {
     
     /// Parses comparison expressions.
     fn parse_comparison(&mut self) -> Result<Expr, String> {
-        let mut left = self.parse_addition()?;
-        
+        let mut left = self.parse_concatenation()?;
+
         while matches!(self.current_token, Token::Less | Token::LessEqual | Token::Greater | Token::GreaterEqual) {
             let op = match self.current_token {
                 Token::Less => BinaryOp::Less,
                 Token::LessEqual => BinaryOp::LessEqual,
                 Token::Greater => BinaryOp::Greater,
                 Token::GreaterEqual => BinaryOp::GreaterEqual,
-                _ => unreachable!(),
-            };
-            self.advance()?;
-            let right = self.parse_addition()?;
-            left = Expr::Binary {
-                left: Box::new(left),
-                operator: op,
-                right: Box::new(right),
-            };
-        }
-        
-        Ok(left)
-    }
-    
-    /// Parses addition and subtraction expressions.
-    fn parse_addition(&mut self) -> Result<Expr, String> {
-        let mut left = self.parse_concatenation()?;
-        
-        while matches!(self.current_token, Token::Plus | Token::Minus) {
-            let op = match self.current_token {
-                Token::Plus => BinaryOp::Add,
-                Token::Minus => BinaryOp::Subtract,
                 _ => unreachable!(),
             };
             self.advance()?;
@@ -112,24 +113,48 @@ impl Parser {
                 right: Box::new(right),
             };
         }
-        
+
         Ok(left)
     }
-    
-    /// Parses string concatenation expressions.
+
+    /// Parses string concatenation expressions. Sits between comparison and
+    /// addition: Excel binds `&` looser than `+`/`-` but tighter than
+    /// comparisons, so `="a" & 1+2` is `"a3"` and `="a" & 1 = "a1"` is TRUE.
     fn parse_concatenation(&mut self) -> Result<Expr, String> {
-        let mut left = self.parse_multiplication()?;
-        
+        let mut left = self.parse_addition()?;
+
         while matches!(self.current_token, Token::Ampersand) {
             self.advance()?;
-            let right = self.parse_multiplication()?;
+            let right = self.parse_addition()?;
             left = Expr::Binary {
                 left: Box::new(left),
                 operator: BinaryOp::Concatenate,
                 right: Box::new(right),
             };
         }
-        
+
+        Ok(left)
+    }
+
+    /// Parses addition and subtraction expressions.
+    fn parse_addition(&mut self) -> Result<Expr, String> {
+        let mut left = self.parse_multiplication()?;
+
+        while matches!(self.current_token, Token::Plus | Token::Minus) {
+            let op = match self.current_token {
+                Token::Plus => BinaryOp::Add,
+                Token::Minus => BinaryOp::Subtract,
+                _ => unreachable!(),
+            };
+            self.advance()?;
+            let right = self.parse_multiplication()?;
+            left = Expr::Binary {
+                left: Box::new(left),
+                operator: op,
+                right: Box::new(right),
+            };
+        }
+
         Ok(left)
     }
     
@@ -174,7 +199,8 @@ impl Parser {
     
     /// Parses unary expressions.
     fn parse_unary(&mut self) -> Result<Expr, String> {
-        match self.current_token {
+        self.descend()?;
+        let result = match self.current_token {
             Token::Plus => {
                 self.advance()?;
                 let operand = self.parse_unary()?;
@@ -192,7 +218,9 @@ impl Parser {
                 })
             }
             _ => self.parse_primary(),
-        }
+        };
+        self.ascend();
+        result
     }
     
     /// Builds an `Expr::Let` from a parsed argument list.
@@ -472,24 +500,25 @@ impl Parser {
     /// Parses function argument lists.
     fn parse_argument_list(&mut self) -> Result<Vec<Expr>, String> {
         let mut args = Vec::new();
-        
+
         // Empty argument list
         if self.current_token == Token::RightParen {
             return Ok(args);
         }
-        
+
         // Parse first argument
         args.push(self.parse_equality()?);
-        
+
         // Parse remaining arguments
         while self.current_token == Token::Comma {
             self.advance()?;
             args.push(self.parse_equality()?);
         }
-        
+
         Ok(args)
     }
 }
+
 
 #[cfg(test)]
 mod tests {

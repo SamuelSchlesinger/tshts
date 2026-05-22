@@ -54,6 +54,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 app.workbook = workbook;
                 app.filename = Some(filename.clone());
                 app.dirty = false;
+                // Pull persistent freezes/hidden ranges/filter/validations
+                // from the loaded sheet into App-level runtime state.
+                app.restore_view_state_from_active_sheet();
                 infrastructure::recent::add(&filename);
                 app.status_message = Some(format!("Loaded {}", filename));
             }
@@ -156,6 +159,11 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<
                     }
                     _ => {}
                 },
+                Event::Resize(_, _) => {
+                    // Wake the loop so the next iteration's draw picks up the
+                    // new terminal size immediately. Without this arm, the UI
+                    // can show stale dimensions for up to the poll timeout.
+                }
                 _ => {}
             }
         }
@@ -168,10 +176,18 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<
             app.recalc_all();
         }
 
-        // Idle auto-save check.
-        if app.dirty && autosave::maybe_save(&app.workbook, app.filename.as_deref()) {
-            app.dirty = false;
-            app.status_message = Some("Auto-saved".to_string());
+        // Idle auto-save check: queue a snapshot but DON'T clear the dirty
+        // flag — the write is still in flight and the user may edit during
+        // it. The status receiver below clears dirty once the write actually
+        // lands (and only when it succeeded).
+        if app.dirty {
+            autosave::maybe_save(&app.workbook, app.filename.as_deref());
+        }
+        if let Some((msg, is_error)) = autosave::take_status_message() {
+            if !is_error {
+                app.dirty = false;
+            }
+            app.status_message = Some(msg);
         }
     }
 }

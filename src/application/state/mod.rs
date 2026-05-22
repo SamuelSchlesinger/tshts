@@ -162,6 +162,26 @@ pub enum UndoAction {
         sheet_idx: usize,
         at: usize,
     },
+    /// Row was deleted at `at` on `sheet_idx`. Undo restores `pre`;
+    /// redo re-runs the delete. We snapshot the entire workbook because
+    /// cross-sheet refs to the deleted row become `#REF!` and per-sheet
+    /// formula shifts can't be undone purely from the deleted row's contents.
+    RowDeleted {
+        sheet_idx: usize,
+        at: usize,
+        pre: Box<Workbook>,
+    },
+    /// Column was inserted at `at` on `sheet_idx`. Undo = delete the column.
+    ColInserted {
+        sheet_idx: usize,
+        at: usize,
+    },
+    /// Column was deleted. Same reasoning as RowDeleted.
+    ColDeleted {
+        sheet_idx: usize,
+        at: usize,
+        pre: Box<Workbook>,
+    },
 }
 
 impl UndoAction {
@@ -185,6 +205,17 @@ impl UndoAction {
                     with_active_sheet(workbook, *sheet_idx, |wb| wb.delete_row_on_active(*at));
                 }
             }
+            UndoAction::RowDeleted { pre, .. } => {
+                restore_workbook(workbook, pre);
+            }
+            UndoAction::ColInserted { sheet_idx, at } => {
+                if *sheet_idx < workbook.sheets.len() {
+                    with_active_sheet(workbook, *sheet_idx, |wb| wb.delete_col_on_active(*at));
+                }
+            }
+            UndoAction::ColDeleted { pre, .. } => {
+                restore_workbook(workbook, pre);
+            }
         }
     }
 
@@ -207,7 +238,33 @@ impl UndoAction {
                     with_active_sheet(workbook, *sheet_idx, |wb| wb.insert_row_on_active(*at));
                 }
             }
+            UndoAction::RowDeleted { sheet_idx, at, .. } => {
+                if *sheet_idx < workbook.sheets.len() {
+                    with_active_sheet(workbook, *sheet_idx, |wb| wb.delete_row_on_active(*at));
+                }
+            }
+            UndoAction::ColInserted { sheet_idx, at } => {
+                if *sheet_idx < workbook.sheets.len() {
+                    with_active_sheet(workbook, *sheet_idx, |wb| wb.insert_col_on_active(*at));
+                }
+            }
+            UndoAction::ColDeleted { sheet_idx, at, .. } => {
+                if *sheet_idx < workbook.sheets.len() {
+                    with_active_sheet(workbook, *sheet_idx, |wb| wb.delete_col_on_active(*at));
+                }
+            }
         }
+    }
+}
+
+/// Replace `workbook` with `pre`'s contents (deep clone). Used by
+/// RowDeleted/ColDeleted undo where structural snapshots are the most
+/// reliable way to roll back.
+fn restore_workbook(workbook: &mut Workbook, pre: &Workbook) {
+    *workbook = (*pre).clone();
+    workbook.rebuild_cross_sheet_deps();
+    for sheet in &mut workbook.sheets {
+        sheet.resweep_all_spills();
     }
 }
 
@@ -403,6 +460,7 @@ enum EditExitDir {
     Down,
     Up,
     Right,
+    Left,
 }
 
 /// Parse a literal cell-range like `A1:B10` into ((row, col), (row, col)).
@@ -500,9 +558,9 @@ impl App {
         // Vim pending operator/count/awaiting-g would otherwise leak across
         // Esc and cause the next motion key to act as `<op><motion>`.
         self.vim_reset_pending();
-        if self.filter_column.is_some() || !self.hidden_rows.is_empty() {
-            self.clear_filter();
-        }
+        // Filters are long-lived view state — Esc shouldn't kill them.
+        // Use `:filter clear` or the relevant command to clear explicitly.
+        // Hidden rows persist alongside filter; same reasoning.
     }
 
     pub fn recalc_all(&mut self) {
@@ -528,6 +586,10 @@ impl App {
                 sheet.cells.insert((row, col), cd);
             }
         }
+        // The cross-sheet dep graph is built off formulas; rebuild it after
+        // a recalc so any prior drift (e.g. graph populated before some
+        // sheets were loaded) is corrected.
+        self.workbook.rebuild_cross_sheet_deps();
         self.status_message = Some("Recalculated all formulas".to_string());
     }
 
@@ -621,6 +683,17 @@ impl App {
             None
         };
 
+        // No-op suppression: if the new cell is byte-identical to the
+        // existing one (same value/formula/format/comment/spill_anchor),
+        // there's nothing to record. Without this, pressing Enter on an
+        // unchanged cell grew the undo stack and (more importantly) marked
+        // the workbook dirty, triggering spurious autosave activity.
+        if let Some(ref existing) = old_cell
+            && *existing == new_data
+        {
+            return;
+        }
+
         // Record the action
         let action = UndoAction::CellModified {
             row,
@@ -630,8 +703,10 @@ impl App {
         };
         self.record_action(action);
 
-        // Apply the change, then auto-extend any table that this row sits below.
-        self.workbook.current_sheet_mut().set_cell(row, col, new_data);
+        // Apply the change via the workbook-aware mutation path so the
+        // same-sheet recalc cascade sees cross-sheet refs correctly; then
+        // auto-extend any table that this row sits below.
+        self.workbook.set_cell_on_active(row, col, new_data);
         self.maybe_extend_table(row, col);
 
         // Workbook-level cross-sheet dep maintenance: register this cell's
@@ -689,8 +764,8 @@ impl App {
             self.record_action(action);
         }
         
-        // Apply the change
-        self.workbook.current_sheet_mut().clear_cell(row, col);
+        // Apply the change via the workbook-aware mutation path.
+        self.workbook.clear_cell_on_active(row, col);
 
         // Cross-sheet maintenance.
         self.propagate_cell_change(row, col);

@@ -250,12 +250,16 @@ impl App {
             return;
         }
         cell.comment = comment.clone();
-        self.workbook.current_sheet_mut().set_cell(row, col, cell.clone());
+        self.workbook.set_cell_on_active(row, col, cell.clone());
         self.record_action(UndoAction::CellModified {
             row, col,
             old_cell,
             new_cell: Some(cell),
         });
+        // Comments don't change formula results, but routing through the
+        // workbook-aware mutation API keeps cross-sheet bookkeeping
+        // consistent and matches the discipline in CLAUDE.md.
+        self.propagate_cell_change(row, col);
         if let Some(ref text) = comment {
             self.status_message = Some(format!("Comment set: {}", text));
         } else {

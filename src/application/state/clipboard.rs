@@ -107,6 +107,28 @@ impl App {
             }
         }
         let count = cells.len();
+
+        // Symmetric with copy_selection: also push the cut region to the
+        // system clipboard so an external paste after `dd`/`x` gets the
+        // cut contents instead of stale data from the previous copy.
+        let mut tsv = String::from(crate::infrastructure::sidecar::SENTINEL);
+        for row in start_row..=end_row {
+            for col in start_col..=end_col {
+                if col > start_col {
+                    tsv.push('\t');
+                }
+                let cell = self.workbook.current_sheet().get_cell(row, col);
+                tsv.push_str(&cell.value);
+            }
+            tsv.push('\n');
+        }
+        if let Ok(mut board) = arboard::Clipboard::new() {
+            let _ = board.set_text(tsv);
+        }
+        if !cfg!(test) {
+            crate::infrastructure::sidecar::write(cells.clone(), start_row, start_col);
+        }
+
         self.clipboard = Some(ClipboardData {
             cells,
             source_row: start_row,
@@ -296,37 +318,45 @@ impl App {
 
     pub fn insert_row(&mut self) {
         let insert_at = self.selected_row;
+        let sheet_idx = self.workbook.active_sheet;
         // Routes through Workbook so cross-sheet refs to this sheet adjust
         // too (e.g. `Sheet2!A5` shifts to `Sheet2!A6` on insertion above A5).
         self.workbook.insert_row_on_active(insert_at);
-        self.dirty = true;
+        self.record_action(UndoAction::RowInserted { sheet_idx, at: insert_at });
         self.status_message = Some(format!("Inserted row at {}", insert_at + 1));
     }
 
     pub fn delete_row(&mut self) {
         let delete_at = self.selected_row;
+        let sheet_idx = self.workbook.active_sheet;
+        // Snapshot pre-delete: structural cross-sheet shifts can't be
+        // reconstructed from the deleted row alone.
+        let pre = Box::new(self.workbook.clone());
         self.workbook.delete_row_on_active(delete_at);
         if self.selected_row >= self.workbook.current_sheet().rows {
             self.selected_row = self.workbook.current_sheet().rows.saturating_sub(1);
         }
-        self.dirty = true;
+        self.record_action(UndoAction::RowDeleted { sheet_idx, at: delete_at, pre });
         self.status_message = Some(format!("Deleted row {}", delete_at + 1));
     }
 
     pub fn insert_col(&mut self) {
         let insert_at = self.selected_col;
+        let sheet_idx = self.workbook.active_sheet;
         self.workbook.insert_col_on_active(insert_at);
-        self.dirty = true;
+        self.record_action(UndoAction::ColInserted { sheet_idx, at: insert_at });
         self.status_message = Some(format!("Inserted column at {}", crate::domain::Spreadsheet::column_label(insert_at)));
     }
 
     pub fn delete_col(&mut self) {
         let delete_at = self.selected_col;
+        let sheet_idx = self.workbook.active_sheet;
+        let pre = Box::new(self.workbook.clone());
         self.workbook.delete_col_on_active(delete_at);
         if self.selected_col >= self.workbook.current_sheet().cols {
             self.selected_col = self.workbook.current_sheet().cols.saturating_sub(1);
         }
-        self.dirty = true;
+        self.record_action(UndoAction::ColDeleted { sheet_idx, at: delete_at, pre });
         self.status_message = Some(format!("Deleted column {}", crate::domain::Spreadsheet::column_label(delete_at)));
     }
 

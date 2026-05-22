@@ -24,33 +24,58 @@ struct Snapshot {
     filename: String,
 }
 
+/// Latest autosave outcome the main thread hasn't yet drained. Surface via
+/// `take_status_message` so the UI can show "Auto-saved" on success or
+/// "Auto-save failed: ..." on disk-full / permission errors, instead of
+/// silently dropping data and reporting success.
+struct Status {
+    message: String,
+    is_error: bool,
+}
+
 struct Inner {
     sender: mpsc::Sender<Snapshot>,
+    status_rx: Mutex<mpsc::Receiver<Status>>,
     enabled: AtomicBool,
     last_mark: Mutex<Option<Instant>>,
+    /// True between `maybe_save` queueing a snapshot and the worker reporting
+    /// completion. Caller must NOT clear the global dirty flag while this is
+    /// true — the user could edit during the worker's write and we'd lose
+    /// those edits if we cleared dirty optimistically.
+    in_flight: AtomicBool,
 }
 
 fn inner() -> &'static Inner {
     static INSTANCE: OnceLock<Inner> = OnceLock::new();
     INSTANCE.get_or_init(|| {
         let (tx, rx) = mpsc::channel::<Snapshot>();
-        // Worker: receive snapshot, sleep until idle window elapses, save.
+        let (status_tx, status_rx) = mpsc::channel::<Status>();
         thread::spawn(move || {
             while let Ok(snap) = rx.recv() {
-                // Drain newer snapshots — we only care about the latest.
                 let mut latest = snap;
                 while let Ok(next) = rx.try_recv() {
                     latest = next;
                 }
-                // Save (errors are silent — autosave is a safety net,
-                // explicit Ctrl+S surfaces failures to the user).
-                let _ = FileRepository::save_workbook(&latest.workbook, &latest.filename);
+                let status = match FileRepository::save_workbook(&latest.workbook, &latest.filename) {
+                    Ok(_) => Status {
+                        message: format!("Auto-saved {}", latest.filename),
+                        is_error: false,
+                    },
+                    Err(e) => Status {
+                        message: format!("Auto-save failed: {}", e),
+                        is_error: true,
+                    },
+                };
+                let _ = status_tx.send(status);
+                inner().in_flight.store(false, Ordering::Release);
             }
         });
         Inner {
             sender: tx,
+            status_rx: Mutex::new(status_rx),
             enabled: AtomicBool::new(false),
             last_mark: Mutex::new(None),
+            in_flight: AtomicBool::new(false),
         }
     })
 }
@@ -79,14 +104,21 @@ pub fn mark_dirty() {
 }
 
 /// Called from the main loop each tick. If autosave is enabled, the workbook
-/// is dirty, and the last edit was more than IDLE ago, post a snapshot to
-/// the worker for saving. Returns true if a save was queued.
+/// is dirty, the last edit was more than IDLE ago, and no save is already
+/// in flight, post a snapshot to the worker for saving. Returns true if a
+/// save was queued. Callers must NOT clear their dirty flag based on this
+/// return — the write hasn't landed yet; poll `take_status_message` for the
+/// outcome and only clear dirty on the non-error message.
 pub fn maybe_save(workbook: &Workbook, filename: Option<&str>) -> bool {
     let i = inner();
     if !i.enabled.load(Ordering::Relaxed) {
         return false;
     }
     let Some(filename) = filename else { return false; };
+    // Don't pile up snapshots if the worker hasn't finished the last one.
+    if i.in_flight.load(Ordering::Acquire) {
+        return false;
+    }
     let mut guard = i
         .last_mark
         .lock()
@@ -96,9 +128,35 @@ pub fn maybe_save(workbook: &Workbook, filename: Option<&str>) -> bool {
         return false;
     }
     *guard = None;
-    let _ = i.sender.send(Snapshot {
+    i.in_flight.store(true, Ordering::Release);
+    if i.sender.send(Snapshot {
         workbook: workbook.clone(),
         filename: filename.to_string(),
-    });
+    }).is_err() {
+        // Worker thread died — clear the flag so future attempts aren't
+        // permanently blocked.
+        i.in_flight.store(false, Ordering::Release);
+        return false;
+    }
     true
+}
+
+/// Drain the next autosave status (success or failure), if any. Returns
+/// `(message, is_error)`. The main loop should call this each tick and
+/// surface non-empty results to the user.
+pub fn take_status_message() -> Option<(String, bool)> {
+    let i = inner();
+    let rx = i.status_rx.lock().ok()?;
+    match rx.try_recv() {
+        Ok(s) => Some((s.message, s.is_error)),
+        Err(_) => None,
+    }
+}
+
+/// True while the background worker is mid-write. The main loop must keep
+/// the dirty flag set during this window so edits made during the write
+/// don't get silently overwritten by the in-flight (older) snapshot.
+#[allow(dead_code)]
+pub fn is_in_flight() -> bool {
+    inner().in_flight.load(Ordering::Acquire)
 }

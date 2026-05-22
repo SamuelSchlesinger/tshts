@@ -53,6 +53,38 @@ pub struct Spreadsheet {
     /// change. Refcell so `conditional_style_for(&self)` can write.
     #[serde(skip)]
     pub cf_cache: std::cell::RefCell<HashMap<(usize, usize), Option<CellStyle>>>,
+    /// Persistent view state for this sheet. Save/load round-trips freezes,
+    /// hidden rows/cols, filter criteria, and per-column data-validation
+    /// rules so reopening a workbook restores the user's full workspace.
+    #[serde(default)]
+    pub view_state: SheetViewState,
+}
+
+/// Persistent per-sheet view state. The App keeps these on its struct for
+/// runtime convenience, but they're synced to/from this on save and load.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SheetViewState {
+    /// Number of rows frozen at the top.
+    #[serde(default)]
+    pub frozen_rows: usize,
+    /// Number of columns frozen on the left.
+    #[serde(default)]
+    pub frozen_cols: usize,
+    /// Row indices hidden via `:hide` / filter. Stored as a sorted Vec so the
+    /// serialized form is stable across runs (HashSet iteration order is not).
+    #[serde(default)]
+    pub hidden_rows: Vec<usize>,
+    /// Column indices hidden via `:hide col E`.
+    #[serde(default)]
+    pub hidden_cols: Vec<usize>,
+    /// Active filter (column, criteria). Pair of None when no filter set.
+    #[serde(default)]
+    pub filter_column: Option<usize>,
+    #[serde(default)]
+    pub filter_value: Option<String>,
+    /// Per-column data validation predicates.
+    #[serde(default)]
+    pub validations: HashMap<usize, String>,
 }
 
 fn default_iter_max() -> usize { 100 }
@@ -102,6 +134,7 @@ impl Default for Spreadsheet {
             iter_max: default_iter_max(),
             iter_epsilon: default_iter_epsilon(),
             cf_cache: std::cell::RefCell::new(HashMap::new()),
+            view_state: SheetViewState::default(),
         }
     }
 }
@@ -227,16 +260,19 @@ impl Spreadsheet {
             Ok(a) => a,
             Err(_) => return,
         };
-        let registry = FunctionRegistry::new();
+        let registry = FunctionRegistry::shared_builtin();
         let names = if self.named_ranges.is_empty() {
             None
         } else {
             Some(&self.named_ranges)
         };
-        let evaluator = ExpressionEvaluator::new(self, &registry, names, None);
-        let value = match evaluator.evaluate(&ast) {
-            Ok(v) => v,
-            Err(_) => return,
+        let value = super::workbook::with_workbook_context(|wb| {
+            let evaluator = ExpressionEvaluator::new(self, &registry, names, wb);
+            evaluator.evaluate(&ast).ok()
+        });
+        let value = match value {
+            Some(v) => v,
+            None => return,
         };
         // Determine shape. List is 1×N (single row); Array carries explicit
         // shape; scalars don't spill.
@@ -535,18 +571,25 @@ impl Spreadsheet {
         self.recalculate_cell(row, col);
     }
 
-    /// Recalculates a single cell's value based on its formula.
+    /// Recalculates a single cell's value based on its formula. Honors the
+    /// thread-local workbook context set by `Workbook::with_recalc_context`
+    /// so cross-sheet refs (`=Sheet2!A1`) in dependent recalcs don't go
+    /// `#REF!` just because the cascade started from `Spreadsheet::set_cell`.
     fn recalculate_cell(&mut self, row: usize, col: usize) {
         let cell_pos = (row, col);
         if let Some(cell) = self.cells.get(&cell_pos).cloned()
             && let Some(ref formula) = cell.formula {
                 use crate::domain::services::FormulaEvaluator;
-                let evaluator = if self.named_ranges.is_empty() {
-                    FormulaEvaluator::new(self)
-                } else {
-                    FormulaEvaluator::new(self).with_names(&self.named_ranges)
-                };
-                let new_value = evaluator.evaluate_formula(formula);
+                let new_value = super::workbook::with_workbook_context(|wb_opt| {
+                    let mut ev = FormulaEvaluator::new(self);
+                    if !self.named_ranges.is_empty() {
+                        ev = ev.with_names(&self.named_ranges);
+                    }
+                    if let Some(wb) = wb_opt {
+                        ev = ev.with_workbook(wb);
+                    }
+                    ev.evaluate_formula(formula)
+                });
                 let mut updated_cell = cell;
                 updated_cell.value = new_value;
                 self.set_cell_internal(row, col, updated_cell);
@@ -600,7 +643,39 @@ impl Spreadsheet {
     /// Parse a possibly sheet-qualified cell reference: `Sheet2!A1`,
     /// `'Some Sheet'!B5`, `$A$1`, etc. Returns (sheet?, row, col, abs_row, abs_col).
     pub fn parse_qualified_reference(cell_ref: &str) -> Option<(Option<String>, usize, usize, bool, bool)> {
-        if let Some(idx) = cell_ref.rfind('!') {
+        // Find the `!` that separates the sheet name from the cell ref,
+        // skipping any `!` inside a `'...'` quoted sheet name. Previously
+        // `rfind('!')` would slice the wrong split point for names like
+        // `'oh!no'!A1`.
+        let bang_pos = if let Some(b) = cell_ref.strip_prefix('\'') {
+            // Find the closing quote, skipping `''` escapes.
+            let mut end = None;
+            let bytes = b.as_bytes();
+            let mut i = 0;
+            while i < bytes.len() {
+                if bytes[i] == b'\'' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
+                    end = Some(i);
+                    break;
+                }
+                i += 1;
+            }
+            // Convert relative position back to absolute (1 = opening quote).
+            end.map(|e| 1 + e + 1)
+                .and_then(|after_quote| {
+                    if cell_ref[after_quote..].starts_with('!') {
+                        Some(after_quote)
+                    } else {
+                        None
+                    }
+                })
+        } else {
+            cell_ref.find('!')
+        };
+        if let Some(idx) = bang_pos {
             let (sheet, rest) = cell_ref.split_at(idx);
             let cell_part = &rest[1..];
             let sheet_name = if sheet.starts_with('\'') && sheet.ends_with('\'') && sheet.len() >= 2 {

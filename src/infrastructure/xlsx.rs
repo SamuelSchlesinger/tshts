@@ -21,9 +21,34 @@ use crate::domain::{CellData, CellFormat, CellStyle, NumberFormat, Spreadsheet, 
 const MAX_IMPORT_ROWS: usize = 200_000;
 const MAX_IMPORT_COLS: usize = 1_024;
 
+/// Reject obviously-hostile .xlsx files before handing them to calamine.
+/// A 1 GiB on-disk file would force calamine to load gigabytes into memory
+/// (the SharedStrings table alone can be huge in pathological cases).
+/// 256 MiB covers any realistic workbook by a wide margin.
+const MAX_XLSX_FILE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Cap on the number of cells we'll materialize from a single sheet. Once
+/// past this, we stop adding cells (the user gets a partial import rather
+/// than the process OOMing). This is a second line of defense beyond the
+/// row/col geometry caps — a single sparsely-defined sheet could still
+/// reference a billion (row, col) coordinates through used_cells iteration.
+const MAX_IMPORT_CELLS_PER_SHEET: usize = 5_000_000;
+
 /// Read an `.xlsx` file into a Workbook.
 pub fn load_xlsx(path: &str) -> Result<Workbook, String> {
     use calamine::{open_workbook_auto, Data, Reader};
+    // Refuse files that are obviously oversized before letting calamine
+    // touch them. This is the cheap zip-bomb defense: a 100 KB hostile zip
+    // expanding to 100 GB is the textbook case, and rejecting outsize files
+    // up-front beats post-hoc OOM detection.
+    if let Ok(meta) = std::fs::metadata(path)
+        && meta.len() > MAX_XLSX_FILE_BYTES {
+            return Err(format!(
+                "xlsx too large: {} bytes (limit {})",
+                meta.len(),
+                MAX_XLSX_FILE_BYTES
+            ));
+        }
     let mut wb = open_workbook_auto(path).map_err(|e| format!("xlsx open: {}", e))?;
     let sheet_names = wb.sheet_names().to_vec();
     if sheet_names.is_empty() {
@@ -67,14 +92,26 @@ pub fn load_xlsx(path: &str) -> Result<Workbook, String> {
         }
         // Same offset for the value range.
         let (val_r, val_c) = range.start().unwrap_or((0, 0));
+        let mut imported_cells = 0usize;
         for (r, c, cell) in range.used_cells() {
+            if imported_cells >= MAX_IMPORT_CELLS_PER_SHEET {
+                break;
+            }
             let value = match cell {
                 Data::Empty => continue,
                 Data::String(s) => s.clone(),
                 Data::Float(f) => f.to_string(),
                 Data::Int(i) => i.to_string(),
-                Data::Bool(b) => if *b { "1".to_string() } else { "0".to_string() },
-                Data::DateTime(d) => d.to_string(),
+                // Booleans become Excel's display strings so formulas like
+                // `=A1=TRUE` work, instead of the raw 0/1 numerals.
+                Data::Bool(b) => if *b { "TRUE".to_string() } else { "FALSE".to_string() },
+                // DateTime is an Excel serial. Render as ISO so the cell
+                // displays as a date rather than the raw float "45000.0".
+                Data::DateTime(d) => {
+                    let serial = d.as_f64();
+                    let (y, m, day) = crate::domain::parser::serial_to_date_pub(serial);
+                    format!("{:04}-{:02}-{:02}", y, m, day)
+                }
                 Data::DateTimeIso(s) => s.clone(),
                 Data::DurationIso(s) => s.clone(),
                 Data::Error(e) => format!("#{:?}!", e),
@@ -86,6 +123,7 @@ pub fn load_xlsx(path: &str) -> Result<Workbook, String> {
             if abs_r >= sheet.rows || abs_c >= sheet.cols {
                 continue;
             }
+            imported_cells += 1;
             // Strip `_xlfn.` and `_xlfn._xlws.` prefixes Excel adds to
             // modern function names (XLOOKUP, FILTER, etc.) so the
             // formula evaluator recognizes them.
@@ -413,8 +451,11 @@ const CELL_STYLE_DEFAULT: CellStyle = CellStyle {
 /// ranges, and cell formatting (bold/underline/fg+bg colors, number formats)
 /// are preserved.
 pub fn save_xlsx(workbook: &Workbook, path: &str) -> Result<(), String> {
-    let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
-    let mut zip = zip::ZipWriter::new(file);
+    // Build the zip into an in-memory buffer, then atomic_write so a crash
+    // mid-zip-write can't leave a corrupt half-written .xlsx where the
+    // user's previous good file used to be.
+    let buf = std::io::Cursor::new(Vec::<u8>::with_capacity(64 * 1024));
+    let mut zip = zip::ZipWriter::new(buf);
     // zip 2.x renamed FileOptions::default() ergonomics to SimpleFileOptions
     // (the old name was generic over the compression-type parameter and
     // required turbofish to instantiate).
@@ -561,7 +602,9 @@ pub fn save_xlsx(workbook: &Workbook, path: &str) -> Result<(), String> {
         zip.write_all(buf.as_bytes()).map_err(|e| e.to_string())?;
     }
 
-    zip.finish().map_err(|e| e.to_string())?;
+    let cursor = zip.finish().map_err(|e| e.to_string())?;
+    let bytes = cursor.into_inner();
+    crate::infrastructure::atomic::atomic_write(path, &bytes).map_err(|e| e.to_string())?;
     Ok(())
 }
 

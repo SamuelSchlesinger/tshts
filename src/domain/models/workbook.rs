@@ -20,6 +20,59 @@ fn default_workbook_version() -> u32 {
     1
 }
 
+thread_local! {
+    /// Thread-local pointer to the current `Workbook` for the duration of a
+    /// workbook-driven recalc. The pointer is non-null only inside
+    /// `with_recalc_context`; outside of that scope, sheet-driven recalcs
+    /// see `None` and fall back to single-sheet evaluation. Stored as a
+    /// raw pointer because the cascade reborrows the workbook mutably (via
+    /// `set_cell` on its sheets) while the evaluator only needs immutable
+    /// access — and lifetimes can't express "borrowed for the duration of
+    /// this dynamic scope" across the workbook ↔ sheet boundary.
+    static RECALC_WORKBOOK: std::cell::Cell<*const Workbook> = const { std::cell::Cell::new(std::ptr::null()) };
+}
+
+/// Run `f` with `wb` published in the thread-local recalc context. Nested
+/// scopes are supported — the previous pointer is restored on exit.
+///
+/// Inside the closure, callers that ultimately drive `Spreadsheet::set_cell`
+/// (which cascades through `recalculate_cell`) will have their evaluator
+/// receive the workbook reference, so cross-sheet refs resolve. Outside the
+/// closure (e.g. tests that drive `Spreadsheet` directly), the fallback to
+/// single-sheet eval still works — cross-sheet refs become `#REF!` as
+/// before.
+pub fn with_recalc_context<R>(wb: &Workbook, f: impl FnOnce() -> R) -> R {
+    let raw = wb as *const Workbook;
+    let prev = RECALC_WORKBOOK.with(|c| c.replace(raw));
+    let result = f();
+    RECALC_WORKBOOK.with(|c| c.set(prev));
+    result
+}
+
+/// Read the thread-local workbook ref and pass it (as `Option<&Workbook>`)
+/// to `f`. Used by `Spreadsheet::recalculate_cell` and `maybe_spill` to
+/// enrich their evaluator with workbook context when one is in scope.
+///
+/// # Safety
+///
+/// The pointer is set by `with_recalc_context` for the lifetime of its
+/// closure. We assume callers respect the discipline that any code reached
+/// from inside that closure holds a borrow consistent with the original
+/// `&Workbook`. The pointer is only dereferenced through this helper, so
+/// any access is bounded by `f`'s scope; we never store the borrow.
+pub(crate) fn with_workbook_context<R>(f: impl FnOnce(Option<&Workbook>) -> R) -> R {
+    let raw = RECALC_WORKBOOK.with(|c| c.get());
+    if raw.is_null() {
+        f(None)
+    } else {
+        // SAFETY: pointer was just written by `with_recalc_context` and is
+        // valid for the duration of its closure. We hold no other mutable
+        // borrow that would alias.
+        let wb: &Workbook = unsafe { &*raw };
+        f(Some(wb))
+    }
+}
+
 /// A workbook containing multiple spreadsheets (tabs).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Workbook {
@@ -370,13 +423,33 @@ impl Workbook {
     }
 
     /// Run register_cross_sheet_deps + propagate_cross_sheet_changes for a
-     /// single cell on the active sheet. Use from mutation paths that bypass
+    /// single cell on the active sheet. Use from mutation paths that bypass
     /// `write_cells_on_active` / `clear_cells_on_active` (e.g. undo/redo
     /// apply that restores via `set_cell` directly).
     pub fn propagate_active_cell(&mut self, row: usize, col: usize) {
         let sheet_name = self.sheet_names[self.active_sheet].clone();
         self.register_cross_sheet_deps(&sheet_name, row, col);
         self.propagate_cross_sheet_changes(&sheet_name, row, col);
+    }
+
+    /// Write a single cell on the active sheet with workbook context
+    /// published for the same-sheet recalc cascade. Use this instead of
+    /// `current_sheet_mut().set_cell(...)` when downstream cells on the same
+    /// sheet may contain cross-sheet refs that need to resolve correctly.
+    pub fn set_cell_on_active(&mut self, row: usize, col: usize, data: CellData) {
+        let snapshot = self.clone();
+        with_recalc_context(&snapshot, || {
+            self.sheets[self.active_sheet].set_cell(row, col, data);
+        });
+    }
+
+    /// Clear a single cell on the active sheet with workbook context
+    /// published for the same-sheet recalc cascade.
+    pub fn clear_cell_on_active(&mut self, row: usize, col: usize) {
+        let snapshot = self.clone();
+        with_recalc_context(&snapshot, || {
+            self.sheets[self.active_sheet].clear_cell(row, col);
+        });
     }
 
     /// Write a batch of cells to the active sheet, then propagate.
@@ -397,7 +470,14 @@ impl Workbook {
         let positions: Vec<(usize, usize)> =
             writes.iter().map(|(r, c, _)| (*r, *c)).collect();
         let sheet_name = self.sheet_names[self.active_sheet].clone();
-        self.sheets[self.active_sheet].set_many(writes);
+        // Snapshot for cross-sheet ref resolution during this sheet's
+        // recalc cascade. Without this, formulas like `=B1 + Sheet2!A1`
+        // re-evaluated as part of the dependent recalc lose workbook
+        // context and resolve the Sheet2!A1 ref to `#REF!`.
+        let snapshot = self.clone();
+        with_recalc_context(&snapshot, || {
+            self.sheets[self.active_sheet].set_many(writes);
+        });
         for (r, c) in positions {
             self.register_cross_sheet_deps(&sheet_name, r, c);
             self.propagate_cross_sheet_changes(&sheet_name, r, c);
@@ -411,9 +491,12 @@ impl Workbook {
             return;
         }
         let sheet_name = self.sheet_names[self.active_sheet].clone();
-        for (r, c) in &positions {
-            self.sheets[self.active_sheet].clear_cell(*r, *c);
-        }
+        let snapshot = self.clone();
+        with_recalc_context(&snapshot, || {
+            for (r, c) in &positions {
+                self.sheets[self.active_sheet].clear_cell(*r, *c);
+            }
+        });
         for (r, c) in positions {
             self.register_cross_sheet_deps(&sheet_name, r, c);
             self.propagate_cross_sheet_changes(&sheet_name, r, c);

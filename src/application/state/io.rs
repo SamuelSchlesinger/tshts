@@ -5,6 +5,9 @@ use super::*;
 impl App {
     pub fn save_in_place_or_prompt(&mut self) {
         if let Some(filename) = self.filename.clone() {
+            // Capture App-only view state (freezes, hidden ranges, filter,
+            // validations) into the active sheet so they round-trip.
+            self.snapshot_view_state_to_active_sheet();
             let result = if filename.to_lowercase().ends_with(".xlsx") {
                 crate::infrastructure::xlsx::save_xlsx(&self.workbook, &filename)
                     .map(|_| filename.clone())
@@ -121,6 +124,7 @@ impl App {
                 self.undo_stack.clear();
                 self.redo_stack.clear();
                 self.dirty = false;
+                self.restore_view_state_from_active_sheet();
                 crate::infrastructure::recent::add(&filename);
                 self.status_message = Some(format!("Loaded from {}", filename));
             }
@@ -132,6 +136,40 @@ impl App {
         self.mode = AppMode::Normal;
         self.filename_input.clear();
         self.cursor_position = 0;
+    }
+
+    /// Pull persistent view state (frozen rows/cols, hidden ranges, filter,
+    /// validations) from the loaded workbook's active sheet into the App's
+    /// runtime fields. The inverse is `snapshot_view_state_to_active_sheet`,
+    /// called before save.
+    pub fn restore_view_state_from_active_sheet(&mut self) {
+        let vs = self.workbook.current_sheet().view_state.clone();
+        self.frozen_rows = vs.frozen_rows;
+        self.frozen_cols = vs.frozen_cols;
+        self.hidden_rows = vs.hidden_rows.into_iter().collect();
+        self.hidden_cols = vs.hidden_cols.into_iter().collect();
+        self.filter_column = vs.filter_column;
+        self.filter_value = vs.filter_value;
+        self.validations = vs.validations;
+    }
+
+    /// Push the App's runtime view-state fields into the active sheet's
+    /// persistent record so the next save round-trips them.
+    pub fn snapshot_view_state_to_active_sheet(&mut self) {
+        let mut hidden_rows: Vec<usize> = self.hidden_rows.iter().copied().collect();
+        hidden_rows.sort();
+        let mut hidden_cols: Vec<usize> = self.hidden_cols.iter().copied().collect();
+        hidden_cols.sort();
+        let vs = crate::domain::SheetViewState {
+            frozen_rows: self.frozen_rows,
+            frozen_cols: self.frozen_cols,
+            hidden_rows,
+            hidden_cols,
+            filter_column: self.filter_column,
+            filter_value: self.filter_value.clone(),
+            validations: self.validations.clone(),
+        };
+        self.workbook.current_sheet_mut().view_state = vs;
     }
 
     pub fn get_save_filename(&self) -> String {

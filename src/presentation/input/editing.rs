@@ -14,6 +14,10 @@ impl InputHandler {
                 // Finish editing and move right instead of down
                 app.finish_editing_move_right();
             }
+            KeyCode::BackTab => {
+                // Shift+Tab: commit and move left, symmetric with Tab.
+                app.finish_editing_move_left();
+            }
             // Up/Down commit the edit and move the cursor — matches Excel /
             // Sheets convention where a spreadsheet user's muscle memory
             // expects arrow keys to confirm the value, not move the in-cell

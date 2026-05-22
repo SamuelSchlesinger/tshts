@@ -68,6 +68,7 @@ impl App {
         if let Some(rest) = trimmed.strip_prefix("w ").or_else(|| trimmed.strip_prefix("W ")) {
             let name = rest.trim().to_string();
             if !name.is_empty() {
+                self.snapshot_view_state_to_active_sheet();
                 let result = if name.to_lowercase().ends_with(".xlsx") {
                     crate::infrastructure::xlsx::save_xlsx(&self.workbook, &name)
                         .map(|_| name.clone())
@@ -746,10 +747,14 @@ impl App {
                 let input_pos = crate::domain::Spreadsheet::parse_cell_reference(input);
                 let expected_v: f64 = expected.parse().unwrap_or(0.0);
                 if let (Some(t), Some(i)) = (target_pos, input_pos) {
-                    // Snapshot the original input cell before bisection so we
-                    // can either undo the final write or restore on failure
-                    // without leaking ~80 intermediate values into undo history.
-                    let original_cell = self.workbook.current_sheet().get_cell(i.0, i.1);
+                    // Run the bisection on a CLONE of the workbook so the
+                    // ~80 intermediate writes don't ripple to cross-sheet
+                    // dependents on the real workbook. Only the converged
+                    // value lands on the real workbook (via set_cell_with_undo),
+                    // which propagates correctly. On non-convergence the
+                    // real workbook is untouched.
+                    let mut scratch = self.workbook.clone();
+                    let active_idx = scratch.active_sheet;
                     let mut lo = -1e9_f64;
                     let mut hi = 1e9_f64;
                     let mut result: Option<f64> = None;
@@ -762,8 +767,12 @@ impl App {
                             comment: None,
                             spill_anchor: None,
                         };
-                        self.workbook.current_sheet_mut().set_cell(i.0, i.1, cell);
-                        let cur: f64 = self.workbook.current_sheet().get_cell(t.0, t.1).value.parse().unwrap_or(0.0);
+                        scratch.sheets[active_idx].set_cell(i.0, i.1, cell);
+                        let cur: f64 = scratch.sheets[active_idx]
+                            .get_cell(t.0, t.1)
+                            .value
+                            .parse()
+                            .unwrap_or(0.0);
                         if (cur - expected_v).abs() < 1e-6 {
                             result = Some(mid);
                             break;
@@ -775,16 +784,6 @@ impl App {
                         }
                     }
                     if let Some(v) = result {
-                        // Restore the cell to its pre-bisection state, then
-                        // perform the final write through set_cell_with_undo
-                        // so the recorded `old_cell` is the *original* value
-                        // (not the last bisection step). The intermediate
-                        // bisection writes left cross-sheet dependents holding
-                        // stale `mid` values; the final set_cell_with_undo
-                        // propagates the converged value to them.
-                        self.workbook
-                            .current_sheet_mut()
-                            .set_cell(i.0, i.1, original_cell);
                         let final_cell = CellData {
                             value: v.to_string(),
                             formula: None,
@@ -795,14 +794,6 @@ impl App {
                         self.set_cell_with_undo(i.0, i.1, final_cell);
                         self.status_message = Some(format!("Goal seek: {} = {:.6}", input, v));
                     } else {
-                        // No-op net effect: put the original cell back, no
-                        // undo entry needed. Propagate so cross-sheet
-                        // dependents see the *original* value, not the last
-                        // bisection step.
-                        self.workbook
-                            .current_sheet_mut()
-                            .set_cell(i.0, i.1, original_cell);
-                        self.propagate_cell_change(i.0, i.1);
                         self.status_message = Some("Goal seek did not converge".to_string());
                     }
                 } else {

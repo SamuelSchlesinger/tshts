@@ -178,25 +178,23 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
             }
         });
         reg.register_function("RAND", |_args| {
-            use std::time::SystemTime;
-            let nanos = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .subsec_nanos();
-            Ok(Value::Number(nanos as f64 / 1_000_000_000.0))
+            // xorshift64 PRNG advanced per call. Seeded once per thread
+            // from a high-entropy source. Two RAND() calls in the same
+            // millisecond used to return identical or highly-correlated
+            // values because the previous seed was just `subsec_nanos()`.
+            Ok(Value::Number(next_rand_u64() as f64 / u64::MAX as f64))
         });
         reg.register_function("RANDBETWEEN", |args| {
             if args.len() != 2 {
                 Err("RANDBETWEEN requires exactly 2 arguments".to_string())
             } else {
-                use std::time::SystemTime;
                 let low = args[0].to_number();
                 let high = args[1].to_number();
-                let seed = SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .subsec_nanos();
-                let result = (low + (seed as f64 / u32::MAX as f64) * (high - low + 1.0)).floor();
+                if high < low {
+                    return Ok(Value::Error(ErrorKind::Num));
+                }
+                let r = next_rand_u64() as f64 / u64::MAX as f64;
+                let result = (low + r * (high - low + 1.0)).floor();
                 Ok(Value::Number(result))
             }
         });
@@ -397,7 +395,17 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
             Ok(Value::Number(args[0].to_number().to_radians()))
         });
         reg.register_function("FACT", |args| {
-            let n = args[0].to_number() as u64;
+            let n_raw = args[0].to_number();
+            if n_raw < 0.0 || !n_raw.is_finite() {
+                return Ok(Value::Error(ErrorKind::Num));
+            }
+            // 170! is the largest f64-representable factorial; 171! is Inf.
+            // Reject up-front so callers get #NUM! instead of an Inf cell
+            // that breaks downstream arithmetic silently.
+            if n_raw > 170.0 {
+                return Ok(Value::Error(ErrorKind::Num));
+            }
+            let n = n_raw as u64;
             let mut r: f64 = 1.0;
             for i in 2..=n {
                 r *= i as f64;
@@ -440,8 +448,22 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
             fn gcd(a: i64, b: i64) -> i64 {
                 if b == 0 { a.abs() } else { gcd(b, a % b) }
             }
-            let l = nums.iter().fold(1, |a, &b| if b == 0 { 0 } else { (a * b).abs() / gcd(a, b) });
-            Ok(Value::Number(l as f64))
+            // (a*b).abs() wraps silently on i64 overflow. Use checked_mul
+            // and surface #NUM! when the product would wrap — much better
+            // than a nonsense small or negative result.
+            let mut acc: i64 = 1;
+            for &b in &nums {
+                if b == 0 {
+                    return Ok(Value::Number(0.0));
+                }
+                let g = gcd(acc, b);
+                let b_div = b / g;
+                match acc.checked_mul(b_div) {
+                    Some(v) => acc = v.abs(),
+                    None => return Ok(Value::Error(ErrorKind::Num)),
+                }
+            }
+            Ok(Value::Number(acc as f64))
         });
         reg.register_function("ROUNDUP", |args| {
             if args.len() != 2 {
@@ -520,6 +542,41 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
                 data: result,
             })
         });
+}
+
+// Thread-local xorshift64 PRNG state. Seeded once per thread from a
+// high-entropy source (nanos XOR thread id, then mixed with the splitmix
+// constants to deal out a non-zero starting value).
+thread_local! {
+    static RAND_STATE: std::cell::Cell<u64> = std::cell::Cell::new(seed_rand());
+}
+
+fn seed_rand() -> u64 {
+    use std::time::SystemTime;
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0xCAFE_BABE);
+    let mut s = nanos ^ 0x9E37_79B9_7F4A_7C15;
+    // splitmix64 — one round is enough to decorrelate from epoch.
+    s = (s ^ (s >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    s = (s ^ (s >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    s ^ (s >> 31)
+}
+
+/// Advance the thread-local PRNG and return the next 64-bit value.
+fn next_rand_u64() -> u64 {
+    RAND_STATE.with(|cell| {
+        let mut s = cell.get();
+        if s == 0 {
+            s = seed_rand().max(1);
+        }
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        cell.set(s);
+        s
+    })
 }
 
 /// Common helper for statistical functions: flattens args and parses each

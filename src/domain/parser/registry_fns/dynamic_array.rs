@@ -7,6 +7,12 @@
 #![allow(unused_imports)]
 use crate::domain::parser::{FunctionRegistry, Value, ErrorKind, flatten_args, shape_of, broadcast_binary, criteria_matches, add_commas, glob_match, date_to_serial, serial_to_date, parse_iso_date, days_in_month, today_serial, now_serial};
 
+/// Hard cap on the result size of dynamic-array constructors (SEQUENCE,
+/// MAKEARRAY, etc.). Without this, `=SEQUENCE(1e6, 1e6)` allocates 8 TB
+/// before the OS kills the process. One million cells is plenty for any
+/// realistic use case.
+pub(crate) const MAX_DYNAMIC_ARRAY_CELLS: usize = 1_000_000;
+
 /// Register all `dynamic_array` builtin functions on `reg`.
 pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         reg.register_function("SUMPRODUCT", |args| {
@@ -46,12 +52,21 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
             if args.is_empty() || args.len() > 4 {
                 return Err("SEQUENCE requires 1-4 arguments".to_string());
             }
-            let rows = args[0].to_number() as usize;
-            let cols = args.get(1).map(|v| v.to_number() as usize).unwrap_or(1);
+            let rows_f = args[0].to_number();
+            let cols_f = args.get(1).map(|v| v.to_number()).unwrap_or(1.0);
+            if rows_f < 1.0 || cols_f < 1.0 || !rows_f.is_finite() || !cols_f.is_finite() {
+                return Ok(Value::Error(ErrorKind::Num));
+            }
+            let rows = rows_f as usize;
+            let cols = cols_f as usize;
+            let total = rows.checked_mul(cols).unwrap_or(usize::MAX);
+            if total > MAX_DYNAMIC_ARRAY_CELLS {
+                return Ok(Value::Error(ErrorKind::Num));
+            }
             let start = args.get(2).map(|v| v.to_number()).unwrap_or(1.0);
             let step = args.get(3).map(|v| v.to_number()).unwrap_or(1.0);
-            let mut data = Vec::with_capacity(rows * cols);
-            for i in 0..(rows * cols) {
+            let mut data = Vec::with_capacity(total);
+            for i in 0..total {
                 data.push(Value::Number(start + step * i as f64));
             }
             Ok(Value::Array { rows, cols, data })

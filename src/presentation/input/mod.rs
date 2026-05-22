@@ -49,6 +49,21 @@ impl InputHandler {
         {
             return;
         }
+        // Chart popup is modal — only Esc/Enter/q dismiss it. Without this
+        // guard, keys "behind" the popup land on Normal/Visual mode and
+        // silently move the cursor or trigger edits while the user thinks
+        // they're interacting with the chart.
+        if app.chart_popup.is_some()
+            && matches!(app.mode, AppMode::Normal | AppMode::Visual { .. })
+        {
+            match key {
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+                    app.chart_popup = None;
+                }
+                _ => {}
+            }
+            return;
+        }
         match app.mode {
             AppMode::Normal => Self::handle_normal_mode(app, key, modifiers),
             AppMode::Editing => Self::handle_editing_mode(app, key),

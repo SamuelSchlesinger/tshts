@@ -23,21 +23,30 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
             }
         });
         reg.register_function("LEFT", |args| {
-            if args.len() != 2 {
-                Err("LEFT requires exactly 2 arguments".to_string())
+            if args.is_empty() || args.len() > 2 {
+                Err("LEFT requires 1 or 2 arguments".to_string())
             } else {
                 let text = args[0].to_string();
-                let num_chars = args[1].to_number() as usize;
+                // Default is 1 (Excel). Negative is #VALUE!.
+                let n = args.get(1).map(|v| v.to_number()).unwrap_or(1.0);
+                if n < 0.0 {
+                    return Ok(Value::Error(ErrorKind::Value));
+                }
+                let num_chars = n as usize;
                 let result = text.chars().take(num_chars).collect::<String>();
                 Ok(Value::String(result))
             }
         });
         reg.register_function("RIGHT", |args| {
-            if args.len() != 2 {
-                Err("RIGHT requires exactly 2 arguments".to_string())
+            if args.is_empty() || args.len() > 2 {
+                Err("RIGHT requires 1 or 2 arguments".to_string())
             } else {
                 let text = args[0].to_string();
-                let num_chars = args[1].to_number() as usize;
+                let n = args.get(1).map(|v| v.to_number()).unwrap_or(1.0);
+                if n < 0.0 {
+                    return Ok(Value::Error(ErrorKind::Value));
+                }
+                let num_chars = n as usize;
                 let chars: Vec<char> = text.chars().collect();
                 let start = chars.len().saturating_sub(num_chars);
                 let result = chars[start..].iter().collect::<String>();
@@ -237,10 +246,11 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("TEXT", |args| {
             if args.is_empty() || args.len() > 2 {
-                Err("TEXT requires 1 or 2 arguments".to_string())
-            } else {
-                Ok(Value::String(args[0].to_string()))
+                return Err("TEXT requires 1 or 2 arguments".to_string());
             }
+            let v = &args[0];
+            let format = args.get(1).map(|f| f.to_string()).unwrap_or_default();
+            Ok(Value::String(format_text(v, &format)))
         });
         reg.register_function("VALUE", |args| {
             if args.len() != 1 {
@@ -306,9 +316,16 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
             }
             let text = args[0].to_string();
             let delim = args[1].to_string();
-            let n = args.get(2).map(|v| v.to_number() as usize).unwrap_or(1);
+            let n_raw = args.get(2).map(|v| v.to_number()).unwrap_or(1.0);
+            if n_raw < 1.0 {
+                return Ok(Value::Error(ErrorKind::Value));
+            }
+            let n = n_raw as usize;
             let mut start = 0usize;
-            for _ in 0..n - 1 {
+            // Walk forward n-1 matches; the n-th is the split point. Using
+            // `0..n - 1` underflowed in release builds when n was 0; the
+            // n>=1 guard above plus saturating_sub makes this safe.
+            for _ in 0..n.saturating_sub(1) {
                 if let Some(idx) = text[start..].find(&delim) {
                     start += idx + delim.len();
                 } else {
@@ -327,7 +344,11 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
             }
             let text = args[0].to_string();
             let delim = args[1].to_string();
-            let n = args.get(2).map(|v| v.to_number() as usize).unwrap_or(1);
+            let n_raw = args.get(2).map(|v| v.to_number()).unwrap_or(1.0);
+            if n_raw < 1.0 {
+                return Ok(Value::Error(ErrorKind::Value));
+            }
+            let n = n_raw as usize;
             let mut start = 0usize;
             for _ in 0..n {
                 if let Some(idx) = text[start..].find(&delim) {
@@ -455,4 +476,95 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
             let joined = rows_str.join(if strict { ";" } else { ", " });
             Ok(Value::String(if strict { format!("{{{}}}", joined) } else { joined }))
         });
+}
+
+/// Format a value using a subset of Excel TEXT format codes. Supports:
+///   - Date codes: yyyy/yy, mm/m, dd/d (combined as `yyyy-mm-dd`, `m/d/yyyy`, etc.)
+///   - Numeric codes with `0`, `#`, `.`, `,` (thousands separator)
+///   - `0%` / `0.0%` percentage formats
+/// Falls back to `to_string` when the format string isn't recognized.
+fn format_text(v: &Value, format: &str) -> String {
+    if format.is_empty() {
+        return v.to_string();
+    }
+    let n = v.to_number();
+    // Try date format first: detect by presence of y/m/d tokens.
+    let has_date_tokens = format.contains('y') || format.contains('Y');
+    if has_date_tokens && n.is_finite() && n > 1.0 {
+        let (year, month, day) = serial_to_date(n);
+        return apply_date_format(format, year, month, day);
+    }
+    // Percentage
+    if format.ends_with('%') {
+        let body = &format[..format.len() - 1];
+        let pct = n * 100.0;
+        return format!("{}%", apply_number_format(body, pct));
+    }
+    // Numeric
+    if format.chars().any(|c| matches!(c, '0' | '#')) {
+        return apply_number_format(format, n);
+    }
+    // Unrecognized: just stringify.
+    v.to_string()
+}
+
+fn apply_date_format(fmt: &str, year: i32, month: u32, day: u32) -> String {
+    // Process tokens longest-first so `yyyy` doesn't get partially eaten by
+    // a smaller `yy`. We replace each token with a placeholder, then fill
+    // placeholders with formatted values. This avoids reprocessing already-
+    // formatted digits.
+    let mut out = fmt.to_string();
+    out = out.replace("yyyy", &format!("\x01{:04}\x01", year));
+    out = out.replace("YYYY", &format!("\x01{:04}\x01", year));
+    out = out.replace("yy", &format!("\x01{:02}\x01", year % 100));
+    out = out.replace("YY", &format!("\x01{:02}\x01", year % 100));
+    out = out.replace("mm", &format!("\x01{:02}\x01", month));
+    out = out.replace("MM", &format!("\x01{:02}\x01", month));
+    out = out.replace("dd", &format!("\x01{:02}\x01", day));
+    out = out.replace("DD", &format!("\x01{:02}\x01", day));
+    out = out.replace('m', &format!("\x01{}\x01", month));
+    out = out.replace('M', &format!("\x01{}\x01", month));
+    out = out.replace('d', &format!("\x01{}\x01", day));
+    out = out.replace('D', &format!("\x01{}\x01", day));
+    out.replace('\x01', "")
+}
+
+fn apply_number_format(fmt: &str, n: f64) -> String {
+    let decimals = fmt
+        .rfind('.')
+        .map(|i| fmt[i + 1..].chars().filter(|c| matches!(c, '0' | '#')).count())
+        .unwrap_or(0);
+    let comma = fmt.contains(',');
+    let mut s = format!("{:.*}", decimals, n);
+    if comma {
+        // Insert thousands separators in the integer part.
+        let parts: Vec<&str> = s.splitn(2, '.').collect();
+        let int_part = parts[0];
+        let neg = int_part.starts_with('-');
+        let digits = if neg { &int_part[1..] } else { int_part };
+        let with_commas = add_commas_local(digits);
+        s = if let Some(frac) = parts.get(1) {
+            if neg {
+                format!("-{}.{}", with_commas, frac)
+            } else {
+                format!("{}.{}", with_commas, frac)
+            }
+        } else if neg {
+            format!("-{}", with_commas)
+        } else {
+            with_commas
+        };
+    }
+    s
+}
+
+fn add_commas_local(int_str: &str) -> String {
+    let mut out = String::with_capacity(int_str.len() + int_str.len() / 3);
+    for (i, c) in int_str.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out.chars().rev().collect()
 }

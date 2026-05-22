@@ -77,6 +77,11 @@ impl App {
                     self.selected_col += 1;
                 }
             }
+            EditExitDir::Left => {
+                if self.selected_col > 0 {
+                    self.selected_col -= 1;
+                }
+            }
         }
     }
 
@@ -153,6 +158,10 @@ impl App {
 
     pub fn finish_editing_move_right(&mut self) {
         self.finish_editing_in_direction(EditExitDir::Right);
+    }
+
+    pub fn finish_editing_move_left(&mut self) {
+        self.finish_editing_in_direction(EditExitDir::Left);
     }
 
     /// Commit the edit and move the cursor up — used by the Up arrow in

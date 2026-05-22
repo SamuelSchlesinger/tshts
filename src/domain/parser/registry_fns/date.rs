@@ -179,6 +179,11 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
             let start = args[0].to_number().floor() as i64;
             let end = args[1].to_number().floor() as i64;
             let (lo, hi, sign) = if start <= end { (start, end, 1) } else { (end, start, -1) };
+            // Cap the span at ~3 centuries (109,500 days) to keep an
+            // accidental `=NETWORKDAYS(0, 1e9)` from hanging the UI.
+            if hi.saturating_sub(lo) > 109_500 {
+                return Ok(Value::Error(ErrorKind::Num));
+            }
             let holidays: std::collections::HashSet<i64> = args
                 .get(2)
                 .map(|v| {
@@ -190,7 +195,6 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
                 .unwrap_or_default();
             let mut count = 0i64;
             for d in lo..=hi {
-                // 1899-12-30 (serial 0) was Saturday → Mon-based day = (d+5) mod 7
                 let dow = (d + 5).rem_euclid(7);
                 if dow < 5 && !holidays.contains(&d) {
                     count += 1;
@@ -204,6 +208,11 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
             }
             let start = args[0].to_number().floor() as i64;
             let days = args[1].to_number() as i64;
+            // Same span cap as NETWORKDAYS: refuse to step more than ~3
+            // centuries' worth of business days.
+            if days.unsigned_abs() > 109_500 {
+                return Ok(Value::Error(ErrorKind::Num));
+            }
             let holidays: std::collections::HashSet<i64> = args
                 .get(2)
                 .map(|v| {

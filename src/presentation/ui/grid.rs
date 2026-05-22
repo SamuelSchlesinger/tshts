@@ -311,15 +311,39 @@ pub fn cell_at(app: &App, x: usize, y: usize) -> Option<(usize, usize)> {
         .find(|(_, lo, hi)| xs >= *lo && xs < *hi)
         .map(|(c, _, _)| *c)?;
 
+    // Walk the visible rows in the same order render_spreadsheet built them
+    // (frozen-first, then body, both skipping hidden rows) and return the
+    // logical row at the rendered offset `y - grid_top`. The previous
+    // implementation indexed by raw offset, which misaligned when hidden
+    // rows lived inside the frozen region or the visible body.
     let row_offset = y - grid_top;
-    let frozen_r = app.frozen_rows.min(app.workbook.current_sheet().rows);
-    if row_offset < frozen_r {
-        return Some((row_offset, col));
+    let total_rows = app.workbook.current_sheet().rows;
+    let frozen_r = app.frozen_rows.min(total_rows);
+    let mut rendered = 0usize;
+
+    for frow in 0..frozen_r {
+        if app.hidden_rows.contains(&frow) {
+            continue;
+        }
+        if rendered == row_offset {
+            return Some((frow, col));
+        }
+        rendered += 1;
     }
-    let row = app.scroll_row.max(frozen_r) + (row_offset - frozen_r);
-    if row >= app.workbook.current_sheet().rows {
-        return None;
+
+    let body_start = app.scroll_row.max(frozen_r);
+    let mut row = body_start;
+    while row < total_rows {
+        if app.hidden_rows.contains(&row) {
+            row += 1;
+            continue;
+        }
+        if rendered == row_offset {
+            return Some((row, col));
+        }
+        rendered += 1;
+        row += 1;
     }
-    Some((row, col))
+    None
 }
 

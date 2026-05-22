@@ -3,6 +3,45 @@
 #![allow(unused_imports)]
 use super::*;
 
+/// Compare two values for ordering. Numbers compare numerically (with the
+/// same float-tolerance as `=`); strings compare lexicographically and
+/// case-insensitively (Excel convention). Mixed numeric/text uses Excel's
+/// ranking: numbers < strings < booleans. Tolerance-based equality means
+/// nearly-equal numbers compare `Equal` (so `<` is strict at the same
+/// precision used by `=`).
+fn cmp_ord(left: &Value, right: &Value) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let rank = |v: &Value| -> u8 {
+        match v {
+            Value::Number(_) => 0,
+            Value::String(_) => 1,
+            Value::Bool(_) => 2,
+            // Lists/arrays implicit-intersect to first element; errors
+            // shouldn't reach here (caller propagates first_error).
+            _ => 1,
+        }
+    };
+    match (left, right) {
+        (Value::Number(a), Value::Number(b)) => {
+            if super::numbers_equal(*a, *b) {
+                Ordering::Equal
+            } else {
+                a.partial_cmp(b).unwrap_or(Ordering::Equal)
+            }
+        }
+        (Value::String(a), Value::String(b)) => {
+            a.to_lowercase().cmp(&b.to_lowercase())
+        }
+        (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
+        _ => rank(left).cmp(&rank(right)),
+    }
+}
+
+/// Cap on evaluator recursion. Mirrors `MAX_PARSE_DEPTH` but applies to the
+/// evaluator — protects against runaway LAMBDA recursion (`=FIB(50)` where
+/// FIB is recursive) and pathological INDIRECT chains.
+pub(crate) const MAX_EVAL_DEPTH: u32 = 256;
+
 pub struct ExpressionEvaluator<'a> {
     spreadsheet: &'a Spreadsheet,
     function_registry: &'a FunctionRegistry,
@@ -13,6 +52,9 @@ pub struct ExpressionEvaluator<'a> {
     /// Stack of local-binding scopes for LET / LAMBDA. Innermost is last.
     /// Uses interior mutability so `evaluate(&self)` can push/pop.
     local_scope: std::cell::RefCell<Vec<HashMap<String, Value>>>,
+    /// Per-call evaluator-recursion counter. RefCell so `evaluate(&self)` can
+    /// bump it.
+    depth: std::cell::Cell<u32>,
 }
 
 impl<'a> ExpressionEvaluator<'a> {
@@ -31,6 +73,7 @@ impl<'a> ExpressionEvaluator<'a> {
             named_ranges: names,
             workbook,
             local_scope: std::cell::RefCell::new(Vec::new()),
+            depth: std::cell::Cell::new(0),
         }
     }
 
@@ -61,6 +104,17 @@ impl<'a> ExpressionEvaluator<'a> {
     
     /// Evaluates an expression AST to a value result.
     pub fn evaluate(&self, expr: &Expr) -> Result<Value, String> {
+        let d = self.depth.get();
+        if d >= MAX_EVAL_DEPTH {
+            return Err("Formula recursion too deep".to_string());
+        }
+        self.depth.set(d + 1);
+        let result = self.evaluate_inner(expr);
+        self.depth.set(d);
+        result
+    }
+
+    fn evaluate_inner(&self, expr: &Expr) -> Result<Value, String> {
         match expr {
             Expr::Number(value) => Ok(Value::Number(*value)),
 
@@ -203,26 +257,10 @@ impl<'a> ExpressionEvaluator<'a> {
                         let right_str = right_val.to_string();
                         Ok(Value::String(format!("{}{}", left_str, right_str)))
                     }
-                    BinaryOp::Less => {
-                        let left_num = left_val.to_number();
-                        let right_num = right_val.to_number();
-                        Ok(Value::Number(if left_num < right_num { 1.0 } else { 0.0 }))
-                    }
-                    BinaryOp::LessEqual => {
-                        let left_num = left_val.to_number();
-                        let right_num = right_val.to_number();
-                        Ok(Value::Number(if left_num <= right_num { 1.0 } else { 0.0 }))
-                    }
-                    BinaryOp::Greater => {
-                        let left_num = left_val.to_number();
-                        let right_num = right_val.to_number();
-                        Ok(Value::Number(if left_num > right_num { 1.0 } else { 0.0 }))
-                    }
-                    BinaryOp::GreaterEqual => {
-                        let left_num = left_val.to_number();
-                        let right_num = right_val.to_number();
-                        Ok(Value::Number(if left_num >= right_num { 1.0 } else { 0.0 }))
-                    }
+                    BinaryOp::Less => Ok(Value::Number(if cmp_ord(&left_val, &right_val) == std::cmp::Ordering::Less { 1.0 } else { 0.0 })),
+                    BinaryOp::LessEqual => Ok(Value::Number(if cmp_ord(&left_val, &right_val) != std::cmp::Ordering::Greater { 1.0 } else { 0.0 })),
+                    BinaryOp::Greater => Ok(Value::Number(if cmp_ord(&left_val, &right_val) == std::cmp::Ordering::Greater { 1.0 } else { 0.0 })),
+                    BinaryOp::GreaterEqual => Ok(Value::Number(if cmp_ord(&left_val, &right_val) != std::cmp::Ordering::Less { 1.0 } else { 0.0 })),
                     BinaryOp::Equal => {
                         let result = match (&left_val, &right_val) {
                             (Value::Number(l), Value::Number(r)) => numbers_equal(*l, *r),
@@ -262,6 +300,13 @@ impl<'a> ExpressionEvaluator<'a> {
             
             Expr::FunctionCall { name, args } => {
                 let upper = name.to_uppercase();
+                // Short-circuit control-flow functions: evaluate args lazily
+                // so e.g. `=IFERROR(1/0, "n/a")` doesn't surface #DIV/0!,
+                // and `=IF(A1=0, 0, 1/A1)` doesn't divide when the guard
+                // is true. Must run BEFORE evaluate_function_args.
+                if let Some(v) = self.try_short_circuit(&upper, args)? {
+                    return Ok(v);
+                }
                 if upper == "INDIRECT" {
                     return self.eval_indirect(args);
                 }
@@ -304,6 +349,102 @@ impl<'a> ExpressionEvaluator<'a> {
                 let arg_values = self.evaluate_function_args(args)?;
                 func(&arg_values)
             }
+        }
+    }
+
+    /// Lazy dispatch for control-flow functions that must NOT eagerly
+    /// evaluate every argument. Returns `Ok(Some(value))` when the call was
+    /// dispatched (and the value is the result), `Ok(None)` when this
+    /// function name isn't one of the short-circuit cases (so the caller
+    /// should fall through to the normal eager dispatch), or `Err` if
+    /// dispatch was attempted but failed.
+    fn try_short_circuit(&self, upper: &str, args: &[Expr]) -> Result<Option<Value>, String> {
+        match upper {
+            "IF" => {
+                if args.len() != 3 && args.len() != 2 {
+                    return Err("IF requires 2 or 3 arguments".to_string());
+                }
+                let cond = self.evaluate(&args[0])?;
+                if let Some(e) = cond.first_error() {
+                    return Ok(Some(Value::Error(e)));
+                }
+                if cond.is_truthy() {
+                    Ok(Some(self.evaluate(&args[1])?))
+                } else if let Some(else_branch) = args.get(2) {
+                    Ok(Some(self.evaluate(else_branch)?))
+                } else {
+                    Ok(Some(Value::Bool(false)))
+                }
+            }
+            "IFERROR" => {
+                if args.len() != 2 {
+                    return Err("IFERROR requires 2 arguments".to_string());
+                }
+                match self.evaluate(&args[0]) {
+                    Ok(v) if v.is_error() => Ok(Some(self.evaluate(&args[1])?)),
+                    Ok(v) => Ok(Some(v)),
+                    Err(_) => Ok(Some(self.evaluate(&args[1])?)),
+                }
+            }
+            "IFNA" => {
+                if args.len() != 2 {
+                    return Err("IFNA requires 2 arguments".to_string());
+                }
+                match self.evaluate(&args[0]) {
+                    Ok(v) if matches!(v.first_error(), Some(ErrorKind::NA)) => {
+                        Ok(Some(self.evaluate(&args[1])?))
+                    }
+                    Ok(v) => Ok(Some(v)),
+                    Err(msg) => {
+                        // String-classified #N/A: fall through to fallback.
+                        if msg.to_lowercase().contains("not found") {
+                            Ok(Some(self.evaluate(&args[1])?))
+                        } else {
+                            Err(msg)
+                        }
+                    }
+                }
+            }
+            "IFS" => {
+                if args.len() < 2 || args.len() % 2 != 0 {
+                    return Err("IFS requires pairs (cond, value), at least one pair".to_string());
+                }
+                let mut i = 0;
+                while i < args.len() {
+                    let cond = self.evaluate(&args[i])?;
+                    if let Some(e) = cond.first_error() {
+                        return Ok(Some(Value::Error(e)));
+                    }
+                    if cond.is_truthy() {
+                        return Ok(Some(self.evaluate(&args[i + 1])?));
+                    }
+                    i += 2;
+                }
+                Ok(Some(Value::Error(ErrorKind::NA)))
+            }
+            "SWITCH" => {
+                if args.len() < 3 {
+                    return Err("SWITCH requires expr + at least one match pair".to_string());
+                }
+                let expr_v = self.evaluate(&args[0])?;
+                let expr_s = expr_v.to_string();
+                let mut i = 1;
+                while i + 1 < args.len() {
+                    let case = self.evaluate(&args[i])?;
+                    if case.to_string() == expr_s {
+                        return Ok(Some(self.evaluate(&args[i + 1])?));
+                    }
+                    i += 2;
+                }
+                if i < args.len() {
+                    Ok(Some(self.evaluate(&args[i])?))
+                } else {
+                    Ok(Some(Value::Error(ErrorKind::NA)))
+                }
+            }
+            // AND/OR can also short-circuit, though Excel evaluates eagerly.
+            // We keep them eager for now (existing registry impl handles them).
+            _ => Ok(None),
         }
     }
 
@@ -422,9 +563,18 @@ impl<'a> ExpressionEvaluator<'a> {
                 if args.len() != 3 {
                     return Err("MAKEARRAY requires 3 arguments".to_string());
                 }
-                let rows = self.evaluate(&args[0])?.to_number() as usize;
-                let cols = self.evaluate(&args[1])?.to_number() as usize;
-                let mut out = Vec::with_capacity(rows * cols);
+                let rows_f = self.evaluate(&args[0])?.to_number();
+                let cols_f = self.evaluate(&args[1])?.to_number();
+                if rows_f < 1.0 || cols_f < 1.0 || !rows_f.is_finite() || !cols_f.is_finite() {
+                    return Ok(Value::Error(ErrorKind::Num));
+                }
+                let rows = rows_f as usize;
+                let cols = cols_f as usize;
+                let total = rows.checked_mul(cols).unwrap_or(usize::MAX);
+                if total > super::registry_fns::dynamic_array::MAX_DYNAMIC_ARRAY_CELLS {
+                    return Ok(Value::Error(ErrorKind::Num));
+                }
+                let mut out = Vec::with_capacity(total);
                 for r in 0..rows {
                     for c in 0..cols {
                         out.push(invoke(vec![

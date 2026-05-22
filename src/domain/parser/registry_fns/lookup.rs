@@ -51,7 +51,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
                     }
             }
             if count == 0 {
-                Err("AVERAGEIF: no matching values".to_string())
+                Ok(Value::Error(ErrorKind::Div0))
             } else {
                 Ok(Value::Number(sum / count as f64))
             }
@@ -65,7 +65,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
             let exact = args.get(3).map(|v| !v.is_truthy()).unwrap_or(false);
             let (rows, cols, data) = shape_of(&args[1]);
             if col_index == 0 || col_index > cols {
-                return Err("VLOOKUP: col_index out of range".to_string());
+                return Ok(Value::Error(ErrorKind::Ref));
             }
             // Approximate-match mode requires sorted keys (Excel semantics):
             // we stop at the first key strictly greater than the target.
@@ -75,13 +75,11 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
             for r in 0..rows {
                 let key = &data[r * cols];
                 if exact {
-                    if key.to_string() == lookup {
+                    // Excel exact-match VLOOKUP is case-insensitive on text.
+                    if key.to_string().eq_ignore_ascii_case(&lookup) {
                         return Ok(data[r * cols + col_index - 1].clone());
                     }
                 } else if let Some(t) = target_num {
-                    // Numeric approximate-match: only consider numeric keys
-                    // (skip strings whose to_number() collapses to 0 and would
-                    // falsely match every non-negative target).
                     let k_num = match key {
                         Value::Number(n) => Some(*n),
                         Value::String(s) => s.trim().parse::<f64>().ok(),
@@ -90,19 +88,17 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
                     };
                     let Some(k) = k_num else { continue };
                     if k > t {
-                        // Sorted-ascending assumption: nothing further can match.
                         break;
                     }
                     last_match = Some(r);
-                } else if key.to_string() <= lookup {
-                    // Non-numeric approximate: string compare.
+                } else if key.to_string().to_lowercase() <= lookup.to_lowercase() {
                     last_match = Some(r);
                 }
             }
             if let Some(r) = last_match {
                 return Ok(data[r * cols + col_index - 1].clone());
             }
-            Err("VLOOKUP: value not found".to_string())
+            Ok(Value::Error(ErrorKind::NA))
         });
         reg.register_function("HLOOKUP", |args| {
             if args.len() < 3 || args.len() > 4 {
@@ -113,27 +109,36 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
             let exact = args.get(3).map(|v| !v.is_truthy()).unwrap_or(false);
             let (rows, cols, data) = shape_of(&args[1]);
             if row_index == 0 || row_index > rows {
-                return Err("HLOOKUP: row_index out of range".to_string());
+                return Ok(Value::Error(ErrorKind::Ref));
             }
+            let target_num = lookup.parse::<f64>().ok();
             let mut last_match: Option<usize> = None;
             for c in 0..cols {
-                let key = &data[c]; // top row at index 0..cols
-                let matches = if exact {
-                    key.to_string() == lookup
-                } else {
-                    key.to_number() <= lookup.parse::<f64>().unwrap_or(0.0)
-                };
-                if matches {
-                    if exact {
+                let key = &data[c];
+                if exact {
+                    if key.to_string().eq_ignore_ascii_case(&lookup) {
                         return Ok(data[(row_index - 1) * cols + c].clone());
                     }
+                } else if let Some(t) = target_num {
+                    let k_num = match key {
+                        Value::Number(n) => Some(*n),
+                        Value::String(s) => s.trim().parse::<f64>().ok(),
+                        Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+                        _ => None,
+                    };
+                    let Some(k) = k_num else { continue };
+                    if k > t {
+                        break;
+                    }
+                    last_match = Some(c);
+                } else if key.to_string().to_lowercase() <= lookup.to_lowercase() {
                     last_match = Some(c);
                 }
             }
             if let Some(c) = last_match {
                 return Ok(data[(row_index - 1) * cols + c].clone());
             }
-            Err("HLOOKUP: value not found".to_string())
+            Ok(Value::Error(ErrorKind::NA))
         });
         reg.register_function("XLOOKUP", |args| {
             if args.len() < 3 || args.len() > 6 {
@@ -211,9 +216,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
                 && let Some(i) = next_larger {
                     return Ok(values[i].clone());
                 }
-            args.get(3)
-                .cloned()
-                .ok_or_else(|| "XLOOKUP: value not found".to_string())
+            Ok(args.get(3).cloned().unwrap_or(Value::Error(ErrorKind::NA)))
         });
         reg.register_function("INDEX", |args| {
             if args.len() < 2 || args.len() > 3 {
@@ -222,11 +225,11 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
             let row = args[1].to_number() as usize;
             let col = args.get(2).map(|v| v.to_number() as usize).unwrap_or(1);
             if row == 0 || col == 0 {
-                return Err("INDEX: row/col are 1-based".to_string());
+                return Ok(Value::Error(ErrorKind::Ref));
             }
             let (rows, cols, data) = shape_of(&args[0]);
             if row > rows || col > cols {
-                return Err("INDEX: out of range".to_string());
+                return Ok(Value::Error(ErrorKind::Ref));
             }
             Ok(data[(row - 1) * cols + (col - 1)].clone())
         });
@@ -238,20 +241,19 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
             let range = args[1].flatten();
             let match_type = args.get(2).map(|v| v.to_number() as i64).unwrap_or(1);
             if match_type == 0 {
-                // Excel MATCH exact mode supports `*` / `?` wildcards.
                 let has_wild = needle.contains('*') || needle.contains('?');
                 for (i, v) in range.iter().enumerate() {
                     let s = v.to_string();
                     let matched = if has_wild {
                         glob_match(&s, &needle)
                     } else {
-                        s == needle
+                        s.eq_ignore_ascii_case(&needle)
                     };
                     if matched {
                         return Ok(Value::Number((i + 1) as f64));
                     }
                 }
-                Err("MATCH: not found".to_string())
+                Ok(Value::Error(ErrorKind::NA))
             } else {
                 let target = needle.parse::<f64>().unwrap_or(0.0);
                 let mut last_idx: Option<usize> = None;
@@ -261,9 +263,9 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
                         last_idx = Some(i);
                     }
                 }
-                last_idx
+                Ok(last_idx
                     .map(|i| Value::Number((i + 1) as f64))
-                    .ok_or_else(|| "MATCH: not found".to_string())
+                    .unwrap_or(Value::Error(ErrorKind::NA)))
             }
         });
 }

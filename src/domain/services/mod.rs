@@ -10,7 +10,6 @@ use super::models::{Spreadsheet, Workbook};
 use super::parser::{Parser, ExpressionEvaluator, FunctionRegistry, Expr, Value};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
 
 /// Map an unhandled `Err(String)` to the closest Excel error code based on
 /// keywords in the message. Falls back to `#ERROR` for genuinely

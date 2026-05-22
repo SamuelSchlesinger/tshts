@@ -12,7 +12,8 @@
 //! ```bnf
 //! Expression     ::= Equality
 //! Equality       ::= Comparison ( ( "<>" | "=" ) Comparison )*
-//! Comparison     ::= Addition ( ( "<" | "<=" | ">" | ">=" ) Addition )*
+//! Comparison     ::= Concatenation ( ( "<" | "<=" | ">" | ">=" ) Concatenation )*
+//! Concatenation  ::= Addition ( "&" Addition )*
 //! Addition       ::= Multiplication ( ( "+" | "-" ) Multiplication )*
 //! Multiplication ::= Power ( ( "*" | "/" | "%" ) Power )*
 //! Power          ::= Unary ( ( "**" | "^" ) Unary )*
@@ -529,6 +530,12 @@ pub(super) fn date_to_serial(year: i32, month: u32, day: u32) -> f64 {
     serial as f64
 }
 
+/// Public alias for use by the XLSX importer, which needs to render Excel
+/// date serials as ISO strings instead of bare floats.
+pub fn serial_to_date_pub(serial: f64) -> (i32, u32, u32) {
+    serial_to_date(serial)
+}
+
 pub(super) fn serial_to_date(serial: f64) -> (i32, u32, u32) {
     let z = (serial as i64) - 25569 + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
@@ -603,7 +610,7 @@ pub(super) fn now_serial() -> f64 {
 /// Returns true if numbers are within absolute or relative epsilon.
 /// `=0.1+0.2 = 0.3` should evaluate true; very small numbers near zero should
 /// also compare equal.
-fn numbers_equal(l: f64, r: f64) -> bool {
+pub(crate) fn numbers_equal(l: f64, r: f64) -> bool {
     if l == r {
         return true;
     }
