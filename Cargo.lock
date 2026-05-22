@@ -2098,6 +2098,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "signal-hook",
  "tempfile",
  "unicode-width 0.2.0",
  "vt100",

@@ -11,24 +11,37 @@ use crate::domain::parser::{FunctionRegistry, Value, ErrorKind, flatten_args, sh
 pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         reg.register_function("PMT", |args| {
             if args.len() < 3 || args.len() > 5 {
-                return Err("PMT requires 3-5 arguments".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let rate = args[0].to_number();
             let nper = args[1].to_number();
             let pv = args[2].to_number();
             let fv = args.get(3).map(|v| v.to_number()).unwrap_or(0.0);
             let type_ = args.get(4).map(|v| v.to_number()).unwrap_or(0.0);
+            // nper=0 means "no payment periods"; with rate=0 the rate==0
+            // branch already divides by nper (also zero). Either way, PMT
+            // is undefined; Excel returns #DIV/0!.
+            if nper == 0.0 {
+                return Ok(Value::Error(ErrorKind::Div0));
+            }
             let pmt = if rate == 0.0 {
                 -(pv + fv) / nper
             } else {
                 let pow = (1.0 + rate).powf(nper);
-                -(pv * pow + fv) * rate / ((1.0 + rate * type_) * (pow - 1.0))
+                // (1+rate)^nper - 1 == 0 happens at rate = -1 (with nper > 0)
+                // or when extreme rounding collapses pow to 1; surface as
+                // #NUM! rather than emit Inf.
+                let denom = (1.0 + rate * type_) * (pow - 1.0);
+                if denom == 0.0 || !denom.is_finite() {
+                    return Ok(Value::Error(ErrorKind::Num));
+                }
+                -(pv * pow + fv) * rate / denom
             };
             Ok(Value::Number(pmt))
         });
         reg.register_function("FV", |args| {
             if args.len() < 3 || args.len() > 5 {
-                return Err("FV requires 3-5 arguments".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let rate = args[0].to_number();
             let nper = args[1].to_number();
@@ -45,7 +58,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("PV", |args| {
             if args.len() < 3 || args.len() > 5 {
-                return Err("PV requires 3-5 arguments".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let rate = args[0].to_number();
             let nper = args[1].to_number();
@@ -62,7 +75,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("NPV", |args| {
             if args.len() < 2 {
-                return Err("NPV requires rate + at least one value".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let rate = args[0].to_number();
             let flat = flatten_args(&args[1..]);

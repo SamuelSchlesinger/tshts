@@ -90,6 +90,11 @@ impl CsvExporter {
         let mut max_row = 0;
         let mut max_col = 0;
 
+        // Buffer all writes, then commit them in a single set_many call.
+        // Per-row `set_cell` previously triggered a full dep-graph recalc
+        // for each cell — O(N²) on a typical sparse import. Bulk insert
+        // skips the per-cell recalc and we run a single rebuild at the end.
+        let mut buffered: Vec<(usize, usize, crate::domain::models::CellData)> = Vec::new();
         for (row_index, result) in reader.records().enumerate() {
             let record = result.map_err(|e| format!("Failed to read CSV row {}: {}", row_index + 1, e))?;
 
@@ -101,16 +106,15 @@ impl CsvExporter {
                     // GET() or other side-effecting functions on load).
                     // The user can manually convert via the formula bar if
                     // they actually want a formula.
-                    let cell_data = crate::domain::models::CellData {
+                    buffered.push((row_index, col_index, crate::domain::models::CellData {
                         value: field.to_string(),
                         formula: None,
                         format: None,
                         comment: None,
                         spill_anchor: None,
-                    };
-                    spreadsheet.set_cell(row_index, col_index, cell_data);
+                    }));
+                    max_col = max_col.max(col_index);
                 }
-                max_col = max_col.max(col_index);
             }
             max_row = max_row.max(row_index);
         }
@@ -120,6 +124,7 @@ impl CsvExporter {
             spreadsheet.cols = spreadsheet.cols.max(max_col + 5);
         }
 
+        spreadsheet.set_many(buffered);
         spreadsheet.rebuild_dependencies();
 
         Ok(spreadsheet)
@@ -143,20 +148,20 @@ impl CsvExporter {
             existing_max_row + 1
         };
         let start_row = next_row;
+        let mut buffered: Vec<(usize, usize, crate::domain::models::CellData)> = Vec::new();
         for record in reader.records() {
             let record = record.map_err(|e| e.to_string())?;
             for (col_index, field) in record.iter().enumerate() {
                 if !field.is_empty() {
                     // Same defang as import_from_csv: don't auto-promote
                     // leading-`=` strings to formulas on import.
-                    let cell_data = crate::domain::models::CellData {
+                    buffered.push((next_row, col_index, crate::domain::models::CellData {
                         value: field.to_string(),
                         formula: None,
                         format: None,
                         comment: None,
                         spill_anchor: None,
-                    };
-                    dest.set_cell(next_row, col_index, cell_data);
+                    }));
                 }
             }
             next_row += 1;
@@ -165,6 +170,7 @@ impl CsvExporter {
         if next_row > 0 {
             dest.rows = dest.rows.max(next_row + 5);
         }
+        dest.set_many(buffered);
         dest.rebuild_dependencies();
         Ok(appended)
     }

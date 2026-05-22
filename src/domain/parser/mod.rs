@@ -607,19 +607,23 @@ pub(super) fn now_serial() -> f64 {
 }
 
 /// Tolerance-aware float equality.
-/// Returns true if numbers are within absolute or relative epsilon.
-/// `=0.1+0.2 = 0.3` should evaluate true; very small numbers near zero should
-/// also compare equal.
+/// Returns true when the two numbers are within a relative epsilon scaled
+/// to their magnitude, with an absolute floor at `f64::EPSILON` so genuinely-
+/// near-zero values (e.g. `0.1 + 0.2 - 0.3`) compare equal.
+/// `=0.1+0.2 = 0.3` evaluates true. `=1e-15 = 2e-15` evaluates false —
+/// the previous absolute-1e-12 floor lumped far-apart small numbers
+/// together, breaking VLOOKUP / MATCH / numeric COUNTIF equality on
+/// scientific-data sheets.
 pub(crate) fn numbers_equal(l: f64, r: f64) -> bool {
     if l == r {
         return true;
     }
-    let diff = (l - r).abs();
-    if diff < 1e-12 {
-        return true;
+    if !l.is_finite() || !r.is_finite() {
+        return false;
     }
+    let diff = (l - r).abs();
     let scale = l.abs().max(r.abs());
-    diff < scale * 1e-9
+    diff < scale * 1e-12 || diff < f64::EPSILON
 }
 
 /// Expression evaluator that walks the AST and computes results.

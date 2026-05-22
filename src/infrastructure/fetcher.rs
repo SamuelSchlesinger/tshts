@@ -133,10 +133,17 @@ fn inner() -> &'static Arc<Inner> {
 }
 
 fn perform_fetch(client: Option<&reqwest::blocking::Client>, url: &str) -> CacheEntry {
-    let send_result = match client {
-        Some(c) => c.get(url).send(),
-        None => reqwest::blocking::get(url),
+    // Refuse to fall back to bare `reqwest::blocking::get` when the
+    // configured client failed to build: that path has no timeout, no
+    // redirect-revalidation, and no user-agent, which silently strips
+    // every SSRF defense for the rest of the session.
+    let Some(c) = client else {
+        return CacheEntry::Error {
+            fetched_at: Instant::now(),
+            body: "#ERROR: HTTP client failed to initialize".to_string(),
+        };
     };
+    let send_result = c.get(url).send();
     let response = match send_result {
         Ok(r) => r,
         Err(e) => {

@@ -11,17 +11,22 @@ use crate::domain::parser::{FunctionRegistry, Value, ErrorKind, flatten_args, sh
 pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         reg.register_function("GET", |args| {
             if args.len() != 1 {
-                return Err("GET requires exactly 1 argument (URL)".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let url = args[0].to_string();
             if url.is_empty() {
-                return Err("GET: empty URL".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             use crate::infrastructure::fetcher::{fetch, FetchResult};
             match fetch(&url) {
                 FetchResult::Value(body) => Ok(Value::String(body)),
                 FetchResult::Loading => Ok(Value::String("Loading…".to_string())),
-                FetchResult::Error(msg) => Err(msg),
+                // Fetcher errors carry a human-readable string (#ERROR: ...);
+                // surface as a #VALUE! so the cell renders an error literal
+                // and IFERROR can trap it. The original message is dropped
+                // because Value::Error doesn't carry text — acceptable since
+                // the cause is usually a transient network issue.
+                FetchResult::Error(_) => Ok(Value::Error(ErrorKind::Value)),
             }
         });
 }

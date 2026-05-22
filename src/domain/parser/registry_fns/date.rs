@@ -11,53 +11,77 @@ use crate::domain::parser::{FunctionRegistry, Value, ErrorKind, flatten_args, sh
 pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         reg.register_function("TODAY", |args| {
             if !args.is_empty() {
-                return Err("TODAY takes no arguments".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             Ok(Value::Number(today_serial()))
         });
         reg.register_function("NOW", |args| {
             if !args.is_empty() {
-                return Err("NOW takes no arguments".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             Ok(Value::Number(now_serial()))
         });
         reg.register_function("DATE", |args| {
             if args.len() != 3 {
-                return Err("DATE requires 3 arguments (year, month, day)".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
-            let y = args[0].to_number() as i32;
-            let m = args[1].to_number() as u32;
-            let d = args[2].to_number() as u32;
+            let yr = args[0].to_number();
+            let mr = args[1].to_number();
+            let dr = args[2].to_number();
+            if !yr.is_finite() || !mr.is_finite() || !dr.is_finite() {
+                return Ok(Value::Error(ErrorKind::Num));
+            }
+            let y = yr as i32;
+            let m = mr as u32;
+            let d = dr as u32;
             Ok(Value::Number(date_to_serial(y, m, d)))
         });
         reg.register_function("YEAR", |args| {
             if args.len() != 1 {
-                return Err("YEAR requires 1 argument".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
-            let (y, _, _) = serial_to_date(args[0].to_number());
+            let n = args[0].to_number();
+            if !n.is_finite() {
+                return Ok(Value::Error(ErrorKind::Num));
+            }
+            let (y, _, _) = serial_to_date(n);
             Ok(Value::Number(y as f64))
         });
         reg.register_function("MONTH", |args| {
             if args.len() != 1 {
-                return Err("MONTH requires 1 argument".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
-            let (_, m, _) = serial_to_date(args[0].to_number());
+            let n = args[0].to_number();
+            if !n.is_finite() {
+                return Ok(Value::Error(ErrorKind::Num));
+            }
+            let (_, m, _) = serial_to_date(n);
             Ok(Value::Number(m as f64))
         });
         reg.register_function("DAY", |args| {
             if args.len() != 1 {
-                return Err("DAY requires 1 argument".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
-            let (_, _, d) = serial_to_date(args[0].to_number());
+            let n = args[0].to_number();
+            if !n.is_finite() {
+                return Ok(Value::Error(ErrorKind::Num));
+            }
+            let (_, _, d) = serial_to_date(n);
             Ok(Value::Number(d as f64))
         });
         reg.register_function("TIME", |args| {
             if args.len() != 3 {
-                return Err("TIME requires 3 arguments".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let h = args[0].to_number();
             let m = args[1].to_number();
             let s = args[2].to_number();
+            // Excel TIME requires h, m, s ≥ 0 (and returns #NUM! otherwise).
+            if !h.is_finite() || !m.is_finite() || !s.is_finite()
+                || h < 0.0 || m < 0.0 || s < 0.0
+            {
+                return Ok(Value::Error(ErrorKind::Num));
+            }
             Ok(Value::Number((h * 3600.0 + m * 60.0 + s) / 86400.0))
         });
         reg.register_function("HOUR", |args| {
@@ -77,7 +101,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("DATEDIF", |args| {
             if args.len() != 3 {
-                return Err("DATEDIF requires 3 arguments".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let start = args[0].to_number().floor();
             let end = args[1].to_number().floor();
@@ -124,12 +148,12 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
                     let s2 = date_to_serial(candidate_year, sm, sd);
                     Ok(Value::Number(end - s2))
                 }
-                _ => Err(format!("DATEDIF: unknown unit '{}'", unit)),
+                _ => Ok(Value::Error(ErrorKind::Value)),
             }
         });
         reg.register_function("WEEKDAY", |args| {
             if args.is_empty() {
-                return Err("WEEKDAY requires 1 or 2 arguments".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let serial = args[0].to_number().floor() as i64;
             let ty = args.get(1).map(|v| v.to_number() as i64).unwrap_or(1);
@@ -139,16 +163,20 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
                 1 => ((mon_based + 1) % 7) + 1, // Sun=1..Sat=7
                 2 => mon_based + 1,             // Mon=1..Sun=7
                 3 => mon_based,                 // Mon=0..Sun=6
-                _ => return Err(format!("WEEKDAY: bad type {}", ty)),
+                _ => return Ok(Value::Error(ErrorKind::Value)),
             };
             Ok(Value::Number(v as f64))
         });
         reg.register_function("EDATE", |args| {
             if args.len() != 2 {
-                return Err("EDATE requires 2 arguments".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let (y, m, d) = serial_to_date(args[0].to_number());
-            let total = (y as i64) * 12 + (m as i64 - 1) + args[1].to_number() as i64;
+            // Excel rounds the months arg toward zero on display but
+            // arithmetically uses the truncated integer; we instead round
+            // half-away-from-zero so `EDATE(d, 1.5)` advances 2 months,
+            // matching Sheets and avoiding surprising truncation at .9.
+            let total = (y as i64) * 12 + (m as i64 - 1) + args[1].to_number().round() as i64;
             let new_y = total.div_euclid(12) as i32;
             let new_m = (total.rem_euclid(12) + 1) as u32;
             let last = days_in_month(new_y, new_m);
@@ -157,10 +185,10 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("EOMONTH", |args| {
             if args.len() != 2 {
-                return Err("EOMONTH requires 2 arguments".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let (y, m, _) = serial_to_date(args[0].to_number());
-            let total = (y as i64) * 12 + (m as i64 - 1) + args[1].to_number() as i64;
+            let total = (y as i64) * 12 + (m as i64 - 1) + args[1].to_number().round() as i64;
             let new_y = total.div_euclid(12) as i32;
             let new_m = (total.rem_euclid(12) + 1) as u32;
             let last = days_in_month(new_y, new_m);
@@ -168,13 +196,13 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("DAYS", |args| {
             if args.len() != 2 {
-                return Err("DAYS requires 2 arguments".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             Ok(Value::Number(args[0].to_number().floor() - args[1].to_number().floor()))
         });
         reg.register_function("NETWORKDAYS", |args| {
             if args.len() < 2 || args.len() > 3 {
-                return Err("NETWORKDAYS requires 2 or 3 arguments".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let start = args[0].to_number().floor() as i64;
             let end = args[1].to_number().floor() as i64;
@@ -204,7 +232,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("WORKDAY", |args| {
             if args.len() < 2 || args.len() > 3 {
-                return Err("WORKDAY requires 2 or 3 arguments".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let start = args[0].to_number().floor() as i64;
             let days = args[1].to_number() as i64;
@@ -236,7 +264,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("DATEVALUE", |args| {
             if args.len() != 1 {
-                return Err("DATEVALUE requires 1 argument".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let s = args[0].to_string();
             // ISO
@@ -258,7 +286,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("TIMEVALUE", |args| {
             if args.len() != 1 {
-                return Err("TIMEVALUE requires 1 argument".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let s = args[0].to_string();
             let parts: Vec<&str> = s.split(':').collect();
@@ -275,7 +303,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("YEARFRAC", |args| {
             if args.len() < 2 || args.len() > 3 {
-                return Err("YEARFRAC requires 2 or 3 arguments".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let start = args[0].to_number().floor() as i64;
             let end = args[1].to_number().floor() as i64;

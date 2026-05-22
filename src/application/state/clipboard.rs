@@ -279,6 +279,36 @@ impl App {
                 // way for plain-text formula paste. The tshts→tshts path in
                 // `paste()` handles relative adjustment properly.
                 let new_cell = if value.starts_with('=') {
+                    // Cycle check: pasted text bypasses finish_editing_in_direction,
+                    // so a `=A1` pasted into A1 would otherwise be accepted.
+                    if !self.iterative_calc {
+                        let names = self.workbook.named_ranges.clone();
+                        let evaluator = FormulaEvaluator::for_workbook(
+                            &self.workbook,
+                            self.workbook.current_sheet(),
+                            &names,
+                        );
+                        let same = evaluator.would_create_circular_reference(
+                            value,
+                            (target_row, target_col),
+                        );
+                        let precedents = evaluator.extract_qualified_refs(value);
+                        let sheet_name = self
+                            .workbook
+                            .sheet_names[self.workbook.active_sheet]
+                            .clone();
+                        let cross = self.workbook.would_create_cross_sheet_cycle(
+                            &sheet_name,
+                            target_row,
+                            target_col,
+                            &precedents,
+                        );
+                        if same || cross {
+                            // Skip this one cell; keep going. Surfacing via
+                            // status_message at end of paste.
+                            continue;
+                        }
+                    }
                     let evaluator = FormulaEvaluator::new(self.workbook.current_sheet());
                     let evaluated = evaluator.evaluate_formula(value);
                     CellData {

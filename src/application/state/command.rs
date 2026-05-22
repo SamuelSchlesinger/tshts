@@ -68,8 +68,13 @@ impl App {
         if let Some(rest) = trimmed.strip_prefix("w ").or_else(|| trimmed.strip_prefix("W ")) {
             let name = rest.trim().to_string();
             if !name.is_empty() {
-                self.snapshot_view_state_to_active_sheet();
-                let result = if name.to_lowercase().ends_with(".xlsx") {
+                let is_xlsx = name.to_lowercase().ends_with(".xlsx");
+                // See save_in_place_or_prompt: xlsx doesn't round-trip
+                // App-only view state, so skip the snapshot for that target.
+                if !is_xlsx {
+                    self.snapshot_view_state_to_active_sheet();
+                }
+                let result = if is_xlsx {
                     crate::infrastructure::xlsx::save_xlsx(&self.workbook, &name)
                         .map(|_| name.clone())
                 } else {
@@ -183,11 +188,15 @@ impl App {
                 let max_c = sheet.cols.saturating_sub(1);
                 self.frozen_rows = self.selected_row.min(max_r);
                 self.frozen_cols = self.selected_col.min(max_c);
+                // Freeze is persistent view state — mark dirty so it
+                // survives :q after a freeze with no other edits.
+                self.dirty = true;
                 self.status_message = Some(format!("Frozen {} rows, {} cols", self.frozen_rows, self.frozen_cols));
             }
             ["unfreeze"] => {
                 self.frozen_rows = 0;
                 self.frozen_cols = 0;
+                self.dirty = true;
                 self.status_message = Some("Unfrozen all panes".to_string());
             }
             ["format", "general"] => self.set_selection_format(NumberFormat::General),
@@ -231,33 +240,33 @@ impl App {
             }
             ["sheet", "new"] | ["new", "sheet"] | ["addsheet"] => {
                 let name = format!("Sheet{}", self.workbook.sheets.len() + 1);
-                self.workbook.add_sheet(name.clone());
-                self.workbook.active_sheet = self.workbook.sheets.len() - 1;
-                self.selected_row = 0;
-                self.selected_col = 0;
-                self.scroll_row = 0;
-                self.scroll_col = 0;
-                self.dirty = true;
-                crate::infrastructure::autosave::mark_dirty();
-                self.status_message = Some(format!("Added sheet '{}'", name));
+                let label = format!("Add sheet '{}'", name);
+                self.with_snapshot_undo(&label, |app| {
+                    app.workbook.add_sheet(name.clone());
+                    app.workbook.active_sheet = app.workbook.sheets.len() - 1;
+                    app.selected_row = 0;
+                    app.selected_col = 0;
+                    app.scroll_row = 0;
+                    app.scroll_col = 0;
+                });
+                self.status_message = Some(format!("Added sheet (undo with u)"));
             }
             ["sheet", "delete"] | ["delsheet"] => {
                 let name = self.workbook.sheet_names[self.workbook.active_sheet].clone();
-                if self.workbook.remove_sheet(self.workbook.active_sheet) {
-                    self.selected_row = 0;
-                    self.selected_col = 0;
-                    self.scroll_row = 0;
-                    self.scroll_col = 0;
-                    self.dirty = true;
-                    crate::infrastructure::autosave::mark_dirty();
-                    // remove_sheet may have shifted the active sheet (the
-                    // workbook re-anchors it). Drop search/find-replace state
-                    // since their (row, col) results belonged to the old
-                    // active sheet.
-                    self.invalidate_cross_sheet_state();
-                    self.status_message = Some(format!("Deleted sheet '{}'", name));
-                } else {
+                if self.workbook.sheets.len() <= 1 {
                     self.status_message = Some("Cannot delete the last sheet".to_string());
+                } else {
+                    let label = format!("Delete sheet '{}'", name);
+                    let active = self.workbook.active_sheet;
+                    self.with_snapshot_undo(&label, |app| {
+                        app.workbook.remove_sheet(active);
+                        app.selected_row = 0;
+                        app.selected_col = 0;
+                        app.scroll_row = 0;
+                        app.scroll_col = 0;
+                        app.invalidate_cross_sheet_state();
+                    });
+                    self.status_message = Some(format!("Deleted sheet '{}' (undo with u)", name));
                 }
             }
             ["sheet", "next"] | ["sn"] => {
@@ -539,6 +548,11 @@ impl App {
                 for s in &mut self.workbook.sheets {
                     s.iterative_calc = true;
                 }
+                // Existing circular formulas need to resolve under the new
+                // mode; without this they keep showing the previous #CYCLE!
+                // value until the next user edit.
+                self.recalc_all();
+                self.dirty = true;
                 self.status_message = Some(format!(
                     "Iterative calc: on (max {} iters, eps {})",
                     self.workbook.current_sheet().iter_max,
@@ -550,6 +564,8 @@ impl App {
                 for s in &mut self.workbook.sheets {
                     s.iterative_calc = false;
                 }
+                self.recalc_all();
+                self.dirty = true;
                 self.status_message = Some("Iterative calc: off".to_string());
             }
             ["iterative", "max", n] => {
@@ -557,6 +573,10 @@ impl App {
                     for s in &mut self.workbook.sheets {
                         s.iter_max = v;
                     }
+                    if self.iterative_calc {
+                        self.recalc_all();
+                    }
+                    self.dirty = true;
                     self.status_message = Some(format!("Iterative max = {}", v));
                 } else {
                     self.status_message = Some("iterative max: bad number".to_string());
@@ -567,6 +587,10 @@ impl App {
                     for s in &mut self.workbook.sheets {
                         s.iter_epsilon = v;
                     }
+                    if self.iterative_calc {
+                        self.recalc_all();
+                    }
+                    self.dirty = true;
                     self.status_message = Some(format!("Iterative epsilon = {}", v));
                 } else {
                     self.status_message = Some("iterative epsilon: bad number".to_string());
@@ -948,16 +972,26 @@ impl App {
                 // Join the remaining tokens so values with spaces (e.g.
                 // `LAMBDA(x, x*2)`) survive intact.
                 let value = rest.join(" ");
-                self.workbook.set_name(name, &value);
-                self.dirty = true;
+                let label = format!("Name '{}' = {}", name, value);
+                let name_owned = (*name).to_string();
+                let value_owned = value.clone();
+                self.with_snapshot_undo(&label, |app| {
+                    app.workbook.set_name(&name_owned, &value_owned);
+                });
                 self.status_message = Some(format!("Named '{}' = {}", name, value));
             }
             ["unname", name] => {
-                if self.workbook.remove_name(name) {
-                    self.dirty = true;
-                    self.status_message = Some(format!("Removed name '{}'", name));
-                } else {
+                if !self.workbook.named_ranges.contains_key(*name)
+                    && !self.workbook.named_ranges.keys().any(|k| k.eq_ignore_ascii_case(name))
+                {
                     self.status_message = Some(format!("No such name: {}", name));
+                } else {
+                    let label = format!("Remove name '{}'", name);
+                    let name_owned = (*name).to_string();
+                    self.with_snapshot_undo(&label, |app| {
+                        app.workbook.remove_name(&name_owned);
+                    });
+                    self.status_message = Some(format!("Removed name '{}'", name));
                 }
             }
             ["names"] => {

@@ -11,7 +11,7 @@ use crate::domain::parser::{FunctionRegistry, Value, ErrorKind, flatten_args, sh
 pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         reg.register_function("SUMIF", |args| {
             if args.len() != 2 && args.len() != 3 {
-                return Err("SUMIF requires 2 or 3 arguments".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let range = args[0].flatten();
             let criteria = args[1].to_string();
@@ -27,7 +27,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("COUNTIF", |args| {
             if args.len() != 2 {
-                return Err("COUNTIF requires 2 arguments".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let range = args[0].flatten();
             let criteria = args[1].to_string();
@@ -36,7 +36,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("AVERAGEIF", |args| {
             if args.len() != 2 && args.len() != 3 {
-                return Err("AVERAGEIF requires 2 or 3 arguments".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let range = args[0].flatten();
             let criteria = args[1].to_string();
@@ -58,7 +58,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("VLOOKUP", |args| {
             if args.len() < 3 || args.len() > 4 {
-                return Err("VLOOKUP requires 3 or 4 arguments".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let lookup = args[0].to_string();
             let col_index = args[2].to_number() as usize;
@@ -102,7 +102,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("HLOOKUP", |args| {
             if args.len() < 3 || args.len() > 4 {
-                return Err("HLOOKUP requires 3 or 4 arguments".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let lookup = args[0].to_string();
             let row_index = args[2].to_number() as usize;
@@ -142,13 +142,13 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("XLOOKUP", |args| {
             if args.len() < 3 || args.len() > 6 {
-                return Err("XLOOKUP requires 3-6 arguments".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let lookup = args[0].to_string();
             let keys = args[1].flatten();
             let values = args[2].flatten();
             if keys.len() != values.len() {
-                return Err("XLOOKUP: lookup and return ranges must match in length".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let match_mode = args
                 .get(4)
@@ -169,42 +169,65 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
             // exploit sortedness but the linear walk still finds the answer.)
 
             let needle_num = lookup.parse::<f64>().ok();
+            let needle_lc = lookup.to_lowercase();
             let mut exact_hit: Option<usize> = None;
-            let mut next_smaller: Option<usize> = None; // largest <= target
-            let mut next_larger: Option<usize> = None;  // smallest >= target
+            // For match_mode = -1, "largest value ≤ target": track the
+            // candidate whose comparison to needle is closest to Equal from
+            // below (largest Less, or Equal). For match_mode = 1, "smallest
+            // value ≥ target": closest to Equal from above (smallest Greater).
+            // We carry the candidate index together with a numeric key for
+            // the "how close" comparison; for text we use lexicographic order.
+            let key_for_compare = |k: &Value| -> Option<f64> {
+                let k_num = match k {
+                    Value::Number(n) => Some(*n),
+                    Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+                    Value::String(s) => s.parse::<f64>().ok(),
+                    _ => None,
+                };
+                if needle_num.is_some() {
+                    k_num
+                } else if matches!(k, Value::Number(_) | Value::Bool(_)) {
+                    None // numeric key, text needle: skip
+                } else {
+                    // Text-vs-text: project lowercase string compare against
+                    // the needle to a signed integer ordering distance.
+                    let kl = k.to_string().to_lowercase();
+                    Some(match kl.cmp(&needle_lc) {
+                        std::cmp::Ordering::Less => -1.0,
+                        std::cmp::Ordering::Equal => 0.0,
+                        std::cmp::Ordering::Greater => 1.0,
+                    })
+                }
+            };
+            let target = needle_num.unwrap_or(0.0);
+            let mut best_smaller: Option<(usize, f64)> = None;
+            let mut best_larger: Option<(usize, f64)> = None;
 
             for i in &indices {
                 let k = &keys[*i];
                 let matched = match match_mode {
                     2 => glob_match(&k.to_string(), &lookup),
-                    _ => k.to_string() == lookup,
+                    _ => k.to_string().eq_ignore_ascii_case(&lookup),
                 };
                 if matched {
                     exact_hit = Some(*i);
                     break;
                 }
-                if let (Some(t), Some(n)) = (needle_num, Some(k.to_number())) {
-                    match match_mode {
-                        -1 if n <= t
-                            && next_smaller
-                                .map(|si| keys[si].to_number())
-                                .map(|sv| n > sv)
-                                .unwrap_or(true)
-                            => {
-                                next_smaller = Some(*i);
-                            }
-                        1 if n >= t
-                            && next_larger
-                                .map(|li| keys[li].to_number())
-                                .map(|lv| n < lv)
-                                .unwrap_or(true)
-                            => {
-                                next_larger = Some(*i);
-                            }
-                        _ => {}
+                let Some(kn) = key_for_compare(k) else { continue };
+                if match_mode == -1 && kn <= target {
+                    let is_better = best_smaller.map(|(_, bv)| kn > bv).unwrap_or(true);
+                    if is_better {
+                        best_smaller = Some((*i, kn));
+                    }
+                } else if match_mode == 1 && kn >= target {
+                    let is_better = best_larger.map(|(_, bv)| kn < bv).unwrap_or(true);
+                    if is_better {
+                        best_larger = Some((*i, kn));
                     }
                 }
             }
+            let next_smaller = best_smaller.map(|(i, _)| i);
+            let next_larger = best_larger.map(|(i, _)| i);
             if let Some(i) = exact_hit {
                 return Ok(values[i].clone());
             }
@@ -220,7 +243,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("INDEX", |args| {
             if args.len() < 2 || args.len() > 3 {
-                return Err("INDEX requires 2 or 3 arguments".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let row = args[1].to_number() as usize;
             let col = args.get(2).map(|v| v.to_number() as usize).unwrap_or(1);
@@ -235,7 +258,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("MATCH", |args| {
             if args.len() < 2 || args.len() > 3 {
-                return Err("MATCH requires 2 or 3 arguments".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let needle = args[0].to_string();
             let range = args[1].flatten();
@@ -255,12 +278,36 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
                 }
                 Ok(Value::Error(ErrorKind::NA))
             } else {
-                let target = needle.parse::<f64>().unwrap_or(0.0);
+                // match_type 1: ascending, find largest value <= needle.
+                // match_type -1: descending, find smallest value >= needle.
+                // Excel accepts text or numeric ranges; previously
+                // `needle.parse::<f64>().unwrap_or(0.0)` collapsed text
+                // needles to 0 and made every text cell match cell == 0.
+                let needle_num = needle.parse::<f64>().ok();
+                let needle_lc = needle.to_lowercase();
                 let mut last_idx: Option<usize> = None;
                 for (i, v) in range.iter().enumerate() {
-                    let n = v.to_number();
-                    if (match_type > 0 && n <= target) || (match_type < 0 && n >= target) {
-                        last_idx = Some(i);
+                    let v_num = match v {
+                        Value::Number(n) => Some(*n),
+                        Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+                        Value::String(s) => s.parse::<f64>().ok(),
+                        _ => None,
+                    };
+                    let ord = match (needle_num, v_num) {
+                        (Some(t), Some(n)) => n.partial_cmp(&t),
+                        (None, None) => Some(v.to_string().to_lowercase().cmp(&needle_lc)),
+                        // Mixed types are skipped (Excel ignores them).
+                        _ => None,
+                    };
+                    if let Some(o) = ord {
+                        let hit = if match_type > 0 {
+                            !o.is_gt() // n <= target
+                        } else {
+                            !o.is_lt() // n >= target
+                        };
+                        if hit {
+                            last_idx = Some(i);
+                        }
                     }
                 }
                 Ok(last_idx

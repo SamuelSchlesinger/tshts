@@ -31,7 +31,17 @@ pub fn load() -> Vec<String> {
     let Ok(content) = std::fs::read_to_string(&path) else { return Vec::new(); };
     let list: Vec<String> = serde_json::from_str(&content).unwrap_or_default();
     list.into_iter()
-        .filter(|p| std::path::Path::new(p).exists())
+        .filter(|p| {
+            // `exists()` returns false for "not found" AND for permission-
+            // denied / NFS-unreachable cases. Use `try_exists` so that
+            // a temporarily-unmounted share doesn't permanently drop the
+            // entry from the recent list.
+            match std::path::Path::new(p).try_exists() {
+                Ok(true) => true,
+                Ok(false) => false,
+                Err(_) => true, // ambiguous — keep the entry
+            }
+        })
         .collect()
 }
 

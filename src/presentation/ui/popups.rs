@@ -11,6 +11,7 @@ use ratatui::{
     Frame,
 };
 use super::{caret, layer_for_render, terminal_color_to_ratatui};
+use unicode_width::UnicodeWidthStr;
 
 pub(super) fn render_chart_popup(f: &mut Frame, app: &App) {
     let Some(chart) = app.chart_popup.as_ref() else { return; };
@@ -24,6 +25,12 @@ pub(super) fn render_chart_popup(f: &mut Frame, app: &App) {
     f.render_widget(Clear, popup);
     let inner_h = popup.height.saturating_sub(3) as usize;
     let inner_w = popup.width.saturating_sub(4) as usize;
+    // Tiny terminal → empty inner area. Bail without entering the
+    // chart-render loops, which otherwise underflow `inner_h - 1`
+    // computations and panic on usize.
+    if inner_h == 0 || inner_w == 0 {
+        return;
+    }
     // Pull values fresh from the source range so the chart reflects any
     // edits since the popup was opened.
     let ((sr, sc), (er, ec)) = chart.source;
@@ -95,7 +102,10 @@ pub(super) fn render_chart_popup(f: &mut Frame, app: &App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!("{} (min={:.2}, max={:.2})", chart.title, min, max))
+                .title(format!(
+                    "{} (min={:.2}, max={:.2}) — Esc to close",
+                    chart.title, min, max
+                ))
                 .style(Style::default().fg(Color::Cyan)),
         )
         .style(Style::default().fg(Color::Green));
@@ -114,7 +124,10 @@ pub(super) fn render_function_autocomplete(f: &mut Frame, app: &App, status_area
         .chars()
         .rev()
         .collect();
-    if token.len() < 2 {
+    // Count chars, not bytes — a single CJK character is 3+ bytes but one
+    // visible character. We only want to autocomplete after 2 identifier
+    // characters have been typed.
+    if token.chars().count() < 2 {
         return;
     }
     let upper = token.to_uppercase();
@@ -126,7 +139,7 @@ pub(super) fn render_function_autocomplete(f: &mut Frame, app: &App, status_area
     if matches.is_empty() {
         return;
     }
-    let width = (matches.iter().map(|s| s.len()).max().unwrap_or(20) as u16 + 4).max(15);
+    let width = (matches.iter().map(|s| s.width()).max().unwrap_or(20) as u16 + 4).max(15);
     let height = (matches.len() as u16 + 2).min(8);
     let popup = Rect {
         x: status_area.x,
@@ -154,7 +167,7 @@ pub(super) fn render_recent_files(f: &mut Frame, status_area: Rect) {
     }
     let max_show = recents.len().min(8);
     let shown = &recents[..max_show];
-    let width = (shown.iter().map(|s| s.len()).max().unwrap_or(20) as u16 + 4).max(30);
+    let width = (shown.iter().map(|s| UnicodeWidthStr::width(&s[..])).max().unwrap_or(20) as u16 + 4).max(30);
     let height = (shown.len() as u16 + 2).min(10);
     let popup = Rect {
         x: status_area.x,
@@ -182,7 +195,7 @@ pub(super) fn render_command_suggestions(f: &mut Frame, app: &App, status_area: 
         return;
     }
     let height = (suggestions.len() as u16 + 2).min(10);
-    let width = (suggestions.iter().map(|s| s.len()).max().unwrap_or(20) as u16 + 4).max(20);
+    let width = (suggestions.iter().map(|s| UnicodeWidthStr::width(&s[..])).max().unwrap_or(20) as u16 + 4).max(20);
     let popup = Rect {
         x: status_area.x,
         y: status_area.y.saturating_sub(height),

@@ -62,6 +62,7 @@ pub fn load_xlsx(path: &str) -> Result<Workbook, String> {
         named_ranges: std::collections::HashMap::new(),
         cross_sheet_dependents: std::collections::HashMap::new(),
         cross_sheet_dependencies: std::collections::HashMap::new(),
+        cells_with_qualified_refs: std::collections::HashSet::new(),
     };
     for name in &sheet_names {
         let range = wb
@@ -583,9 +584,12 @@ pub fn save_xlsx(workbook: &Workbook, path: &str) -> Result<(), String> {
                         xml_escape(&cd.value)
                     ));
                 } else if is_num {
+                    // Numeric branch is currently safe (parse::<f64>().is_ok()
+                    // excludes XML metacharacters) but escape defensively so a
+                    // future loosening of `is_num` can't introduce injection.
                     buf.push_str(&format!(
                         "<c r=\"{}\"{}><v>{}</v></c>",
-                        cell_ref, s_attr, cd.value
+                        cell_ref, s_attr, xml_escape(&cd.value)
                     ));
                 } else {
                     buf.push_str(&format!(

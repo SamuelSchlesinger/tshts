@@ -11,7 +11,7 @@ use crate::domain::parser::{FunctionRegistry, Value, ErrorKind, flatten_args, sh
 pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         reg.register_function("IF", |args| {
             if args.len() != 3 {
-                Err("IF requires exactly 3 arguments".to_string())
+                Ok(Value::Error(ErrorKind::Value))
             } else {
                 Ok(if args[0].is_truthy() { args[1].clone() } else { args[2].clone() })
             }
@@ -34,7 +34,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("NOT", |args| {
             if args.len() != 1 {
-                Err("NOT requires exactly 1 argument".to_string())
+                Ok(Value::Error(ErrorKind::Value))
             } else if let Some(e) = args[0].first_error() {
                 Ok(Value::Error(e))
             } else {
@@ -44,7 +44,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("IFERROR", |args| {
             if args.len() != 2 {
-                return Err("IFERROR requires 2 arguments".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             if args[0].is_error() {
                 Ok(args[1].clone())
@@ -54,7 +54,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("IFNA", |args| {
             if args.len() != 2 {
-                return Err("IFNA requires 2 arguments".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             if matches!(args[0].first_error(), Some(ErrorKind::NA)) {
                 Ok(args[1].clone())
@@ -64,19 +64,19 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("TRUE", |args| {
             if !args.is_empty() {
-                return Err("TRUE takes no arguments".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             Ok(Value::Bool(true))
         });
         reg.register_function("FALSE", |args| {
             if !args.is_empty() {
-                return Err("FALSE takes no arguments".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             Ok(Value::Bool(false))
         });
         reg.register_function("IFS", |args| {
             if args.len() < 2 || args.len() % 2 != 0 {
-                return Err("IFS requires pairs (cond, value), at least one pair".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let mut i = 0;
             while i < args.len() {
@@ -89,7 +89,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("SWITCH", |args| {
             if args.len() < 3 {
-                return Err("SWITCH requires expr + at least one match pair".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let expr_s = args[0].to_string();
             let mut i = 1;

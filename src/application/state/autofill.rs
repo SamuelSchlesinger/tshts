@@ -36,9 +36,10 @@ impl App {
             }
 
             let num_changes = changes.len();
-            for (row, col, cell_data) in changes {
-                self.set_cell_with_undo(row, col, cell_data);
-            }
+            // Single batched undo entry rather than one per cell. A 20-cell
+            // autofill used to require 20 separate `u` presses to roll back;
+            // now it's one.
+            self.set_many_with_undo(changes);
 
             if num_changes > 0 {
                 let suffix = if skipped > 0 {

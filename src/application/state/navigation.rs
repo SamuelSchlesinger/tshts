@@ -34,6 +34,7 @@ impl App {
     /// n/N after a sheet switch would jump to phantom cells.
     pub(crate) fn invalidate_cross_sheet_state(&mut self) {
         self.search_results.clear();
+        self.search_results_set.clear();
         self.search_result_index = 0;
         self.find_replace_results.clear();
         self.find_replace_index = 0;

@@ -25,6 +25,10 @@ unicode-width = "0.2"
 regex = "1"
 calamine = "0.24"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+# SIGTERM / SIGHUP handler — flips an AtomicBool the main loop polls so we
+# can flush the autosave worker before exit instead of letting logout/
+# shutdown drop queued writes.
+signal-hook = "0.3"
 
 [dev-dependencies]
 tempfile = "3.0"

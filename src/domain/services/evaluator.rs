@@ -277,17 +277,39 @@ impl<'a> FormulaEvaluator<'a> {
             }
             Expr::Range(start_cell, end_cell) => {
                 // 3-D markers (`<S1>..<S3>!<cell>`): expand the cell across
-                // each named sheet in the span.
+                // each sheet in the span [S1..=S3], inclusive of intermediates.
+                // The previous version only emitted S1 and S3, so a change
+                // on an intermediate sheet (S2!A1) failed to trigger recalc
+                // of a cell that referenced `S1:S3!A1`.
                 if let Some((s1, s2, cell)) = Spreadsheet::parse_three_d_marker(start_cell)
                 {
                     if let Some((row, col)) = Spreadsheet::parse_cell_reference(&cell) {
-                        // Walk the sheet-name list; if the names aren't in
-                        // the workbook, we silently skip.
-                        // (We don't have workbook ordering info in this
-                        // method directly — caller can resolve as needed.)
-                        out.push((Some(s1.clone()), row, col));
-                        if !s1.eq_ignore_ascii_case(&s2) {
-                            out.push((Some(s2), row, col));
+                        let pushed = if let Some(wb) = self.workbook {
+                            let lo = wb.sheet_names.iter()
+                                .position(|n| n.eq_ignore_ascii_case(&s1));
+                            let hi = wb.sheet_names.iter()
+                                .position(|n| n.eq_ignore_ascii_case(&s2));
+                            if let (Some(lo), Some(hi)) = (lo, hi) {
+                                let (a, b) = if lo <= hi { (lo, hi) } else { (hi, lo) };
+                                for i in a..=b {
+                                    out.push((Some(wb.sheet_names[i].clone()), row, col));
+                                }
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+                        if !pushed {
+                            // Workbook context absent (or sheet name not found):
+                            // fall back to the boundaries so dep registration
+                            // still covers something. Single-sheet evaluator
+                            // path; intermediate sheets are unknowable here.
+                            out.push((Some(s1.clone()), row, col));
+                            if !s1.eq_ignore_ascii_case(&s2) {
+                                out.push((Some(s2), row, col));
+                            }
                         }
                     }
                     return;
@@ -1327,8 +1349,8 @@ mod tests {
         let sheet = create_test_spreadsheet();
         let evaluator = FormulaEvaluator::new(&sheet);
 
-        // FIND with no match → #N/A (Excel)
-        assert_eq!(evaluator.evaluate_formula("=FIND(\"xyz\", \"Hello\")"), "#N/A");
+        // FIND with no match → #VALUE! (Excel).
+        assert_eq!(evaluator.evaluate_formula("=FIND(\"xyz\", \"Hello\")"), "#VALUE!");
 
         // Arity mismatches → #VALUE!.
         assert_eq!(evaluator.evaluate_formula("=LEN()"), "#VALUE!");
@@ -1379,6 +1401,55 @@ mod tests {
         let evaluator = FormulaEvaluator::for_workbook(&wb, &wb.sheets[0], &names);
         assert_eq!(evaluator.evaluate_formula("=Data!A1"), "42");
         assert_eq!(evaluator.evaluate_formula("=Data!A1 + 8"), "50");
+    }
+
+    /// Regression: when a cross-sheet ref triggers an update, the destination
+    /// sheet's same-sheet dependents (e.g. `Sheet2!B1 = A1*2` where
+    /// `Sheet2!A1 = Sheet1!A1`) must also recompute. The previous
+    /// implementation walked only the cross-sheet edge and left
+    /// `Sheet2!B1` stale.
+    #[test]
+    fn test_cross_sheet_change_cascades_same_sheet_dependents() {
+        use crate::domain::Workbook;
+        let mut wb = Workbook::default();
+        wb.add_sheet("S2".to_string());
+        // Sheet1!A1 = 10
+        wb.sheets[0].set_cell(0, 0, CellData {
+            value: "10".to_string(), formula: None, format: None, comment: None,
+            spill_anchor: None,
+        });
+        // Sheet2!A1 = Sheet1!A1  (cross-sheet)
+        wb.active_sheet = 1;
+        wb.set_cell_on_active(0, 0, CellData {
+            value: "10".to_string(),
+            formula: Some("=Sheet1!A1".to_string()),
+            format: None,
+            comment: None,
+            spill_anchor: None,
+        });
+        // Sheet2!B1 = A1 * 2  (same-sheet, depends on Sheet2!A1)
+        wb.set_cell_on_active(0, 1, CellData {
+            value: "20".to_string(),
+            formula: Some("=A1*2".to_string()),
+            format: None,
+            comment: None,
+            spill_anchor: None,
+        });
+        wb.register_cross_sheet_deps("S2", 0, 0);
+        wb.register_cross_sheet_deps("S2", 0, 1);
+
+        // Now change Sheet1!A1 = 50 and propagate.
+        wb.active_sheet = 0;
+        wb.set_cell_on_active(0, 0, CellData {
+            value: "50".to_string(), formula: None, format: None, comment: None,
+            spill_anchor: None,
+        });
+        wb.propagate_cross_sheet_changes("Sheet1", 0, 0);
+
+        assert_eq!(wb.sheets[1].get_cell(0, 0).value, "50",
+            "Sheet2!A1 cross-sheet ref should pick up Sheet1!A1's new value");
+        assert_eq!(wb.sheets[1].get_cell(0, 1).value, "100",
+            "Sheet2!B1 (same-sheet dependent of Sheet2!A1) should cascade");
     }
 
     #[test]
@@ -2723,6 +2794,7 @@ mod tests {
             named_ranges: named.clone(),
             cross_sheet_dependents: Default::default(),
             cross_sheet_dependencies: Default::default(),
+            cells_with_qualified_refs: Default::default(),
         };
         let dir = std::env::temp_dir();
         let path = dir.join("empty_sheets_named_ranges.tshts");
@@ -2746,6 +2818,7 @@ mod tests {
             named_ranges: Default::default(),
             cross_sheet_dependents: Default::default(),
             cross_sheet_dependencies: Default::default(),
+            cells_with_qualified_refs: Default::default(),
         };
         wb.sheets[0].set_cell(0, 0, CellData { value: "ok".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
         let dir = std::env::temp_dir();
@@ -2804,6 +2877,7 @@ mod tests {
             named_ranges: Default::default(),
             cross_sheet_dependents: Default::default(),
             cross_sheet_dependencies: Default::default(),
+            cells_with_qualified_refs: Default::default(),
         };
         let dir = std::env::temp_dir();
         let path = dir.join("future_version.tshts");
@@ -2844,6 +2918,7 @@ mod tests {
             named_ranges: Default::default(),
             cross_sheet_dependents: Default::default(),
             cross_sheet_dependencies: Default::default(),
+            cells_with_qualified_refs: Default::default(),
         };
         let dir = std::env::temp_dir();
         let path = dir.join("agent4_mismatched_names.tshts");

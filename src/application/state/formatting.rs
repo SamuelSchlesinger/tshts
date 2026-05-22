@@ -153,12 +153,19 @@ impl App {
             .into_iter()
             .map(|(r, c)| {
                 let mut cell = self.workbook.current_sheet().get_cell(r, c);
-                cell.format = match &number_format {
-                    NumberFormat::General => None,
-                    _ => {
-                        let existing_style = cell.format.as_ref().map(|f| f.style.clone()).unwrap_or_default();
-                        Some(CellFormat { number_format: number_format.clone(), style: existing_style })
-                    }
+                // Preserve the existing style (bold, colors, etc.) when
+                // changing only the number_format. Switching to General
+                // previously dropped the entire format including style.
+                let existing_style = cell.format.as_ref().map(|f| f.style.clone()).unwrap_or_default();
+                cell.format = if matches!(&number_format, NumberFormat::General)
+                    && existing_style == Default::default()
+                {
+                    None
+                } else {
+                    Some(CellFormat {
+                        number_format: number_format.clone(),
+                        style: existing_style,
+                    })
                 };
                 (r, c, cell)
             })

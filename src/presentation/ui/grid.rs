@@ -11,6 +11,43 @@ use ratatui::{
     Frame,
 };
 use super::{caret, layer_for_render, terminal_color_to_ratatui};
+use unicode_width::UnicodeWidthStr;
+
+/// Does `value` look like an Excel-style error literal? Used to highlight
+/// error cells in red. We check membership in the closed set rather than a
+/// pattern like `starts_with('#') && ends_with('!')` because `#N/A` ends in
+/// `A` and a user-typed `#hashtag!` would otherwise false-positive.
+fn is_error_literal(value: &str) -> bool {
+    matches!(
+        value,
+        "#REF!" | "#N/A" | "#DIV/0!" | "#VALUE!" | "#NAME?" | "#NUM!" | "#NULL!" | "#SPILL!"
+    )
+}
+
+/// Truncate `text` to fit within `width` display columns, appending an
+/// ellipsis when content was dropped. Returns the original when it fits.
+fn fit_to_width(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if text.width() <= width {
+        return text.to_string();
+    }
+    // Leave one column for the ellipsis.
+    let budget = width.saturating_sub(1);
+    let mut out = String::with_capacity(text.len());
+    let mut used = 0usize;
+    for c in text.chars() {
+        let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + cw > budget {
+            break;
+        }
+        out.push(c);
+        used += cw;
+    }
+    out.push('\u{2026}'); // …
+    out
+}
 
 pub(super) fn build_row<'a>(app: &App, row: usize, visible_cols: usize, is_frozen: bool) -> Row<'a> {
     let row_number_style = if row == app.selected_row {
@@ -103,7 +140,7 @@ pub(super) fn build_row<'a>(app: &App, row: usize, visible_cols: usize, is_froze
             Style::default()
         };
 
-        let is_error = raw_value.starts_with('#') && raw_value.ends_with(['!', '?']);
+        let is_error = is_error_literal(&raw_value);
         let is_hyperlink =
             raw_value.starts_with("http://") || raw_value.starts_with("https://");
 
@@ -111,7 +148,7 @@ pub(super) fn build_row<'a>(app: &App, row: usize, visible_cols: usize, is_froze
             base_style.bg(Color::Blue).fg(Color::White)
         } else if app.is_cell_selected(row, col) {
             base_style.bg(Color::LightBlue).fg(Color::Black)
-        } else if app.search_results.contains(&(row, col)) {
+        } else if app.search_results_set.contains(&(row, col)) {
             if matches!(app.mode, AppMode::Search)
                 && app.search_results.get(app.search_result_index) == Some(&(row, col))
             {
@@ -120,7 +157,9 @@ pub(super) fn build_row<'a>(app: &App, row: usize, visible_cols: usize, is_froze
                 base_style.bg(Color::DarkGray).fg(Color::White)
             }
         } else if is_frozen || col_is_frozen {
-            base_style.bg(Color::Rgb(40, 40, 60))
+            // Brighter blue-gray than the previous (40,40,60) which was
+            // nearly invisible on common dark themes.
+            base_style.bg(Color::Rgb(70, 70, 110))
         } else {
             base_style
         };
@@ -145,7 +184,12 @@ pub(super) fn build_row<'a>(app: &App, row: usize, visible_cols: usize, is_froze
             style = style.add_modifier(Modifier::DIM | Modifier::ITALIC);
         }
 
-        cells.push(Cell::from(cell_value).style(style));
+        // Truncate with an ellipsis when content exceeds the column width
+        // so the user can see at a glance that the cell has been clipped.
+        // ratatui's table widget otherwise silently chops the right edge.
+        let col_w = app.workbook.current_sheet().get_column_width(col);
+        let display = fit_to_width(&cell_value, col_w);
+        cells.push(Cell::from(display).style(style));
     }
     Row::new(cells).height(1)
 }

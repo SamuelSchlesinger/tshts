@@ -262,20 +262,33 @@ impl<'a> ExpressionEvaluator<'a> {
                     BinaryOp::Greater => Ok(Value::Number(if cmp_ord(&left_val, &right_val) == std::cmp::Ordering::Greater { 1.0 } else { 0.0 })),
                     BinaryOp::GreaterEqual => Ok(Value::Number(if cmp_ord(&left_val, &right_val) != std::cmp::Ordering::Less { 1.0 } else { 0.0 })),
                     BinaryOp::Equal => {
+                        // Excel rule: values of different types are never
+                        // equal, even when one's string form matches the
+                        // other's (e.g. =1="1" is FALSE). Numbers are
+                        // compared with a small epsilon; strings ignore
+                        // ASCII case to match other string ops.
                         let result = match (&left_val, &right_val) {
                             (Value::Number(l), Value::Number(r)) => numbers_equal(*l, *r),
-                            (Value::String(l), Value::String(r)) => l == r,
+                            (Value::String(l), Value::String(r)) => l.eq_ignore_ascii_case(r),
                             (Value::Bool(l), Value::Bool(r)) => l == r,
-                            _ => left_val.to_string() == right_val.to_string(),
+                            // Empty cells (Value::String("")) compare equal
+                            // to numeric 0 the way Excel does.
+                            (Value::Number(n), Value::String(s))
+                            | (Value::String(s), Value::Number(n))
+                                if s.is_empty() => *n == 0.0,
+                            _ => false,
                         };
                         Ok(Value::Number(if result { 1.0 } else { 0.0 }))
                     }
                     BinaryOp::NotEqual => {
                         let result = match (&left_val, &right_val) {
                             (Value::Number(l), Value::Number(r)) => !numbers_equal(*l, *r),
-                            (Value::String(l), Value::String(r)) => l != r,
+                            (Value::String(l), Value::String(r)) => !l.eq_ignore_ascii_case(r),
                             (Value::Bool(l), Value::Bool(r)) => l != r,
-                            _ => left_val.to_string() != right_val.to_string(),
+                            (Value::Number(n), Value::String(s))
+                            | (Value::String(s), Value::Number(n))
+                                if s.is_empty() => *n != 0.0,
+                            _ => true,
                         };
                         Ok(Value::Number(if result { 1.0 } else { 0.0 }))
                     }
@@ -609,9 +622,17 @@ impl<'a> ExpressionEvaluator<'a> {
         }
         // Qualified `Sheet!A1` resolves through the workbook; unqualified
         // refs read the current sheet. Match Expr::CellRef semantics.
-        let (sheet_opt, row, col, _, _) = Spreadsheet::parse_qualified_reference(&ref_text)
-            .ok_or_else(|| format!("INDIRECT: invalid reference: {}", ref_text))?;
-        let sheet = self.resolve_sheet(sheet_opt.as_deref())?;
+        // Bad reference text is returned as #REF! (Excel-equivalent) so
+        // callers can trap it with IFERROR.
+        let Some((sheet_opt, row, col, _, _)) =
+            Spreadsheet::parse_qualified_reference(&ref_text)
+        else {
+            return Ok(Value::Error(ErrorKind::Ref));
+        };
+        let sheet = match self.resolve_sheet(sheet_opt.as_deref()) {
+            Ok(s) => s,
+            Err(_) => return Ok(Value::Error(ErrorKind::Ref)),
+        };
         let cell = sheet.get_cell(row, col);
         if let Ok(n) = cell.value.parse::<f64>() {
             Ok(Value::Number(n))
@@ -686,18 +707,40 @@ impl<'a> ExpressionEvaluator<'a> {
             _ => return Err("OFFSET: base must be a cell ref".to_string()),
         };
         let sheet = self.resolve_sheet(base_sheet.as_deref())?;
-        let row_off = self.evaluate(&args[1])?.to_number() as i64;
-        let col_off = self.evaluate(&args[2])?.to_number() as i64;
+        // Validate every numeric arg is finite before the lossy `as i64`
+        // cast. NaN/Inf would saturate to 0 / huge silently.
+        let to_int = |v: Value| -> Result<i64, String> {
+            let n = v.to_number();
+            if !n.is_finite() {
+                return Err("OFFSET: arg must be finite".to_string());
+            }
+            Ok(n as i64)
+        };
+        let row_off_raw = self.evaluate(&args[1])?;
+        let col_off_raw = self.evaluate(&args[2])?;
+        if let Some(e) = row_off_raw.first_error().or_else(|| col_off_raw.first_error()) {
+            return Ok(Value::Error(e));
+        }
+        let row_off = match to_int(row_off_raw) {
+            Ok(v) => v,
+            Err(_) => return Ok(Value::Error(ErrorKind::Value)),
+        };
+        let col_off = match to_int(col_off_raw) {
+            Ok(v) => v,
+            Err(_) => return Ok(Value::Error(ErrorKind::Value)),
+        };
         let height = args
             .get(3)
-            .map(|e| self.evaluate(e).map(|v| v.to_number() as i64))
-            .transpose()?
+            .map(|e| self.evaluate(e).and_then(|v| to_int(v)))
+            .transpose()
+            .map_err(|_| "OFFSET: height must be finite".to_string())?
             .unwrap_or(1)
             .max(1);
         let width = args
             .get(4)
-            .map(|e| self.evaluate(e).map(|v| v.to_number() as i64))
-            .transpose()?
+            .map(|e| self.evaluate(e).and_then(|v| to_int(v)))
+            .transpose()
+            .map_err(|_| "OFFSET: width must be finite".to_string())?
             .unwrap_or(1)
             .max(1);
         let new_row_i = base_row as i64 + row_off;
@@ -725,19 +768,24 @@ impl<'a> ExpressionEvaluator<'a> {
             }
             return Ok(Value::String(cell.value));
         }
-        // Build a List of the resulting block.
-        let mut list = Vec::with_capacity((height * width) as usize);
-        for r in new_row..new_row + height as usize {
-            for c in new_col..new_col + width as usize {
+        // Build a 2-D Array result so callers that index by (row, col)
+        // (e.g. INDEX) see the original shape. A previous version
+        // returned a flat List, which made `INDEX(OFFSET(...),r,c)`
+        // mis-resolve any non-square block.
+        let h = height as usize;
+        let w = width as usize;
+        let mut data = Vec::with_capacity(h * w);
+        for r in new_row..new_row + h {
+            for c in new_col..new_col + w {
                 let cell = sheet.get_cell(r, c);
                 if let Ok(n) = cell.value.parse::<f64>() {
-                    list.push(Value::Number(n));
+                    data.push(Value::Number(n));
                 } else {
-                    list.push(Value::String(cell.value));
+                    data.push(Value::String(cell.value));
                 }
             }
         }
-        Ok(Value::List(list))
+        Ok(Value::Array { rows: h, cols: w, data })
     }
     
     /// Evaluates function arguments. Ranges produce a single `Value::List`

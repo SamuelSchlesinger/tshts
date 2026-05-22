@@ -182,6 +182,18 @@ pub enum UndoAction {
         at: usize,
         pre: Box<Workbook>,
     },
+    /// Coarse workbook-level snapshot. Used as an escape hatch for
+    /// structural operations (sheet add/delete/rename, freeze, filter,
+    /// table create, iterative-calc toggles, named-range edits) where
+    /// fine-grained reversal would require its own variant and the
+    /// command is rare enough that round-tripping a whole workbook is
+    /// acceptable. `pre`/`post` are the workbook state before/after the
+    /// command; revert and apply just swap them in.
+    WorkbookSnapshot {
+        description: String,
+        pre: Box<Workbook>,
+        post: Box<Workbook>,
+    },
 }
 
 impl UndoAction {
@@ -214,6 +226,9 @@ impl UndoAction {
                 }
             }
             UndoAction::ColDeleted { pre, .. } => {
+                restore_workbook(workbook, pre);
+            }
+            UndoAction::WorkbookSnapshot { pre, .. } => {
                 restore_workbook(workbook, pre);
             }
         }
@@ -252,6 +267,9 @@ impl UndoAction {
                 if *sheet_idx < workbook.sheets.len() {
                     with_active_sheet(workbook, *sheet_idx, |wb| wb.delete_col_on_active(*at));
                 }
+            }
+            UndoAction::WorkbookSnapshot { post, .. } => {
+                restore_workbook(workbook, post);
             }
         }
     }
@@ -348,8 +366,15 @@ pub struct App {
     pub redo_stack: VecDeque<UndoAction>,
     /// Search query input buffer
     pub search_query: String,
-    /// Search results as (row, col) coordinates
+    /// Search results as (row, col) coordinates, in row-major order so
+    /// next/prev navigation is deterministic.
     pub search_results: Vec<(usize, usize)>,
+    /// HashSet mirror of `search_results` for O(1) lookup during render.
+    /// A 1k-hit search rendered to a 900-cell viewport at 10fps used to
+    /// burn ~9M Vec::contains comparisons per second; this drops it to
+    /// hash-table lookups. Kept in sync wherever `search_results` is
+    /// mutated.
+    pub search_results_set: std::collections::HashSet<(usize, usize)>,
     /// Current search result index
     pub search_result_index: usize,
     /// Selection start position (row, col)
@@ -497,6 +522,7 @@ impl Default for App {
             redo_stack: VecDeque::new(),
             search_query: String::new(),
             search_results: Vec::new(),
+            search_results_set: std::collections::HashSet::new(),
             search_result_index: 0,
             selection_start: None,
             selection_end: None,
@@ -552,6 +578,7 @@ impl App {
     pub fn dismiss_transients(&mut self) {
         self.clear_selection();
         self.search_results.clear();
+        self.search_results_set.clear();
         self.search_result_index = 0;
         self.status_message = None;
         self.chart_popup = None;
@@ -603,6 +630,27 @@ impl App {
         self.dirty = true;
         self.invalidate_stats_cache();
         crate::infrastructure::autosave::mark_dirty();
+    }
+
+    /// Run a structural mutation with a coarse snapshot-based undo entry.
+    /// `description` shows in :history-style listings (currently only used
+    /// for debugging). The snapshot pair is captured around the closure;
+    /// no-op mutations don't push an undo entry.
+    ///
+    /// Use for ops that have no cheap fine-grained inverse: :sheet add/
+    /// delete, :name/:unname, :freeze, :filter, :table create, :iterative
+    /// toggles. The clone is bounded by the workbook size (~10 MB for
+    /// 100k-cell workbooks); these commands run at most a few times per
+    /// session so the cost is acceptable.
+    pub(crate) fn with_snapshot_undo<F: FnOnce(&mut App)>(&mut self, description: &str, f: F) {
+        let pre = Box::new(self.workbook.clone());
+        f(self);
+        let post = Box::new(self.workbook.clone());
+        self.record_action(UndoAction::WorkbookSnapshot {
+            description: description.to_string(),
+            pre,
+            post,
+        });
     }
 
     pub fn undo(&mut self) {

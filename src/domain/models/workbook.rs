@@ -100,6 +100,14 @@ pub struct Workbook {
     /// a formula changes.
     #[serde(skip)]
     pub cross_sheet_dependencies: HashMap<CrossSheetKey, HashSet<CrossSheetKey>>,
+    /// Cells whose formula contains *any* sheet-qualified reference (cross-
+    /// sheet OR self-qualified like `=Sheet1!A1` on Sheet1). Used as a
+    /// fast-path check: if no formula anywhere uses a qualified ref, the
+    /// per-write workbook clone in `*_on_active` can be skipped because no
+    /// evaluator inside the recalc cascade will ever ask for workbook
+    /// context. Maintained by `register_cross_sheet_deps`.
+    #[serde(skip)]
+    pub cells_with_qualified_refs: HashSet<CrossSheetKey>,
 }
 
 impl Default for Workbook {
@@ -112,6 +120,7 @@ impl Default for Workbook {
             named_ranges: HashMap::new(),
             cross_sheet_dependents: HashMap::new(),
             cross_sheet_dependencies: HashMap::new(),
+            cells_with_qualified_refs: HashSet::new(),
         }
     }
 }
@@ -432,24 +441,40 @@ impl Workbook {
         self.propagate_cross_sheet_changes(&sheet_name, row, col);
     }
 
+    /// Fast-path predicate: do any cell formulas in the workbook contain a
+    /// sheet-qualified reference? When false, the workbook clone in the
+    /// `*_on_active` mutators can be skipped because no evaluator inside
+    /// the same-sheet recalc cascade will ever consult workbook context.
+    fn needs_workbook_context(&self) -> bool {
+        !self.cells_with_qualified_refs.is_empty()
+    }
+
     /// Write a single cell on the active sheet with workbook context
     /// published for the same-sheet recalc cascade. Use this instead of
     /// `current_sheet_mut().set_cell(...)` when downstream cells on the same
     /// sheet may contain cross-sheet refs that need to resolve correctly.
     pub fn set_cell_on_active(&mut self, row: usize, col: usize, data: CellData) {
-        let snapshot = self.clone();
-        with_recalc_context(&snapshot, || {
+        if self.needs_workbook_context() {
+            let snapshot = self.clone();
+            with_recalc_context(&snapshot, || {
+                self.sheets[self.active_sheet].set_cell(row, col, data);
+            });
+        } else {
             self.sheets[self.active_sheet].set_cell(row, col, data);
-        });
+        }
     }
 
     /// Clear a single cell on the active sheet with workbook context
     /// published for the same-sheet recalc cascade.
     pub fn clear_cell_on_active(&mut self, row: usize, col: usize) {
-        let snapshot = self.clone();
-        with_recalc_context(&snapshot, || {
+        if self.needs_workbook_context() {
+            let snapshot = self.clone();
+            with_recalc_context(&snapshot, || {
+                self.sheets[self.active_sheet].clear_cell(row, col);
+            });
+        } else {
             self.sheets[self.active_sheet].clear_cell(row, col);
-        });
+        }
     }
 
     /// Write a batch of cells to the active sheet, then propagate.
@@ -473,11 +498,16 @@ impl Workbook {
         // Snapshot for cross-sheet ref resolution during this sheet's
         // recalc cascade. Without this, formulas like `=B1 + Sheet2!A1`
         // re-evaluated as part of the dependent recalc lose workbook
-        // context and resolve the Sheet2!A1 ref to `#REF!`.
-        let snapshot = self.clone();
-        with_recalc_context(&snapshot, || {
+        // context and resolve the Sheet2!A1 ref to `#REF!`. Skip when no
+        // qualified ref exists anywhere — common in single-sheet workbooks.
+        if self.needs_workbook_context() {
+            let snapshot = self.clone();
+            with_recalc_context(&snapshot, || {
+                self.sheets[self.active_sheet].set_many(writes);
+            });
+        } else {
             self.sheets[self.active_sheet].set_many(writes);
-        });
+        }
         for (r, c) in positions {
             self.register_cross_sheet_deps(&sheet_name, r, c);
             self.propagate_cross_sheet_changes(&sheet_name, r, c);
@@ -491,12 +521,18 @@ impl Workbook {
             return;
         }
         let sheet_name = self.sheet_names[self.active_sheet].clone();
-        let snapshot = self.clone();
-        with_recalc_context(&snapshot, || {
+        if self.needs_workbook_context() {
+            let snapshot = self.clone();
+            with_recalc_context(&snapshot, || {
+                for (r, c) in &positions {
+                    self.sheets[self.active_sheet].clear_cell(*r, *c);
+                }
+            });
+        } else {
             for (r, c) in &positions {
                 self.sheets[self.active_sheet].clear_cell(*r, *c);
             }
-        });
+        }
         for (r, c) in positions {
             self.register_cross_sheet_deps(&sheet_name, r, c);
             self.propagate_cross_sheet_changes(&sheet_name, r, c);
@@ -513,6 +549,7 @@ impl Workbook {
             named_ranges: HashMap::new(),
             cross_sheet_dependents: HashMap::new(),
             cross_sheet_dependencies: HashMap::new(),
+            cells_with_qualified_refs: HashSet::new(),
         }
     }
 
@@ -535,6 +572,9 @@ impl Workbook {
                 }
             }
         }
+        // Clear the qualified-ref membership; re-added in Step 4 if the
+        // current formula still has any qualified refs.
+        self.cells_with_qualified_refs.remove(&key);
 
         // Step 2: pull the current formula. Sheet names are case-insensitive
         // (Excel convention); using `==` here silently dropped cross-sheet
@@ -567,6 +607,13 @@ impl Workbook {
             );
             evaluator.extract_qualified_refs(&formula)
         };
+
+        // Track "this cell has at least one qualified ref" (cross OR self-
+        // qualified). Used by the fast path in `*_on_active` to skip the
+        // workbook clone when no formula in the book uses a qualified ref.
+        if qualified_refs.iter().any(|(s, _, _)| s.is_some()) {
+            self.cells_with_qualified_refs.insert(key.clone());
+        }
 
         // Step 4: register the cross-sheet ones (skip refs back to the same
         // sheet — those already live in the per-sheet dep graph).
@@ -671,12 +718,38 @@ impl Workbook {
                     .sheet_names
                     .iter()
                     .position(|n| n.eq_ignore_ascii_case(&dep_sheet));
-                if let Some(idx) = dep_real_idx
-                    && let Some(real_cd) = self.sheets[idx].cells.get_mut(&(dep_row, dep_col))
-                        && real_cd.value != new_value {
-                            real_cd.value = new_value;
-                            queue.push_back(dep);
-                        }
+                if let Some(idx) = dep_real_idx {
+                    let value_actually_changed = self.sheets[idx]
+                        .cells
+                        .get_mut(&(dep_row, dep_col))
+                        .map(|real_cd| {
+                            if real_cd.value != new_value {
+                                real_cd.value = new_value.clone();
+                                true
+                            } else {
+                                false
+                            }
+                        })
+                        .unwrap_or(false);
+                    if value_actually_changed {
+                        // Same-sheet cascade: dependents on the destination
+                        // sheet that referenced the cell we just wrote need
+                        // to recompute too. The previous version skipped
+                        // this — Sheet1!A1 → Sheet2!A1 → Sheet2!B1 left B1
+                        // stale because the cross-sheet engine only walked
+                        // cross-sheet edges. Publishing `snapshot` as the
+                        // workbook context lets the evaluator inside the
+                        // cascade resolve any further cross-sheet refs.
+                        with_recalc_context(&snapshot, || {
+                            self.sheets[idx].recalculate_dependents(dep_row, dep_col);
+                        });
+                        // Refresh the snapshot's view of this sheet so a
+                        // later layer of the cross-sheet BFS sees the
+                        // newly-cascaded same-sheet values.
+                        snapshot.sheets[idx] = self.sheets[idx].clone();
+                        queue.push_back(dep);
+                    }
+                }
             }
         }
     }

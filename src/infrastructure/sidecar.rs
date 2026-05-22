@@ -86,7 +86,21 @@ pub fn clear() {
 /// Returns the sidecar payload if it exists and looks well-formed.
 pub fn read() -> Option<SidecarClipboard> {
     let path = path()?;
-    let content = std::fs::read_to_string(&path).ok()?;
+    // Cap the read at MAX_SIDECAR_BYTES so a hostile or runaway tshts
+    // instance can't plant a multi-GB clipboard.json that OOMs us on the
+    // next paste. The writer enforces the same cap; this is defense-in-
+    // depth in case a stale file from a previous build slipped past.
+    use std::io::Read;
+    let mut f = std::fs::File::open(&path).ok()?;
+    let mut buf = Vec::with_capacity(4096);
+    (&mut f)
+        .take((MAX_SIDECAR_BYTES + 1) as u64)
+        .read_to_end(&mut buf)
+        .ok()?;
+    if buf.len() > MAX_SIDECAR_BYTES {
+        return None;
+    }
+    let content = String::from_utf8(buf).ok()?;
     serde_json::from_str(&content).ok()
 }
 

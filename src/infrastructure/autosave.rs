@@ -160,3 +160,33 @@ pub fn take_status_message() -> Option<(String, bool)> {
 pub fn is_in_flight() -> bool {
     inner().in_flight.load(Ordering::Acquire)
 }
+
+/// Force-queue a snapshot, bypassing the IDLE debounce and enabled gate.
+/// Called from the shutdown path so a Ctrl+C / SIGTERM with dirty state
+/// doesn't drop the user's last edits. Returns true if a save was queued.
+pub fn flush_now(workbook: &Workbook, filename: Option<&str>) -> bool {
+    let i = inner();
+    let Some(filename) = filename else { return false; };
+    i.in_flight.store(true, Ordering::Release);
+    if i.sender.send(Snapshot {
+        workbook: workbook.clone(),
+        filename: filename.to_string(),
+    }).is_err() {
+        i.in_flight.store(false, Ordering::Release);
+        return false;
+    }
+    true
+}
+
+/// Block until the worker thread reports completion (or the timeout fires).
+/// Called from the shutdown path after `flush_now`.
+pub fn wait_until_idle(timeout: std::time::Duration) {
+    let i = inner();
+    let start = std::time::Instant::now();
+    while i.in_flight.load(Ordering::Acquire) {
+        if start.elapsed() > timeout {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}

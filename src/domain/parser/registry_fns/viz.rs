@@ -12,7 +12,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         reg.register_function("SPARKLINE", |args| {
             let flat = flatten_args(args);
             if flat.is_empty() {
-                return Err("SPARKLINE requires at least one argument".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let values: Vec<f64> = flat.iter().map(|v| v.to_number()).collect();
             let min = values.iter().cloned().fold(f64::INFINITY, f64::min);

@@ -7,6 +7,7 @@ impl App {
         self.mode = AppMode::Search;
         self.search_query.clear();
         self.search_results.clear();
+        self.search_results_set.clear();
         self.search_result_index = 0;
         self.cursor_position = 0;
         self.status_message = None;
@@ -16,12 +17,14 @@ impl App {
         self.mode = AppMode::Normal;
         self.search_query.clear();
         self.search_results.clear();
+        self.search_results_set.clear();
         self.search_result_index = 0;
         self.cursor_position = 0;
     }
 
     pub fn perform_search(&mut self) {
         self.search_results.clear();
+        self.search_results_set.clear();
         self.search_result_index = 0;
 
         if self.search_query.is_empty() {
@@ -43,6 +46,7 @@ impl App {
                 .unwrap_or(false);
             if value_matches || formula_matches {
                 self.search_results.push((row, col));
+                self.search_results_set.insert((row, col));
             }
         }
         self.search_results.sort();
@@ -150,6 +154,20 @@ impl App {
         let (row, col) = self.find_replace_results[self.find_replace_index];
         let cell = self.workbook.current_sheet().get_cell(row, col);
         if cell.formula.is_some() {
+            // Don't rewrite formula text. Advance to the next match so the
+            // user pressing Replace repeatedly walks forward instead of
+            // getting stuck on this cell.
+            let next_idx = self
+                .find_replace_results
+                .iter()
+                .position(|&(r, c)| (r, c) > (row, col));
+            self.find_replace_index = next_idx.unwrap_or(0);
+            if let Some(&(r, c)) = self.find_replace_results.get(self.find_replace_index) {
+                self.selected_row = r;
+                self.selected_col = c;
+                self.ensure_cursor_visible();
+            }
+            self.status_message = Some("Skipped formula cell".to_string());
             return;
         }
         let matcher = TextMatcher::new(
@@ -187,11 +205,6 @@ impl App {
         if self.find_replace_results.is_empty() {
             return;
         }
-        // Any operation user-initiated as "replace_all" should clear redo so
-        // stale forward-history can't be re-applied. Even when every match is
-        // a formula cell (skipped below) we still treat this as a state
-        // transition.
-        self.redo_stack.clear();
         let matcher = TextMatcher::new(
             &self.find_replace_search,
             self.search_regex,
@@ -232,6 +245,10 @@ impl App {
         // propagation for the whole batch.
         self.workbook.write_cells_on_active(writes);
         if !batch.is_empty() {
+            // Only clear redo when an actual mutation happened — an all-
+            // formula-skipped replace is effectively a no-op and shouldn't
+            // discard the user's redo history.
+            self.redo_stack.clear();
             self.record_action(UndoAction::Batch(batch));
         }
         let msg = if skipped_formulas > 0 {

@@ -11,14 +11,14 @@ use crate::domain::parser::{FunctionRegistry, Value, ErrorKind, flatten_args, sh
 pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         reg.register_function("ISERROR", |args| {
             if args.len() != 1 {
-                return Err("ISERROR requires 1 argument".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             Ok(Value::Bool(args[0].is_error()))
         });
         reg.register_function("ISERR", |args| {
             // ISERR: error EXCEPT #N/A.
             if args.len() != 1 {
-                return Err("ISERR requires 1 argument".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let result = match args[0].first_error() {
                 Some(ErrorKind::NA) | None => false,
@@ -28,19 +28,19 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("ISNA", |args| {
             if args.len() != 1 {
-                return Err("ISNA requires 1 argument".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             Ok(Value::Bool(matches!(args[0].first_error(), Some(ErrorKind::NA))))
         });
         reg.register_function("NA", |args| {
             if !args.is_empty() {
-                return Err("NA takes no arguments".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             Ok(Value::Error(ErrorKind::NA))
         });
         reg.register_function("ERROR.TYPE", |args| {
             if args.len() != 1 {
-                return Err("ERROR.TYPE requires 1 argument".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             // Excel codes: 1=#NULL!, 2=#DIV/0!, 3=#VALUE!, 4=#REF!,
             // 5=#NAME?, 6=#NUM!, 7=#N/A.
@@ -59,7 +59,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("ISBLANK", |args| {
             if args.len() != 1 {
-                Err("ISBLANK requires exactly 1 argument".to_string())
+                Ok(Value::Error(ErrorKind::Value))
             } else {
                 let is_blank = match &args[0] {
                     Value::String(s) => s.is_empty(),
@@ -71,7 +71,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("ISNUMBER", |args| {
             if args.len() != 1 {
-                Err("ISNUMBER requires exactly 1 argument".to_string())
+                Ok(Value::Error(ErrorKind::Value))
             } else {
                 let is_num = matches!(&args[0], Value::Number(_));
                 Ok(Value::Number(if is_num { 1.0 } else { 0.0 }))
@@ -79,7 +79,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("ISTEXT", |args| {
             if args.len() != 1 {
-                Err("ISTEXT requires exactly 1 argument".to_string())
+                Ok(Value::Error(ErrorKind::Value))
             } else {
                 let is_text = matches!(&args[0], Value::String(_));
                 Ok(Value::Number(if is_text { 1.0 } else { 0.0 }))
@@ -87,7 +87,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("TYPE", |args| {
             if args.len() != 1 {
-                Err("TYPE requires exactly 1 argument".to_string())
+                Ok(Value::Error(ErrorKind::Value))
             } else {
                 let type_num = match &args[0] {
                     Value::Number(_) => 1.0,

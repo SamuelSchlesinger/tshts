@@ -33,6 +33,18 @@ impl CellData {
     pub fn is_spill_ghost(&self) -> bool {
         self.spill_anchor.is_some()
     }
+
+    /// Parse `value` as a finite f64, returning None for empty / non-numeric
+    /// / NaN / Inf. Used by iterative-calc and numeric comparisons that
+    /// would otherwise call `value.parse::<f64>()` repeatedly on the same
+    /// string. A real typed Value cache (CellData::value: Value instead of
+    /// String) is the proper long-term fix; this is a per-call helper that
+    /// at least centralizes the parse policy.
+    #[inline]
+    pub fn numeric(&self) -> Option<f64> {
+        let n: f64 = self.value.parse().ok()?;
+        if n.is_finite() { Some(n) } else { None }
+    }
 }
 
 #[cfg(test)]

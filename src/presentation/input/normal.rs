@@ -286,6 +286,14 @@ impl InputHandler {
             KeyCode::Char('s') => { app.vim_substitute_cell(); app.vim_count = None; }
             KeyCode::Char('S') => { app.vim_substitute_row(); app.vim_count = None; }
             KeyCode::Enter | KeyCode::F(2) => { app.start_editing(); app.vim_count = None; }
+            KeyCode::F(5) => {
+                // Re-evaluate every formula, refreshing GET/RAND caches.
+                // Help text has documented this since v0.1; the binding was
+                // never wired up.
+                app.recalc_all();
+                app.status_message = Some("Recalculated all formulas".to_string());
+                app.vim_count = None;
+            }
             // Visual-mode entries
             KeyCode::Char('v') => { app.vim_enter_visual(VisualKind::Cell); app.vim_count = None; }
             KeyCode::Char('V') => { app.vim_enter_visual(VisualKind::Row); app.vim_count = None; }

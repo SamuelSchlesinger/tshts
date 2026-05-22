@@ -462,7 +462,7 @@ impl Spreadsheet {
     }
 
     /// Recalculates all cells that depend on the given cell using topological ordering.
-    fn recalculate_dependents(&mut self, row: usize, col: usize) {
+    pub(crate) fn recalculate_dependents(&mut self, row: usize, col: usize) {
         let cell_pos = (row, col);
 
         // 1. Collect all transitive dependents
@@ -499,13 +499,13 @@ impl Spreadsheet {
                     let prev: f64 = self
                         .cells
                         .get(&(r, c))
-                        .map(|cd| cd.value.parse::<f64>().unwrap_or(0.0))
+                        .and_then(|cd| cd.numeric())
                         .unwrap_or(0.0);
                     self.recalculate_cell(r, c);
                     let next: f64 = self
                         .cells
                         .get(&(r, c))
-                        .map(|cd| cd.value.parse::<f64>().unwrap_or(0.0))
+                        .and_then(|cd| cd.numeric())
                         .unwrap_or(0.0);
                     if (next - prev).abs() > eps {
                         changed = true;

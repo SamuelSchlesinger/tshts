@@ -5,6 +5,8 @@
 //! a comprehensive expression language for calculations.
 
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, MouseEventKind},
@@ -30,6 +32,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // stuck in raw mode with mouse capture spewing escape sequences. Chains
     // to the default hook so the backtrace still prints.
     install_panic_hook();
+
+    // Set up SIGTERM/SIGHUP handler. SIGINT is consumed by crossterm as a
+    // key event when raw mode is enabled, but logout/shutdown sends
+    // SIGTERM (and X-server disconnect sends SIGHUP) which would
+    // otherwise kill the process and drop any queued autosave write.
+    let terminate = Arc::new(AtomicBool::new(false));
+    #[cfg(unix)]
+    {
+        signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&terminate))?;
+        signal_hook::flag::register(signal_hook::consts::SIGHUP, Arc::clone(&terminate))?;
+    }
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -66,15 +79,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let res = run_app(&mut terminal, &mut app);
+    let res = run_app(&mut terminal, &mut app, Arc::clone(&terminate));
 
-    disable_raw_mode()?;
-    execute!(
+    // Always restore the terminal before propagating errors. The original
+    // code used `?` on disable_raw_mode, which would have swallowed
+    // run_app's error if disable_raw_mode itself failed.
+    let _ = disable_raw_mode();
+    let _ = execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
         DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
+    );
+    let _ = terminal.show_cursor();
+
+    // If the user has a dirty workbook with a known filename, flush
+    // synchronously on shutdown so SIGTERM doesn't drop their last edits.
+    // Best-effort: bounded wait so a stuck disk write doesn't hang exit.
+    if app.dirty && app.filename.is_some() {
+        autosave::flush_now(&app.workbook, app.filename.as_deref());
+    }
+    autosave::wait_until_idle(Duration::from_secs(3));
 
     if let Err(err) = res {
         println!("{err:?}");
@@ -92,9 +116,18 @@ fn install_panic_hook() {
     }));
 }
 
-fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<()> {
+fn run_app<B: Backend>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+    terminate: Arc<AtomicBool>,
+) -> io::Result<()> {
     let mut last_fetch_count = fetcher::completion_count();
     loop {
+        // External shutdown signal — break out cleanly. The main fn will
+        // flush any pending autosave before tearing down the terminal.
+        if terminate.load(Ordering::Relaxed) {
+            app.should_quit = true;
+        }
         terminal.draw(|f| render_ui(f, app))?;
 
         if app.should_quit {

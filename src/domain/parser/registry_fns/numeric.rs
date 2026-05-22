@@ -21,7 +21,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         reg.register_function("AVERAGE", |args| {
             let flat = flatten_args(args);
             if flat.is_empty() {
-                Err("AVERAGE requires at least one argument".to_string())
+                Ok(Value::Error(ErrorKind::Value))
             } else {
                 if let Some(e) = flat.iter().find_map(|v| v.first_error()) {
                     return Ok(Value::Error(e));
@@ -40,7 +40,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
                     }
                 }
                 if count == 0 {
-                    Err("AVERAGE: no numeric values".to_string())
+                    Ok(Value::Error(ErrorKind::Div0))
                 } else {
                     Ok(Value::Number(sum / count as f64))
                 }
@@ -66,14 +66,14 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("ABS", |args| {
             if args.len() != 1 {
-                Err("ABS requires exactly 1 argument".to_string())
+                Ok(Value::Error(ErrorKind::Value))
             } else {
                 Ok(Value::Number(args[0].to_number().abs()))
             }
         });
         reg.register_function("SQRT", |args| {
             if args.len() != 1 {
-                Err("SQRT requires exactly 1 argument".to_string())
+                Ok(Value::Error(ErrorKind::Value))
             } else {
                 let num = args[0].to_number();
                 if num < 0.0 {
@@ -92,26 +92,26 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
                     let multiplier = 10f64.powi(places);
                     Ok(Value::Number((num * multiplier).round() / multiplier))
                 }
-                _ => Err("ROUND requires 1 or 2 arguments".to_string()),
+                _ => Ok(Value::Error(ErrorKind::Value)),
             }
         });
         reg.register_function("CEILING", |args| {
             if args.len() != 1 {
-                Err("CEILING requires exactly 1 argument".to_string())
+                Ok(Value::Error(ErrorKind::Value))
             } else {
                 Ok(Value::Number(args[0].to_number().ceil()))
             }
         });
         reg.register_function("FLOOR", |args| {
             if args.len() != 1 {
-                Err("FLOOR requires exactly 1 argument".to_string())
+                Ok(Value::Error(ErrorKind::Value))
             } else {
                 Ok(Value::Number(args[0].to_number().floor()))
             }
         });
         reg.register_function("INT", |args| {
             if args.len() != 1 {
-                Err("INT requires exactly 1 argument".to_string())
+                Ok(Value::Error(ErrorKind::Value))
             } else {
                 // Excel `INT` is floor, not truncate (matters for negatives).
                 Ok(Value::Number(args[0].to_number().floor()))
@@ -119,7 +119,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("MOD", |args| {
             if args.len() != 2 {
-                Err("MOD requires exactly 2 arguments".to_string())
+                Ok(Value::Error(ErrorKind::Value))
             } else {
                 let dividend = args[0].to_number();
                 let divisor = args[1].to_number();
@@ -148,12 +148,12 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
                         Ok(Value::Number(n.log(base)))
                     }
                 }
-                _ => Err("LOG requires 1 or 2 arguments".to_string()),
+                _ => Ok(Value::Error(ErrorKind::Value)),
             }
         });
         reg.register_function("LN", |args| {
             if args.len() != 1 {
-                Err("LN requires exactly 1 argument".to_string())
+                Ok(Value::Error(ErrorKind::Value))
             } else {
                 let n = args[0].to_number();
                 if n <= 0.0 {
@@ -165,14 +165,14 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("EXP", |args| {
             if args.len() != 1 {
-                Err("EXP requires exactly 1 argument".to_string())
+                Ok(Value::Error(ErrorKind::Value))
             } else {
                 Ok(Value::Number(args[0].to_number().exp()))
             }
         });
         reg.register_function("PI", |args| {
             if !args.is_empty() {
-                Err("PI takes no arguments".to_string())
+                Ok(Value::Error(ErrorKind::Value))
             } else {
                 Ok(Value::Number(std::f64::consts::PI))
             }
@@ -186,7 +186,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("RANDBETWEEN", |args| {
             if args.len() != 2 {
-                Err("RANDBETWEEN requires exactly 2 arguments".to_string())
+                Ok(Value::Error(ErrorKind::Value))
             } else {
                 let low = args[0].to_number();
                 let high = args[1].to_number();
@@ -200,7 +200,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("SIGN", |args| {
             if args.len() != 1 {
-                Err("SIGN requires exactly 1 argument".to_string())
+                Ok(Value::Error(ErrorKind::Value))
             } else {
                 let n = args[0].to_number();
                 let result = if n > 0.0 {
@@ -215,7 +215,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("POWER", |args| {
             if args.len() != 2 {
-                Err("POWER requires exactly 2 arguments".to_string())
+                Ok(Value::Error(ErrorKind::Value))
             } else {
                 Ok(Value::Number(args[0].to_number().powf(args[1].to_number())))
             }
@@ -231,7 +231,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
                 .filter(|n| n.is_finite())
                 .collect();
             if nums.is_empty() {
-                return Err("MEDIAN: no numeric values".to_string());
+                return Ok(Value::Error(ErrorKind::Div0));
             }
             nums.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             let n = nums.len();
@@ -245,7 +245,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         reg.register_function("STDEV.S", |args| {
             let nums = collect_numbers(args);
             if nums.len() < 2 {
-                return Err("STDEV.S requires at least 2 values".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let mean: f64 = nums.iter().sum::<f64>() / nums.len() as f64;
             let var: f64 = nums.iter().map(|n| (n - mean).powi(2)).sum::<f64>()
@@ -256,7 +256,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
             // Excel legacy alias for STDEV.S
             let nums = collect_numbers(args);
             if nums.len() < 2 {
-                return Err("STDEV requires at least 2 values".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let mean: f64 = nums.iter().sum::<f64>() / nums.len() as f64;
             let var: f64 = nums.iter().map(|n| (n - mean).powi(2)).sum::<f64>()
@@ -266,7 +266,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         reg.register_function("STDEV.P", |args| {
             let nums = collect_numbers(args);
             if nums.is_empty() {
-                return Err("STDEV.P: empty".to_string());
+                return Ok(Value::Error(ErrorKind::Div0));
             }
             let mean: f64 = nums.iter().sum::<f64>() / nums.len() as f64;
             let var: f64 = nums.iter().map(|n| (n - mean).powi(2)).sum::<f64>()
@@ -276,7 +276,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         reg.register_function("VAR.S", |args| {
             let nums = collect_numbers(args);
             if nums.len() < 2 {
-                return Err("VAR.S requires at least 2 values".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let mean: f64 = nums.iter().sum::<f64>() / nums.len() as f64;
             let var: f64 = nums.iter().map(|n| (n - mean).powi(2)).sum::<f64>()
@@ -286,7 +286,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         reg.register_function("VAR.P", |args| {
             let nums = collect_numbers(args);
             if nums.is_empty() {
-                return Err("VAR.P: empty".to_string());
+                return Ok(Value::Error(ErrorKind::Div0));
             }
             let mean: f64 = nums.iter().sum::<f64>() / nums.len() as f64;
             let var: f64 = nums.iter().map(|n| (n - mean).powi(2)).sum::<f64>()
@@ -295,7 +295,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("LARGE", |args| {
             if args.len() != 2 {
-                return Err("LARGE requires 2 arguments".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let mut nums = collect_numbers(&args[..1]);
             let k = args[1].to_number() as usize;
@@ -307,7 +307,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("SMALL", |args| {
             if args.len() != 2 {
-                return Err("SMALL requires 2 arguments".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let mut nums = collect_numbers(&args[..1]);
             let k = args[1].to_number() as usize;
@@ -319,7 +319,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("RANK.EQ", |args| {
             if args.len() < 2 || args.len() > 3 {
-                return Err("RANK.EQ requires 2 or 3 arguments".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let v = args[0].to_number();
             let nums = collect_numbers(&args[1..2]);
@@ -333,7 +333,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("PERCENTILE.INC", |args| {
             if args.len() != 2 {
-                return Err("PERCENTILE.INC requires 2 arguments".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let mut nums = collect_numbers(&args[..1]);
             let p = args[1].to_number();
@@ -351,12 +351,12 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("CORREL", |args| {
             if args.len() != 2 {
-                return Err("CORREL requires 2 arguments".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let x = collect_numbers(&args[..1]);
             let y = collect_numbers(&args[1..2]);
             if x.len() != y.len() || x.len() < 2 {
-                return Err("CORREL: arrays must match length, min 2".to_string());
+                return Ok(Value::Error(ErrorKind::NA));
             }
             let mx: f64 = x.iter().sum::<f64>() / x.len() as f64;
             let my: f64 = y.iter().sum::<f64>() / y.len() as f64;
@@ -372,7 +372,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("TRUNC", |args| {
             if args.is_empty() || args.len() > 2 {
-                return Err("TRUNC requires 1 or 2 arguments".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let n = args[0].to_number();
             let digits = args.get(1).map(|v| v.to_number() as i32).unwrap_or(0);
@@ -414,7 +414,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("COMBIN", |args| {
             if args.len() != 2 {
-                return Err("COMBIN requires 2 arguments".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let n = args[0].to_number() as i64;
             let k = args[1].to_number() as i64;
@@ -430,10 +430,20 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
             Ok(Value::Number(r))
         });
         reg.register_function("GCD", |args| {
-            let nums: Vec<i64> = flatten_args(args)
-                .iter()
-                .map(|v| v.to_number() as i64)
-                .collect();
+            let raw = flatten_args(args);
+            if raw.is_empty() {
+                return Ok(Value::Error(ErrorKind::Num));
+            }
+            // Excel: any negative argument → #NUM!. Non-integer args are
+            // truncated toward zero before computing.
+            let mut nums: Vec<i64> = Vec::with_capacity(raw.len());
+            for v in &raw {
+                let n = v.to_number();
+                if !n.is_finite() || n < 0.0 {
+                    return Ok(Value::Error(ErrorKind::Num));
+                }
+                nums.push(n as i64);
+            }
             fn gcd(a: i64, b: i64) -> i64 {
                 if b == 0 { a.abs() } else { gcd(b, a % b) }
             }
@@ -467,7 +477,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("ROUNDUP", |args| {
             if args.len() != 2 {
-                return Err("ROUNDUP requires 2 arguments".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let n = args[0].to_number();
             let digits = args[1].to_number() as i32;
@@ -477,7 +487,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("ROUNDDOWN", |args| {
             if args.len() != 2 {
-                return Err("ROUNDDOWN requires 2 arguments".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let n = args[0].to_number();
             let digits = args[1].to_number() as i32;
@@ -487,7 +497,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("MROUND", |args| {
             if args.len() != 2 {
-                return Err("MROUND requires 2 arguments".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let n = args[0].to_number();
             let m = args[1].to_number();
@@ -517,7 +527,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("FREQUENCY", |args| {
             if args.len() != 2 {
-                return Err("FREQUENCY requires 2 arguments".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let data: Vec<f64> = args[0].flatten().iter().map(|v| v.to_number()).collect();
             let bins: Vec<f64> = args[1].flatten().iter().map(|v| v.to_number()).collect();

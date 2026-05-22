@@ -56,6 +56,25 @@ impl FileRepository {
     pub fn load_workbook(filename: &str) -> Result<(Workbook, String), String> {
         match fs::read_to_string(filename) {
             Ok(content) => {
+                // Pre-parse to detect "looks like a tshts file" rather than
+                // "happens to be valid JSON that serde fills in with all
+                // defaults". A bare `{}` would otherwise deserialize as an
+                // empty Workbook and we'd silently overwrite the file with
+                // a default state on the next save — destroying data if
+                // the source was actually a corrupted or unrelated file.
+                let raw: serde_json::Value = serde_json::from_str(&content)
+                    .map_err(|e| format!("Invalid file format - {}", e))?;
+                let obj = raw.as_object().ok_or_else(|| {
+                    "Invalid file format - top-level value is not an object".to_string()
+                })?;
+                let looks_like_workbook = obj.contains_key("sheets");
+                let looks_like_spreadsheet = obj.contains_key("cells") && obj.contains_key("rows");
+                if !looks_like_workbook && !looks_like_spreadsheet {
+                    return Err(
+                        "Invalid file format - missing 'sheets' or 'cells' field; \
+                         not a tshts file".to_string(),
+                    );
+                }
                 // Try workbook format first
                 if let Ok(mut workbook) = serde_json::from_str::<Workbook>(&content) {
                     // Refuse a file written by a future incompatible version

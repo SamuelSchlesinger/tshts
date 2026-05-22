@@ -16,7 +16,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("LEN", |args| {
             if args.len() != 1 {
-                Err("LEN requires exactly 1 argument".to_string())
+                Ok(Value::Error(ErrorKind::Value))
             } else {
                 let len = args[0].to_string().chars().count() as f64;
                 Ok(Value::Number(len))
@@ -24,7 +24,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("LEFT", |args| {
             if args.is_empty() || args.len() > 2 {
-                Err("LEFT requires 1 or 2 arguments".to_string())
+                Ok(Value::Error(ErrorKind::Value))
             } else {
                 let text = args[0].to_string();
                 // Default is 1 (Excel). Negative is #VALUE!.
@@ -39,7 +39,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("RIGHT", |args| {
             if args.is_empty() || args.len() > 2 {
-                Err("RIGHT requires 1 or 2 arguments".to_string())
+                Ok(Value::Error(ErrorKind::Value))
             } else {
                 let text = args[0].to_string();
                 let n = args.get(1).map(|v| v.to_number()).unwrap_or(1.0);
@@ -55,7 +55,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("MID", |args| {
             if args.len() != 3 {
-                Err("MID requires exactly 3 arguments".to_string())
+                Ok(Value::Error(ErrorKind::Value))
             } else {
                 let text = args[0].to_string();
                 // 1-based start position (Excel convention). start < 1
@@ -68,7 +68,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
                 let length = length_raw as usize;
                 let chars: Vec<char> = text.chars().collect();
                 let start = (start_one as usize) - 1;
-                let end = (start + length).min(chars.len());
+                let end = start.saturating_add(length).min(chars.len());
                 let result = if start < chars.len() {
                     chars[start..end].iter().collect::<String>()
                 } else {
@@ -79,7 +79,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("FIND", |args| {
             if args.len() < 2 || args.len() > 3 {
-                Err("FIND requires 2 or 3 arguments".to_string())
+                Ok(Value::Error(ErrorKind::Value))
             } else {
                 let search_text = args[0].to_string();
                 let within_text = args[1].to_string();
@@ -93,7 +93,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
 
                 let within_chars: Vec<char> = within_text.chars().collect();
                 if start_pos > within_chars.len() {
-                    return Err("Start position is beyond text length".to_string());
+                    return Ok(Value::Error(ErrorKind::Value));
                 }
 
                 let search_in = within_chars[start_pos..].iter().collect::<String>();
@@ -103,34 +103,34 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
                         let char_offset = search_in[..byte_pos].chars().count();
                         Ok(Value::Number((start_pos + char_offset + 1) as f64))
                     }
-                    None => Err("Search text not found".to_string()),
+                    None => Ok(Value::Error(ErrorKind::Value)),
                 }
             }
         });
         reg.register_function("UPPER", |args| {
             if args.len() != 1 {
-                Err("UPPER requires exactly 1 argument".to_string())
+                Ok(Value::Error(ErrorKind::Value))
             } else {
                 Ok(Value::String(args[0].to_string().to_uppercase()))
             }
         });
         reg.register_function("LOWER", |args| {
             if args.len() != 1 {
-                Err("LOWER requires exactly 1 argument".to_string())
+                Ok(Value::Error(ErrorKind::Value))
             } else {
                 Ok(Value::String(args[0].to_string().to_lowercase()))
             }
         });
         reg.register_function("TRIM", |args| {
             if args.len() != 1 {
-                Err("TRIM requires exactly 1 argument".to_string())
+                Ok(Value::Error(ErrorKind::Value))
             } else {
                 Ok(Value::String(args[0].to_string().trim().to_string()))
             }
         });
         reg.register_function("SUBSTITUTE", |args| {
             if args.len() != 3 {
-                Err("SUBSTITUTE requires exactly 3 arguments".to_string())
+                Ok(Value::Error(ErrorKind::Value))
             } else {
                 let text = args[0].to_string();
                 let old = args[1].to_string();
@@ -146,7 +146,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("REPLACE", |args| {
             if args.len() != 4 {
-                Err("REPLACE requires exactly 4 arguments".to_string())
+                Ok(Value::Error(ErrorKind::Value))
             } else {
                 let text = args[0].to_string();
                 let start = args[1].to_number() as usize; // 1-based
@@ -165,7 +165,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("REPT", |args| {
             if args.len() != 2 {
-                Err("REPT requires exactly 2 arguments".to_string())
+                Ok(Value::Error(ErrorKind::Value))
             } else {
                 let text = args[0].to_string();
                 let count_raw = args[1].to_number();
@@ -177,7 +177,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("EXACT", |args| {
             if args.len() != 2 {
-                Err("EXACT requires exactly 2 arguments".to_string())
+                Ok(Value::Error(ErrorKind::Value))
             } else {
                 let a = args[0].to_string();
                 let b = args[1].to_string();
@@ -186,7 +186,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("PROPER", |args| {
             if args.len() != 1 {
-                Err("PROPER requires exactly 1 argument".to_string())
+                Ok(Value::Error(ErrorKind::Value))
             } else {
                 let text = args[0].to_string();
                 let mut result = String::new();
@@ -211,42 +211,49 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("CLEAN", |args| {
             if args.len() != 1 {
-                Err("CLEAN requires exactly 1 argument".to_string())
+                Ok(Value::Error(ErrorKind::Value))
             } else {
                 let text = args[0].to_string();
-                let cleaned: String = text
-                    .chars()
-                    .filter(|c| c.is_ascii_graphic() || *c == ' ')
-                    .collect();
+                // Excel CLEAN strips control characters (U+0000..U+001F and
+                // U+007F..U+009F). Non-control Unicode (accented letters,
+                // CJK, emoji) is preserved.
+                let cleaned: String = text.chars().filter(|c| !c.is_control()).collect();
                 Ok(Value::String(cleaned))
             }
         });
         reg.register_function("CHAR", |args| {
             if args.len() != 1 {
-                Err("CHAR requires exactly 1 argument".to_string())
+                Ok(Value::Error(ErrorKind::Value))
             } else {
-                let n = args[0].to_number() as u32;
+                let raw = args[0].to_number();
+                // Excel CHAR accepts 1..=255 (or 1..=1114111 in modern
+                // Excel for Unicode). Reject negative, NaN, Inf, and
+                // surrogate code points before the lossy `as u32` cast.
+                if !raw.is_finite() || raw < 1.0 || raw > u32::MAX as f64 {
+                    return Ok(Value::Error(ErrorKind::Value));
+                }
+                let n = raw as u32;
                 match char::from_u32(n) {
                     Some(c) => Ok(Value::String(String::from(c))),
-                    None => Err(format!("CHAR: {} is not a valid character code", n)),
+                    None => Ok(Value::Error(ErrorKind::Value)),
                 }
             }
         });
         reg.register_function("CODE", |args| {
             if args.len() != 1 {
-                Err("CODE requires exactly 1 argument".to_string())
+                Ok(Value::Error(ErrorKind::Value))
             } else {
                 let text = args[0].to_string();
                 if let Some(ch) = text.chars().next() {
                     Ok(Value::Number(ch as u32 as f64))
                 } else {
-                    Err("CODE requires a non-empty string".to_string())
+                    Ok(Value::Error(ErrorKind::Value))
                 }
             }
         });
         reg.register_function("TEXT", |args| {
             if args.is_empty() || args.len() > 2 {
-                return Err("TEXT requires 1 or 2 arguments".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let v = &args[0];
             let format = args.get(1).map(|f| f.to_string()).unwrap_or_default();
@@ -254,29 +261,29 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("VALUE", |args| {
             if args.len() != 1 {
-                Err("VALUE requires exactly 1 argument".to_string())
+                Ok(Value::Error(ErrorKind::Value))
             } else {
                 let text = args[0].to_string();
                 match text.parse::<f64>() {
                     Ok(n) => Ok(Value::Number(n)),
-                    Err(_) => Err(format!("VALUE: cannot convert '{}' to number", text)),
+                    Err(_) => Ok(Value::Error(ErrorKind::Value)),
                 }
             }
         });
         reg.register_function("NUMBERVALUE", |args| {
             if args.len() != 1 {
-                Err("NUMBERVALUE requires exactly 1 argument".to_string())
+                Ok(Value::Error(ErrorKind::Value))
             } else {
                 let text = args[0].to_string();
                 match text.parse::<f64>() {
                     Ok(n) => Ok(Value::Number(n)),
-                    Err(_) => Err(format!("NUMBERVALUE: cannot convert '{}' to number", text)),
+                    Err(_) => Ok(Value::Error(ErrorKind::Value)),
                 }
             }
         });
         reg.register_function("TEXTJOIN", |args| {
             if args.len() < 3 {
-                return Err("TEXTJOIN requires at least 3 arguments".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let delim = args[0].to_string();
             let ignore_empty = args[1].is_truthy();
@@ -291,7 +298,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("SEARCH", |args| {
             if args.len() < 2 || args.len() > 3 {
-                return Err("SEARCH requires 2 or 3 arguments".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let needle = args[0].to_string().to_lowercase();
             let hay = args[1].to_string();
@@ -312,7 +319,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("TEXTBEFORE", |args| {
             if args.len() < 2 || args.len() > 3 {
-                return Err("TEXTBEFORE requires 2 or 3 arguments".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let text = args[0].to_string();
             let delim = args[1].to_string();
@@ -320,11 +327,15 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
             if n_raw < 1.0 {
                 return Ok(Value::Error(ErrorKind::Value));
             }
+            // Empty delimiter: `str::find("")` returns Some(0) forever, so
+            // a naive walk hangs. Excel returns #VALUE! for an empty
+            // separator.
+            if delim.is_empty() {
+                return Ok(Value::Error(ErrorKind::Value));
+            }
             let n = n_raw as usize;
             let mut start = 0usize;
-            // Walk forward n-1 matches; the n-th is the split point. Using
-            // `0..n - 1` underflowed in release builds when n was 0; the
-            // n>=1 guard above plus saturating_sub makes this safe.
+            // Walk forward n-1 matches; the n-th is the split point.
             for _ in 0..n.saturating_sub(1) {
                 if let Some(idx) = text[start..].find(&delim) {
                     start += idx + delim.len();
@@ -340,12 +351,16 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("TEXTAFTER", |args| {
             if args.len() < 2 || args.len() > 3 {
-                return Err("TEXTAFTER requires 2 or 3 arguments".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let text = args[0].to_string();
             let delim = args[1].to_string();
             let n_raw = args.get(2).map(|v| v.to_number()).unwrap_or(1.0);
             if n_raw < 1.0 {
+                return Ok(Value::Error(ErrorKind::Value));
+            }
+            // See TEXTBEFORE: empty delim would loop forever via `find("")`.
+            if delim.is_empty() {
                 return Ok(Value::Error(ErrorKind::Value));
             }
             let n = n_raw as usize;
@@ -361,7 +376,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("REGEXMATCH", |args| {
             if args.len() != 2 {
-                return Err("REGEXMATCH requires 2 arguments".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let re = regex::Regex::new(&args[1].to_string())
                 .map_err(|e| format!("REGEXMATCH: bad pattern: {}", e))?;
@@ -369,7 +384,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("REGEXEXTRACT", |args| {
             if args.len() != 2 {
-                return Err("REGEXEXTRACT requires 2 arguments".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let re = regex::Regex::new(&args[1].to_string())
                 .map_err(|e| format!("REGEXEXTRACT: bad pattern: {}", e))?;
@@ -384,7 +399,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("REGEXREPLACE", |args| {
             if args.len() != 3 {
-                return Err("REGEXREPLACE requires 3 arguments".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let re = regex::Regex::new(&args[1].to_string())
                 .map_err(|e| format!("REGEXREPLACE: bad pattern: {}", e))?;
@@ -407,7 +422,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("DOLLAR", |args| {
             if args.is_empty() || args.len() > 2 {
-                return Err("DOLLAR requires 1 or 2 arguments".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let n = args[0].to_number();
             let decimals = args.get(1).map(|v| v.to_number() as i32).unwrap_or(2);
@@ -429,7 +444,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("FIXED", |args| {
             if args.is_empty() || args.len() > 3 {
-                return Err("FIXED requires 1-3 arguments".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let n = args[0].to_number();
             let decimals = args.get(1).map(|v| v.to_number() as i32).unwrap_or(2);
@@ -453,7 +468,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("ARRAYTOTEXT", |args| {
             if args.is_empty() || args.len() > 2 {
-                return Err("ARRAYTOTEXT requires 1 or 2 arguments".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let strict = args.get(1).map(|v| v.to_number() as i32 == 1).unwrap_or(false);
             let (rows, cols, data) = shape_of(&args[0]);

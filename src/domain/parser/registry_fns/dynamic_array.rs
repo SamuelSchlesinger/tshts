@@ -17,7 +17,7 @@ pub(crate) const MAX_DYNAMIC_ARRAY_CELLS: usize = 1_000_000;
 pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         reg.register_function("SUMPRODUCT", |args| {
             if args.is_empty() {
-                return Err("SUMPRODUCT requires at least 1 argument".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let mut acc: Vec<f64> = args[0]
                 .flatten()
@@ -27,7 +27,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
             for arg in &args[1..] {
                 let next: Vec<f64> = arg.flatten().iter().map(|v| v.to_number()).collect();
                 if next.len() != acc.len() {
-                    return Err("SUMPRODUCT: array shape mismatch".to_string());
+                    return Ok(Value::Error(ErrorKind::Value));
                 }
                 for (i, n) in next.iter().enumerate() {
                     acc[i] *= n;
@@ -37,7 +37,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("TRANSPOSE", |args| {
             if args.len() != 1 {
-                return Err("TRANSPOSE requires 1 argument".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let (rows, cols, data) = shape_of(&args[0]);
             let mut out = Vec::with_capacity(rows * cols);
@@ -50,7 +50,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("SEQUENCE", |args| {
             if args.is_empty() || args.len() > 4 {
-                return Err("SEQUENCE requires 1-4 arguments".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let rows_f = args[0].to_number();
             let cols_f = args.get(1).map(|v| v.to_number()).unwrap_or(1.0);
@@ -73,12 +73,12 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("FILTER", |args| {
             if args.len() < 2 || args.len() > 3 {
-                return Err("FILTER requires 2 or 3 arguments".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let (rows, cols, data) = shape_of(&args[0]);
             let mask = args[1].flatten();
             if mask.len() != rows && mask.len() != rows * cols {
-                return Err("FILTER: predicate length must match range rows".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let mut out_rows: Vec<Value> = Vec::new();
             let mut kept = 0;
@@ -95,7 +95,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
                 if let Some(fallback) = args.get(2) {
                     return Ok(fallback.clone());
                 }
-                return Err("FILTER: no matches".to_string());
+                return Ok(Value::Error(ErrorKind::NA));
             }
             Ok(Value::Array {
                 rows: kept,
@@ -105,24 +105,43 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("SORT", |args| {
             if args.is_empty() || args.len() > 3 {
-                return Err("SORT requires 1-3 arguments".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let (rows, cols, data) = shape_of(&args[0]);
             let sort_col = args.get(1).map(|v| v.to_number() as usize).unwrap_or(1);
             let order = args.get(2).map(|v| v.to_number() as i64).unwrap_or(1);
             if sort_col == 0 || sort_col > cols {
-                return Err("SORT: sort_index out of range".to_string());
+                return Ok(Value::Error(ErrorKind::Ref));
             }
             let mut row_indices: Vec<usize> = (0..rows).collect();
+            // Comparator follows Excel's mixed-type rule: numbers come first
+            // (ordered numerically among themselves), then text (ordered
+            // alphabetically), then bools/errors/empty. The previous version
+            // ran `to_number()` unconditionally which collapses every text
+            // cell to 0 and silently scrambles columns that mix types.
+            fn sort_kind(v: &Value) -> u8 {
+                match v {
+                    Value::Number(_) => 0,
+                    Value::Bool(_) => 0, // sorted with numbers per Excel
+                    Value::String(s) if s.parse::<f64>().is_ok() => 0,
+                    Value::String(_) => 1,
+                    Value::Error(_) => 2,
+                    _ => 3,
+                }
+            }
             row_indices.sort_by(|a, b| {
                 let av = &data[*a * cols + sort_col - 1];
                 let bv = &data[*b * cols + sort_col - 1];
-                let cmp = match (av.to_number(), bv.to_number()) {
-                    // Try numeric first, fall back to string.
-                    (an, bn) if !an.is_nan() && !bn.is_nan() && (av.to_string().parse::<f64>().is_ok() || bv.to_string().parse::<f64>().is_ok()) => {
-                        an.partial_cmp(&bn).unwrap_or(std::cmp::Ordering::Equal)
-                    }
-                    _ => av.to_string().cmp(&bv.to_string()),
+                let ak = sort_kind(av);
+                let bk = sort_kind(bv);
+                let cmp = if ak != bk {
+                    ak.cmp(&bk)
+                } else if ak == 0 {
+                    av.to_number()
+                        .partial_cmp(&bv.to_number())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                } else {
+                    av.to_string().to_lowercase().cmp(&bv.to_string().to_lowercase())
                 };
                 if order < 0 { cmp.reverse() } else { cmp }
             });
@@ -136,7 +155,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
         });
         reg.register_function("UNIQUE", |args| {
             if args.len() != 1 {
-                return Err("UNIQUE requires 1 argument".to_string());
+                return Ok(Value::Error(ErrorKind::Value));
             }
             let (rows, cols, data) = shape_of(&args[0]);
             let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
