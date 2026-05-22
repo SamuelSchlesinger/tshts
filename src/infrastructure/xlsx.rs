@@ -415,8 +415,11 @@ const CELL_STYLE_DEFAULT: CellStyle = CellStyle {
 pub fn save_xlsx(workbook: &Workbook, path: &str) -> Result<(), String> {
     let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
     let mut zip = zip::ZipWriter::new(file);
-    let opts =
-        zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    // zip 2.x renamed FileOptions::default() ergonomics to SimpleFileOptions
+    // (the old name was generic over the compression-type parameter and
+    // required turbofish to instantiate).
+    let opts = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
     let styles = build_style_table(workbook);
 
     // [Content_Types].xml

@@ -80,7 +80,7 @@ where
 /// let sheet = Spreadsheet::default();
 /// let evaluator = FormulaEvaluator::new(&sheet);
 /// assert_eq!(evaluator.evaluate_formula("=2+3*4"), "14");
-/// assert_eq!(evaluator.evaluate_formula("=AND(1>0, 2<5)"), "1");
+/// assert_eq!(evaluator.evaluate_formula("=AND(1>0, 2<5)"), "TRUE");
 /// ```
 // Submodules.
 mod evaluator;
