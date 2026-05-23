@@ -675,6 +675,57 @@ thread_local! {
     /// end of a recalc pass.
     static RECALC_CLOCK: std::cell::Cell<Option<f64>> =
         const { std::cell::Cell::new(None) };
+
+    /// Per-cell capture buffer for dynamic dep targets (INDIRECT,
+    /// OFFSET). When an INDIRECT(A1) or OFFSET(A1, r, c) call resolves
+    /// to a concrete target cell at evaluation time, it pushes that
+    /// target here so the executor can record the actual dependency
+    /// post-eval.
+    ///
+    /// The executor takes ownership at the start of each
+    /// `VolatileStructural` cell's evaluation (clearing prior state)
+    /// and drains it after — see `RecalcExecutor` impls. Targets
+    /// captured for cells that aren't `VolatileStructural` are
+    /// harmless leakage that the next take() clears.
+    ///
+    /// Per-thread: each rayon worker captures targets for its own
+    /// in-flight cell. The (cell_node, targets) pairs flow back via
+    /// the worker's return value to the main thread for merging.
+    static EVAL_DYNAMIC_TARGETS: std::cell::RefCell<Vec<DynamicTarget>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A target cell captured during INDIRECT/OFFSET evaluation.
+///
+/// `sheet` is `None` for unqualified references (current sheet) and
+/// `Some(name)` for `Sheet2!A1`-style refs. The executor resolves the
+/// name against the workbook's `sheet_names` to a [`NodeKey`] before
+/// storing in `Workbook::structural_targets`.
+#[derive(Debug, Clone)]
+pub struct DynamicTarget {
+    pub sheet: Option<String>,
+    pub row: usize,
+    pub col: usize,
+}
+
+/// Push a dynamic target captured during INDIRECT/OFFSET eval.
+/// Called from the inline handlers in `ExpressionEvaluator::evaluate`
+/// after the target sheet/row/col has been resolved.
+pub fn push_dynamic_target(sheet: Option<&str>, row: usize, col: usize) {
+    EVAL_DYNAMIC_TARGETS.with(|c| {
+        c.borrow_mut().push(DynamicTarget {
+            sheet: sheet.map(|s| s.to_string()),
+            row,
+            col,
+        });
+    });
+}
+
+/// Drain and return the dynamic targets captured since the last call.
+/// Executors call this once before a `VolatileStructural` cell's eval
+/// to clear any leakage, and once after to collect the actual targets.
+pub fn take_dynamic_targets() -> Vec<DynamicTarget> {
+    EVAL_DYNAMIC_TARGETS.with(|c| std::mem::take(&mut *c.borrow_mut()))
 }
 
 /// Run `f` with `serial` published as the clock-snapshot context for

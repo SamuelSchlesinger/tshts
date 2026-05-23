@@ -69,6 +69,7 @@ pub fn load_xlsx(path: &str) -> Result<Workbook, String> {
         next_sheet_id: sheet_count,
         graph: crate::domain::models::WorkbookGraph::new(),
         cell_purities: std::collections::HashMap::new(),
+        structural_targets: std::collections::HashMap::new(),
     };
     for name in &sheet_names {
         let range = wb

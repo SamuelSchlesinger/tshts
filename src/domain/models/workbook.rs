@@ -43,11 +43,20 @@ thread_local! {
 /// single-sheet eval still works — cross-sheet refs become `#REF!` as
 /// before.
 pub fn with_recalc_context<R>(wb: &Workbook, f: impl FnOnce() -> R) -> R {
+    // Drop guard restores the prior thread-local pointer even on panic.
+    // Without this, a panicking closure would leave a dangling pointer
+    // in the thread-local; the next eval on this thread would deref the
+    // stale address (UB) before any normal restore could run.
+    struct CtxGuard(*const Workbook);
+    impl Drop for CtxGuard {
+        fn drop(&mut self) {
+            RECALC_WORKBOOK.with(|c| c.set(self.0));
+        }
+    }
     let raw = wb as *const Workbook;
     let prev = RECALC_WORKBOOK.with(|c| c.replace(raw));
-    let result = f();
-    RECALC_WORKBOOK.with(|c| c.set(prev));
-    result
+    let _guard = CtxGuard(prev);
+    f()
 }
 
 /// Read the thread-local workbook ref and pass it (as `Option<&Workbook>`)
@@ -152,6 +161,21 @@ pub struct Workbook {
     /// and are stored implicitly (absence = `Pure`).
     #[serde(skip)]
     pub cell_purities: HashMap<NodeKey, FunctionPurity>,
+    /// Resolved dynamic-dep targets per `VolatileStructural` cell.
+    /// Populated by the executor after each VolatileStructural cell's
+    /// evaluation: INDIRECT/OFFSET push their resolved cells via
+    /// `parser::push_dynamic_target`, the executor drains them and
+    /// stores here keyed by the structural cell. `recalc_via_graph`
+    /// uses this to skip auto-seeding a structural cell whose targets
+    /// are unrelated to the current dirty closure — without it, a
+    /// workbook with 1000 OFFSET cells would re-evaluate all 1000 on
+    /// every keystroke.
+    ///
+    /// Absence (no entry) = "never been evaluated" — those cells get
+    /// auto-seeded unconditionally so we observe their targets on the
+    /// first pass.
+    #[serde(skip)]
+    pub structural_targets: HashMap<NodeKey, HashSet<NodeKey>>,
 }
 
 impl Default for Workbook {
@@ -170,6 +194,7 @@ impl Default for Workbook {
             next_sheet_id: 1,
             graph: WorkbookGraph::new(),
             cell_purities: HashMap::new(),
+            structural_targets: HashMap::new(),
         }
     }
 }
@@ -261,6 +286,9 @@ impl Workbook {
         self.ensure_sheet_ids();
         self.graph.clear();
         self.cell_purities.clear();
+        // Targets cache is rebuilt by the next eval pass; any held entries
+        // would be referenced against new (sheet_id, row, col) keys.
+        self.structural_targets.clear();
         let registry = FunctionRegistry::shared_builtin();
         let sheet_count = self.sheets.len();
         // We need an evaluator with workbook context to extract qualified
@@ -545,14 +573,36 @@ impl Workbook {
     /// - **Per-level workbook clone** is O(workbook size) per level.
     ///   A future PR can replace this with `Arc<WorkbookSnapshot>` for
     ///   deeper graphs where the clone dominates.
+    /// Public wrapper for the recalc engine. Returns any pass-level
+    /// error (e.g. iterative-calc non-convergence) so the App layer can
+    /// surface it via status message. Individual cell errors flow
+    /// through `Value::Error` and don't reach this signature.
+    pub fn recalc_via_graph_result(
+        &mut self,
+    ) -> Result<(), crate::domain::services::CalcError> {
+        self.recalc_via_graph_inner()
+    }
+
+    /// Original entry-point — kept for backward compatibility with
+    /// internal call sites that don't care about pass-level errors
+    /// (e.g. tests that just want behavioral parity). Surfaces errors
+    /// to stderr only.
     pub fn recalc_via_graph(&mut self) {
+        if let Err(e) = self.recalc_via_graph_inner() {
+            eprintln!("tshts: recalc: {}", e);
+        }
+    }
+
+    fn recalc_via_graph_inner(
+        &mut self,
+    ) -> Result<(), crate::domain::services::CalcError> {
         // Lazy build: if the graph is empty, rebuild from scratch. PR 3+
         // will keep it incrementally maintained on writes.
         if self.graph.is_empty() {
             self.build_dep_graph_from_scratch();
         }
         if self.dirty.is_empty() && self.cell_purities.is_empty() {
-            return;
+            return Ok(());
         }
 
         // Map dirty cross-sheet keys to graph node keys.
@@ -564,25 +614,46 @@ impl Workbook {
             }
         }
 
-        // Auto-seed VolatileStructural cells (OFFSET, INDIRECT, etc.)
-        // on every recalc. Their dep edges are computed conservatively
-        // from literal args, so they don't pick up changes to their
-        // value-derived targets — but if we re-evaluate them every
-        // pass, the new result propagates through their (static)
-        // dependents and the user observes correct values. Matches
-        // Excel's "always recompute volatile" semantics. The same
-        // policy is implied for VolatileClock/Random by the auto-
-        // seeding of `recalc_all` (which seeds all formula cells);
-        // we narrow here to structural since clock/random recompute
-        // is handled separately by RecalcContext + thread-local PRNG.
+        // Smart auto-seed for VolatileStructural cells (OFFSET, INDIRECT, ...).
+        // Their dep edges are derived conservatively from literal args, so
+        // they don't pick up changes to their value-derived targets via the
+        // static graph. We close that gap by re-seeding them when their
+        // last-known dynamic targets intersect what the user just dirtied.
+        //
+        // Policy:
+        //   * If we have NO recorded targets for the cell yet (first-time
+        //     eval, or just-rebuilt graph), seed it — we must run it once
+        //     to learn its targets.
+        //   * Otherwise, seed only when at least one recorded target lies
+        //     inside the transitive dependents of the user-dirty seeds.
+        //     (We use the closure of dependents, not just the seeds, so
+        //     a chain `target → ... → user-edited cell` still triggers.)
+        //
+        // VolatileClock/Random are handled separately by RecalcContext +
+        // the thread-local PRNG and don't appear here.
+        let user_dirty_closure: HashSet<NodeKey> = if seeds.is_empty() {
+            HashSet::new()
+        } else {
+            self.graph.transitive_dependents(&seeds)
+        };
         for (&node, &purity) in &self.cell_purities {
-            if purity == crate::domain::parser::FunctionPurity::VolatileStructural {
-                seeds.insert(node);
+            if purity != crate::domain::parser::FunctionPurity::VolatileStructural {
+                continue;
+            }
+            match self.structural_targets.get(&node) {
+                None => {
+                    seeds.insert(node);
+                }
+                Some(targets) => {
+                    if targets.iter().any(|t| user_dirty_closure.contains(t)) {
+                        seeds.insert(node);
+                    }
+                }
             }
         }
 
         if seeds.is_empty() {
-            return;
+            return Ok(());
         }
 
         let topo = self.graph.topo_levels_from_seeds(&seeds);
@@ -604,19 +675,10 @@ impl Workbook {
             .and_then(|s| s.parse().ok())
             .unwrap_or(512);
         let max_level_size = plan.levels.iter().map(|l| l.len()).max().unwrap_or(0);
-        let result = if max_level_size >= threshold {
+        if max_level_size >= threshold {
             crate::domain::services::ParallelExecutor::new().run(&plan, &mut ctx, self)
         } else {
             crate::domain::services::SequentialExecutor.run(&plan, &mut ctx, self)
-        };
-        if let Err(e) = result {
-            // The only error we can hit today is WorkerPanic from the
-            // parallel executor. Surface to stderr so a developer can
-            // see it; the UI layer (App::recalc_all) can still set a
-            // status message if it wants. Eating the error silently
-            // would let the workbook display stale values without any
-            // signal that recalc failed.
-            eprintln!("tshts: recalc failed: {:?}", e);
         }
     }
 
@@ -782,8 +844,11 @@ impl Workbook {
                 self.graph.forget_node(node);
                 // Drop stale purity entries too — without this the
                 // auto-seed loop in `recalc_via_graph` walks dead
-                // (sheet_id, r, c) keys forever.
+                // (sheet_id, r, c) keys forever. Same for cached
+                // dynamic targets: their NodeKeys point at a sheet
+                // that no longer exists.
                 self.cell_purities.remove(&node);
+                self.structural_targets.remove(&node);
             }
         }
         // Every surviving formula cell that referenced the removed sheet
@@ -1196,6 +1261,7 @@ impl Workbook {
             next_sheet_id: 1,
             graph: WorkbookGraph::new(),
             cell_purities: HashMap::new(),
+            structural_targets: HashMap::new(),
         }
     }
 
@@ -1357,6 +1423,11 @@ impl Workbook {
         } else {
             self.cell_purities.insert(node, pur);
         }
+        // Any previously-recorded dynamic targets are stale on formula
+        // change. Clear them so the next eval relearns (a now-Structural
+        // cell with no targets is force-seeded; a now-Pure cell needs the
+        // entry gone so it never re-triggers).
+        self.structural_targets.remove(&node);
     }
 
     /// Drop unified-graph + purity tracking for a cell whose formula
@@ -1368,7 +1439,44 @@ impl Workbook {
         if let Some(node) = self.cross_sheet_key_to_node(&key) {
             self.graph.unlink_node(node);
             self.cell_purities.remove(&node);
+            self.structural_targets.remove(&node);
         }
+    }
+
+    /// Record the cells INDIRECT/OFFSET resolved to during a
+    /// VolatileStructural cell's evaluation. Called by the executor
+    /// post-eval so the next recalc's auto-seed can skip this cell
+    /// when none of its targets are in the dirty closure.
+    pub fn record_structural_targets(
+        &mut self,
+        node: NodeKey,
+        targets: &[crate::domain::parser::DynamicTarget],
+    ) {
+        let default_sheet_id = node.0;
+        let resolved: HashSet<NodeKey> = targets
+            .iter()
+            .filter_map(|t| {
+                let sid = match &t.sheet {
+                    Some(name) => {
+                        let idx = self
+                            .sheet_names
+                            .iter()
+                            .position(|n| n.eq_ignore_ascii_case(name))?;
+                        self.sheet_ids[idx]
+                    }
+                    None => default_sheet_id,
+                };
+                Some((sid, t.row, t.col))
+            })
+            .collect();
+        if resolved.is_empty() {
+            // Some VolatileStructural functions don't push targets
+            // (e.g. an OFFSET that errored at #REF! before reaching the
+            // target loop). Keep any prior cached targets — they're
+            // the most recent valid observation.
+            return;
+        }
+        self.structural_targets.insert(node, resolved);
     }
 
     /// Batch variant of `register_cross_sheet_deps`. Calling

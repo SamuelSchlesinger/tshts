@@ -709,6 +709,12 @@ impl<'a> ExpressionEvaluator<'a> {
             Ok(s) => s,
             Err(_) => return Ok(Value::Error(ErrorKind::Ref)),
         };
+        // Capture the resolved target so the executor can record this
+        // as a dynamic dep — without it, a change to the target cell
+        // wouldn't trigger this INDIRECT cell to re-evaluate. The
+        // workbook auto-seeds VolatileStructural cells whose captured
+        // targets overlap the dirty closure.
+        crate::domain::parser::push_dynamic_target(sheet_opt.as_deref(), row, col);
         let cell = sheet.get_cell(row, col);
         if let Ok(n) = cell.value.parse::<f64>() {
             Ok(Value::Number(n))
@@ -836,6 +842,19 @@ impl<'a> ExpressionEvaluator<'a> {
             || new_col + width as usize > sheet.cols
         {
             return Ok(Value::Error(ErrorKind::Ref));
+        }
+        // Capture every cell in the offset region as a dynamic dep
+        // target. The executor reads these post-eval and stores them
+        // on the workbook so the auto-seed can skip this OFFSET cell
+        // when none of its targets are in the next recalc's dirty set.
+        for r in new_row..new_row + height as usize {
+            for c in new_col..new_col + width as usize {
+                crate::domain::parser::push_dynamic_target(
+                    base_sheet.as_deref(),
+                    r,
+                    c,
+                );
+            }
         }
         if height == 1 && width == 1 {
             let cell = sheet.get_cell(new_row, new_col);

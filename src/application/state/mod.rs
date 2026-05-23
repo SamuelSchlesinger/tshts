@@ -198,11 +198,17 @@ pub enum UndoAction {
 
 impl UndoAction {
     /// Roll the workbook back to the state before this action was applied.
-    /// Used by `App::undo`.
-    pub fn revert(&self, workbook: &mut Workbook) {
+    /// Used by `App::undo`. Returns any non-fatal recalc error so the
+    /// caller can surface it (e.g. iterative-calc non-convergence on a
+    /// cyclic workbook) instead of corrupting the TUI via eprintln.
+    pub fn revert(
+        &self,
+        workbook: &mut Workbook,
+    ) -> Result<(), crate::domain::services::CalcError> {
         match self {
             UndoAction::CellModified { row, col, old_cell, new_cell: _ } => {
                 restore_cell(workbook, *row, *col, old_cell.as_ref());
+                Ok(())
             }
             UndoAction::Batch(actions) => {
                 // O(N) batch revert: write every cell directly (no
@@ -211,95 +217,131 @@ impl UndoAction {
                 // approach would be O(N²) for a chain — undo of a
                 // 10k-cell replace_all would take ~15s rather than
                 // ~150ms.
-                batch_apply_cells_then_recalc(workbook, actions.iter().rev(), |a| {
-                    if let UndoAction::CellModified { row, col, old_cell, .. } = a {
-                        Some((*row, *col, old_cell.clone()))
-                    } else {
-                        None
-                    }
-                });
+                let batch_res = batch_apply_cells_then_recalc(
+                    workbook,
+                    actions.iter().rev(),
+                    |a| {
+                        if let UndoAction::CellModified { row, col, old_cell, .. } = a {
+                            Some((*row, *col, old_cell.clone()))
+                        } else {
+                            None
+                        }
+                    },
+                );
                 // Non-CellModified actions inside the batch (rare today
                 // — most batches are pure CellModified) get the usual
                 // per-action revert. This is still O(actions) in the
                 // count of non-CellModified entries, which is bounded.
+                // Surface the first error encountered.
+                let mut first_err = batch_res.err();
                 for a in actions.iter().rev() {
                     if !matches!(a, UndoAction::CellModified { .. }) {
-                        a.revert(workbook);
+                        if let Err(e) = a.revert(workbook) {
+                            first_err.get_or_insert(e);
+                        }
                     }
+                }
+                match first_err {
+                    Some(e) => Err(e),
+                    None => Ok(()),
                 }
             }
             UndoAction::ConditionalFormatsReplaced { sheet_idx, old, new: _ } => {
                 restore_cf(workbook, *sheet_idx, old);
+                Ok(())
             }
             UndoAction::RowInserted { sheet_idx, at } => {
                 if *sheet_idx < workbook.sheets.len() {
                     with_active_sheet(workbook, *sheet_idx, |wb| wb.delete_row_on_active(*at));
                 }
+                Ok(())
             }
             UndoAction::RowDeleted { pre, .. } => {
                 restore_workbook(workbook, pre);
+                Ok(())
             }
             UndoAction::ColInserted { sheet_idx, at } => {
                 if *sheet_idx < workbook.sheets.len() {
                     with_active_sheet(workbook, *sheet_idx, |wb| wb.delete_col_on_active(*at));
                 }
+                Ok(())
             }
             UndoAction::ColDeleted { pre, .. } => {
                 restore_workbook(workbook, pre);
+                Ok(())
             }
             UndoAction::WorkbookSnapshot { pre, .. } => {
                 restore_workbook(workbook, pre);
+                Ok(())
             }
         }
     }
 
-    /// Re-apply this action to the workbook. Used by `App::redo`.
-    pub fn apply(&self, workbook: &mut Workbook) {
+    /// Re-apply this action to the workbook. Used by `App::redo`. Returns
+    /// any non-fatal recalc error so the caller can surface it.
+    pub fn apply(
+        &self,
+        workbook: &mut Workbook,
+    ) -> Result<(), crate::domain::services::CalcError> {
         match self {
             UndoAction::CellModified { row, col, old_cell: _, new_cell } => {
                 restore_cell(workbook, *row, *col, new_cell.as_ref());
+                Ok(())
             }
             UndoAction::Batch(actions) => {
                 // O(N) batch apply — same shape as revert above. See
                 // `batch_apply_cells_then_recalc` for the rationale.
-                batch_apply_cells_then_recalc(workbook, actions.iter(), |a| {
+                let batch_res = batch_apply_cells_then_recalc(workbook, actions.iter(), |a| {
                     if let UndoAction::CellModified { row, col, new_cell, .. } = a {
                         Some((*row, *col, new_cell.clone()))
                     } else {
                         None
                     }
                 });
+                let mut first_err = batch_res.err();
                 for a in actions {
                     if !matches!(a, UndoAction::CellModified { .. }) {
-                        a.apply(workbook);
+                        if let Err(e) = a.apply(workbook) {
+                            first_err.get_or_insert(e);
+                        }
                     }
+                }
+                match first_err {
+                    Some(e) => Err(e),
+                    None => Ok(()),
                 }
             }
             UndoAction::ConditionalFormatsReplaced { sheet_idx, old: _, new } => {
                 restore_cf(workbook, *sheet_idx, new);
+                Ok(())
             }
             UndoAction::RowInserted { sheet_idx, at } => {
                 if *sheet_idx < workbook.sheets.len() {
                     with_active_sheet(workbook, *sheet_idx, |wb| wb.insert_row_on_active(*at));
                 }
+                Ok(())
             }
             UndoAction::RowDeleted { sheet_idx, at, .. } => {
                 if *sheet_idx < workbook.sheets.len() {
                     with_active_sheet(workbook, *sheet_idx, |wb| wb.delete_row_on_active(*at));
                 }
+                Ok(())
             }
             UndoAction::ColInserted { sheet_idx, at } => {
                 if *sheet_idx < workbook.sheets.len() {
                     with_active_sheet(workbook, *sheet_idx, |wb| wb.insert_col_on_active(*at));
                 }
+                Ok(())
             }
             UndoAction::ColDeleted { sheet_idx, at, .. } => {
                 if *sheet_idx < workbook.sheets.len() {
                     with_active_sheet(workbook, *sheet_idx, |wb| wb.delete_col_on_active(*at));
                 }
+                Ok(())
             }
             UndoAction::WorkbookSnapshot { post, .. } => {
                 restore_workbook(workbook, post);
+                Ok(())
             }
         }
     }
@@ -346,7 +388,7 @@ fn batch_apply_cells_then_recalc<'a, I, F>(
     workbook: &mut Workbook,
     actions: I,
     project: F,
-)
+) -> Result<(), crate::domain::services::CalcError>
 where
     I: Iterator<Item = &'a UndoAction>,
     F: Fn(&'a UndoAction) -> Option<(usize, usize, Option<CellData>)>,
@@ -379,15 +421,18 @@ where
         }
     }
     if count == 0 {
-        return;
+        return Ok(());
     }
     // The legacy per-sheet dep graph needs rebuilding because we
     // bypassed `add_cell_dependencies`. The unified graph gets
-    // rebuilt lazily inside recalc_via_graph.
+    // rebuilt lazily inside recalc_via_graph_result.
     workbook.sheets[active_idx].rebuild_dependencies();
     workbook.rebuild_cross_sheet_deps();
     workbook.build_dep_graph_from_scratch();
-    workbook.recalc_via_graph();
+    // Use the Result variant — the eprintln-swallowing wrapper would
+    // corrupt the TUI alt-screen during an undo/redo on a non-converging
+    // cyclic workbook.
+    workbook.recalc_via_graph_result()
 }
 
 fn restore_cf(workbook: &mut Workbook, sheet_idx: usize, rules: &[crate::domain::ConditionalFormat]) {
@@ -710,8 +755,16 @@ impl App {
         self.workbook.build_dep_graph_from_scratch();
         self.workbook.rebuild_cross_sheet_deps();
         // The unified executor drains dirty and walks topo levels.
-        self.workbook.recalc_via_graph();
-        self.status_message = Some("Recalculated all formulas".to_string());
+        // Surface pass-level errors (e.g. iterative-calc non-convergence)
+        // via status message — values are still committed best-effort.
+        match self.workbook.recalc_via_graph_result() {
+            Ok(()) => {
+                self.status_message = Some("Recalculated all formulas".to_string());
+            }
+            Err(e) => {
+                self.status_message = Some(format!("Recalc: {}", e));
+            }
+        }
     }
 
     fn record_action(&mut self, action: UndoAction) {
@@ -749,7 +802,9 @@ impl App {
 
     pub fn undo(&mut self) {
         if let Some(action) = self.undo_stack.pop_back() {
-            action.revert(&mut self.workbook);
+            if let Err(e) = action.revert(&mut self.workbook) {
+                self.status_message = Some(format!("Undo: {}", e));
+            }
             self.redo_stack.push_back(action);
             self.dirty = true;
         }
@@ -764,7 +819,9 @@ impl App {
 
     pub fn redo(&mut self) {
         if let Some(action) = self.redo_stack.pop_back() {
-            action.apply(&mut self.workbook);
+            if let Err(e) = action.apply(&mut self.workbook) {
+                self.status_message = Some(format!("Redo: {}", e));
+            }
             self.undo_stack.push_back(action);
             self.dirty = true;
         }

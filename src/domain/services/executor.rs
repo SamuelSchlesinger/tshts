@@ -84,16 +84,39 @@ impl RecalcPlan {
     }
 }
 
-/// Errors a recalc pass can surface. Today only used for catastrophic
-/// failures (worker panic in PR 4); individual cell errors flow through
-/// `Value::Error` in the cell's value, not through this type.
+/// Errors a recalc pass can surface to the user. Individual cell
+/// errors flow through `Value::Error` in the cell's value — this type
+/// is only for pass-level failures that warrant a status message.
 #[derive(Debug, Clone)]
 pub enum CalcError {
     /// A worker thread panicked. Carries the panic message captured by
-    /// `catch_unwind`. PR 4 produces this; PR 3's sequential path can't
-    /// reach it (a panic in the orchestrator propagates normally).
+    /// `catch_unwind`. The sequential path can't reach this (a panic
+    /// in the orchestrator propagates normally).
     #[allow(dead_code)]
     WorkerPanic(String),
+    /// Iterative calc hit `iter_max` without converging. `cells` is
+    /// the number of cyclic cells that participated; users can adjust
+    /// per-sheet `iter_max`/`iter_epsilon` to extend the budget or
+    /// relax the convergence threshold.
+    DidNotConverge {
+        iter_max: usize,
+        cells: usize,
+    },
+}
+
+impl std::fmt::Display for CalcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CalcError::WorkerPanic(msg) => write!(f, "Recalc worker panicked: {}", msg),
+            CalcError::DidNotConverge { iter_max, cells } => write!(
+                f,
+                "Iterative calc did not converge after {} passes ({} cell{} in cycle)",
+                iter_max,
+                cells,
+                if *cells == 1 { "" } else { "s" }
+            ),
+        }
+    }
 }
 
 /// The seam at which the parallel executor (PR 4) plugs in. Implementors
@@ -145,7 +168,14 @@ impl SequentialExecutor {
         plan: &RecalcPlan,
         wb: &mut Workbook,
     ) -> Result<(), CalcError> {
-        use crate::domain::services::FormulaEvaluator;
+        // ONE snapshot for the whole recalc. We mutate the snapshot's
+        // cell values between levels so the next level's evaluator
+        // sees prior-level results. Eliminates the N-clones-per-recalc
+        // cost that the per-level snapshot pattern paid (10ms+ per
+        // clone of a 10k-cell workbook × N levels). The snapshot stays
+        // valid because no workers are alive between levels — it's
+        // the orchestrator's exclusive working copy.
+        let mut snapshot = wb.clone();
 
         // Acyclic levels — process in topological order.
         for level in &plan.levels {
@@ -154,34 +184,12 @@ impl SequentialExecutor {
             let mut ordered: Vec<NodeKey> = level.clone();
             ordered.sort();
 
-            // Snapshot for cross-sheet ref resolution. The evaluator
-            // reads from this stable view; we write back to the live
-            // workbook after each level so the next level sees the
-            // up-to-date values. (PR 4 replaces this clone with
-            // `Arc<WorkbookSnapshot>`.)
-            let snapshot = wb.clone();
-            let names = snapshot.named_ranges.clone();
-            let mut writes: Vec<(NodeKey, String)> = Vec::with_capacity(ordered.len());
+            let mut writes: Vec<(NodeKey, CellEvalOutcome)> =
+                Vec::with_capacity(ordered.len());
             for &node in &ordered {
-                let Some(sheet_idx) = wb.sheet_idx_of(node.0) else {
-                    continue;
-                };
-                let (r, c) = (node.1, node.2);
-                let Some(formula) = snapshot.sheets[sheet_idx]
-                    .cells
-                    .get(&(r, c))
-                    .and_then(|cd| cd.formula.clone())
-                else {
-                    // Non-formula seed cell — already up-to-date.
-                    continue;
-                };
-                let evaluator = FormulaEvaluator::for_workbook(
-                    &snapshot,
-                    &snapshot.sheets[sheet_idx],
-                    &names,
-                );
-                let value = evaluator.evaluate_formula(&formula);
-                writes.push((node, value));
+                if let Some(outcome) = eval_one(node, &snapshot) {
+                    writes.push((node, outcome));
+                }
             }
 
             // Apply level results to the live workbook with the same
@@ -189,33 +197,65 @@ impl SequentialExecutor {
             // `maybe_spill` re-evaluates the formula via the workbook
             // context thread-local; publishing `snapshot` ensures any
             // cross-sheet refs inside an array formula resolve.
+            //
+            // We need an immutable borrow on `snapshot` for the
+            // recalc-context publish, but we also need to mutate
+            // `snapshot.sheets[].cells[].value` so the next level
+            // sees fresh results. Solution: collect (sheet_idx, r, c,
+            // value) tuples first while snapshot is borrowed for
+            // read, then drop the borrow and apply snapshot writes.
+            let mut snapshot_writes: Vec<(usize, usize, usize, String)> =
+                Vec::with_capacity(writes.len());
             crate::domain::models::with_recalc_context(&snapshot, || {
-                for (node, value) in writes {
+                for (node, outcome) in writes {
                     let Some(sheet_idx) = wb.sheet_idx_of(node.0) else {
                         continue;
                     };
                     let (r, c) = (node.1, node.2);
+                    let value_clone = outcome.value.clone();
                     let sheet = &mut wb.sheets[sheet_idx];
                     if let Some(cd) = sheet.cells.get_mut(&(r, c)) {
-                        cd.value = value;
+                        cd.value = outcome.value;
                     }
                     sheet.cf_cache.lock().unwrap().clear();
                     sheet.sweep_spill_ghosts_for(r, c);
                     sheet.maybe_spill(r, c);
+                    // Record dynamic targets for VolatileStructural
+                    // cells so the next recalc's auto-seed can skip
+                    // this cell when its targets are unrelated to the
+                    // dirty closure.
+                    if wb.cell_purity(node)
+                        == crate::domain::parser::FunctionPurity::VolatileStructural
+                    {
+                        wb.record_structural_targets(node, &outcome.dynamic_targets);
+                    }
+                    // Queue the snapshot write so the next level reads
+                    // fresh values. We only update the cell VALUE on
+                    // the snapshot — cf_cache and spill ghosts are
+                    // render/eval state the workers don't consult.
+                    snapshot_writes.push((sheet_idx, r, c, value_clone));
                 }
             });
+            for (sheet_idx, r, c, value) in snapshot_writes {
+                if let Some(cd) = snapshot.sheets[sheet_idx].cells.get_mut(&(r, c)) {
+                    cd.value = value;
+                }
+            }
         }
 
         // Cyclic remainder: workbook-level iterative-calc that walks
         // every cycle across all sheets. The legacy per-sheet fallback
         // only saw one leg of a cross-sheet cycle and never converged.
+        // Non-convergence is reported via `CalcError::DidNotConverge`
+        // so the orchestrator can surface a status message; the
+        // iterated values are still committed (best-effort).
         if !plan.cyclic.is_empty()
-            && let Err(_iter_max) = wb.iterative_calc_cyclic(&plan.cyclic)
+            && let Err(iter_max) = wb.iterative_calc_cyclic(&plan.cyclic)
         {
-            // Non-convergence isn't fatal — the iterated values are
-            // still written, just stopped at iter_max. A future PR
-            // could surface this to the UI as a "did not converge"
-            // warning; for now we let the values speak for themselves.
+            return Err(CalcError::DidNotConverge {
+                iter_max,
+                cells: plan.cyclic.len(),
+            });
         }
 
         Ok(())
@@ -286,10 +326,16 @@ impl ParallelExecutor {
         clock_snapshot: f64,
         wb: &mut Workbook,
     ) -> Result<(), CalcError> {
-        
-        
         use rayon::prelude::*;
         use std::sync::Arc;
+
+        // ONE snapshot for the whole recalc, wrapped in Arc so workers
+        // hold cheap refcounts. Between levels we `Arc::make_mut` to
+        // mutate the cell values — refcount drops back to 1 after
+        // `par_iter().collect()` joins all workers, so make_mut returns
+        // a mut without cloning. Eliminates the per-level deep-clone
+        // that the previous design paid (O(workbook_size × N_levels)).
+        let mut snapshot = Arc::new(wb.clone());
 
         for level in &plan.levels {
             // Stable ordering for determinism / debuggability.
@@ -298,8 +344,7 @@ impl ParallelExecutor {
 
             // Partition: cells whose purity is parallel-safe go into
             // `par_cells`; everything else (VolatileStructural,
-            // SideEffecting) runs sequentially. Today the partition is a
-            // simple per-cell purity lookup; PR 4+ can refine.
+            // SideEffecting) runs sequentially.
             let mut par_cells: Vec<NodeKey> = Vec::with_capacity(ordered.len());
             let mut serial_cells: Vec<NodeKey> = Vec::new();
             for &node in &ordered {
@@ -309,20 +354,14 @@ impl ParallelExecutor {
                 }
             }
 
-            // Build a per-level snapshot. Arc-wrap so each rayon worker
-            // holds a cheap refcount instead of cloning the workbook
-            // N times. Without Arc, every worker would deep-clone via
-            // capture-by-value — the exact problem this PR exists to
-            // avoid.
-            let snapshot = Arc::new(wb.clone());
-
             // Sequential cells first — they may write to shared state
             // (RNG seed advances, HTTP cache inserts) so we run them on
             // the main thread within the level barrier.
-            let mut writes: Vec<(NodeKey, String)> = Vec::with_capacity(ordered.len());
+            let mut writes: Vec<(NodeKey, CellEvalOutcome)> =
+                Vec::with_capacity(ordered.len());
             for &node in &serial_cells {
-                if let Some(value) = eval_one(node, &snapshot) {
-                    writes.push((node, value));
+                if let Some(outcome) = eval_one(node, &snapshot) {
+                    writes.push((node, outcome));
                 }
             }
 
@@ -334,59 +373,94 @@ impl ParallelExecutor {
                 // Each worker publishes the clock on its own thread —
                 // thread-locals don't propagate across worker spawns,
                 // so we re-publish in the closure body.
-                let par_writes: Vec<(NodeKey, String)> = par_cells
+                let par_writes: Vec<(NodeKey, CellEvalOutcome)> = par_cells
                     .par_iter()
                     .with_min_len(self.min_chunk)
                     .filter_map(|&node| {
                         crate::domain::parser::with_recalc_clock(
                             clock_snapshot,
-                            || eval_one(node, snap_ref).map(|v| (node, v)),
+                            || eval_one(node, snap_ref).map(|o| (node, o)),
                         )
                     })
                     .collect();
                 writes.extend(par_writes);
             } else {
                 for &node in &par_cells {
-                    if let Some(value) = eval_one(node, &snapshot) {
-                        writes.push((node, value));
+                    if let Some(outcome) = eval_one(node, &snapshot) {
+                        writes.push((node, outcome));
                     }
                 }
             }
 
             // Apply level results — same post-write maintenance as
-            // SequentialExecutor, including the with_recalc_context
-            // wrap so spill re-evaluation can resolve cross-sheet refs.
-            crate::domain::models::with_recalc_context(&snapshot, || {
-                for (node, value) in writes {
+            // SequentialExecutor. After par_iter joined, workers have
+            // dropped their Arc clones, so refcount on `snapshot` is
+            // back to 1 and `Arc::make_mut` returns a mut without
+            // cloning. We use this to thread fresh cell values into
+            // the snapshot so the next level reads them.
+            let snapshot_for_ctx: &Workbook = &snapshot;
+            let mut snapshot_writes: Vec<(usize, usize, usize, String)> =
+                Vec::with_capacity(writes.len());
+            crate::domain::models::with_recalc_context(snapshot_for_ctx, || {
+                for (node, outcome) in writes {
                     let Some(sheet_idx) = wb.sheet_idx_of(node.0) else {
                         continue;
                     };
                     let (r, c) = (node.1, node.2);
+                    let value_clone = outcome.value.clone();
                     let sheet = &mut wb.sheets[sheet_idx];
                     if let Some(cd) = sheet.cells.get_mut(&(r, c)) {
-                        cd.value = value;
+                        cd.value = outcome.value;
                     }
                     sheet.cf_cache.lock().unwrap().clear();
                     sheet.sweep_spill_ghosts_for(r, c);
                     sheet.maybe_spill(r, c);
+                    if wb.cell_purity(node)
+                        == crate::domain::parser::FunctionPurity::VolatileStructural
+                    {
+                        wb.record_structural_targets(node, &outcome.dynamic_targets);
+                    }
+                    snapshot_writes.push((sheet_idx, r, c, value_clone));
                 }
             });
+            // Apply queued writes to the snapshot. `Arc::make_mut`
+            // returns a mut because no other Arc handle exists at
+            // this point (workers all joined before par_iter returned;
+            // the orchestrator holds the only Arc).
+            let snap_mut = Arc::make_mut(&mut snapshot);
+            for (sheet_idx, r, c, value) in snapshot_writes {
+                if let Some(cd) = snap_mut.sheets[sheet_idx].cells.get_mut(&(r, c)) {
+                    cd.value = value;
+                }
+            }
         }
 
         // Cyclic remainder: workbook-level iterative-calc, same as
-        // SequentialExecutor. (Originally this path used the per-sheet
-        // fallback; iterative_calc_cyclic handles cross-sheet cycles
-        // that the per-sheet path silently dropped.)
+        // SequentialExecutor. Surface non-convergence so the App layer
+        // can show a status message.
         if !plan.cyclic.is_empty()
-            && let Err(_iter_max) = wb.iterative_calc_cyclic(&plan.cyclic)
+            && let Err(iter_max) = wb.iterative_calc_cyclic(&plan.cyclic)
         {
-            // Non-convergence handled the same way as Sequential: the
-            // last-iterate values are kept. A future PR can surface
-            // this as a status warning via CalcError.
+            return Err(CalcError::DidNotConverge {
+                iter_max,
+                cells: plan.cyclic.len(),
+            });
         }
 
         Ok(())
     }
+}
+
+/// Outcome of evaluating one cell. `value` is the new cell value.
+/// `dynamic_targets` lists the cells INDIRECT/OFFSET resolved to (if
+/// any) — captured via `parser::take_dynamic_targets`. The orchestrator
+/// uses `dynamic_targets` to update `Workbook::structural_targets` so
+/// the next recalc's auto-seed loop can skip VolatileStructural cells
+/// whose targets are unaffected by the dirty closure.
+#[derive(Debug)]
+pub(super) struct CellEvalOutcome {
+    pub value: String,
+    pub dynamic_targets: Vec<crate::domain::parser::DynamicTarget>,
 }
 
 /// Evaluate a single cell's formula against a workbook snapshot.
@@ -396,7 +470,8 @@ impl ParallelExecutor {
 /// Hoisted so both `SequentialExecutor` and `ParallelExecutor` share
 /// one canonical implementation; the closure body that goes into
 /// `par_iter` is small and the impls don't drift.
-fn eval_one(node: NodeKey, snapshot: &Workbook) -> Option<String> {
+fn eval_one(node: NodeKey, snapshot: &Workbook) -> Option<CellEvalOutcome> {
+    use crate::domain::parser::take_dynamic_targets;
     use crate::domain::services::FormulaEvaluator;
     let sheet_idx = snapshot.sheet_idx_of(node.0)?;
     let (r, c) = (node.1, node.2);
@@ -404,12 +479,18 @@ fn eval_one(node: NodeKey, snapshot: &Workbook) -> Option<String> {
         .cells
         .get(&(r, c))
         .and_then(|cd| cd.formula.clone())?;
+    // Drain any prior leakage before evaluating, so the targets we
+    // collect after eval are this cell's only. (Per-thread buffer, so
+    // workers are independent.)
+    let _ = take_dynamic_targets();
     let evaluator = FormulaEvaluator::for_workbook(
         snapshot,
         &snapshot.sheets[sheet_idx],
         &snapshot.named_ranges,
     );
-    Some(evaluator.evaluate_formula(&formula))
+    let value = evaluator.evaluate_formula(&formula);
+    let dynamic_targets = take_dynamic_targets();
+    Some(CellEvalOutcome { value, dynamic_targets })
 }
 
 #[cfg(test)]
@@ -622,5 +703,58 @@ mod tests {
         // how the work is dispatched, not what it computes.
         assert_eq!(wb.sheets[0].get_cell(1, 0).value, "11");
         assert_eq!(wb.sheets[1].get_cell(0, 0).value, "100");
+    }
+
+    /// Single-snapshot recalc must propagate per-level writes into the
+    /// snapshot the next level reads from. Without that, a depth-3
+    /// chain (A1=lit, A2=A1+1, A3=A2+1) would have A3 reading A2's
+    /// pre-recalc value from the stale snapshot.
+    ///
+    /// This is the load-bearing regression test for the per-level
+    /// snapshot mutation in both executors. We exercise both paths
+    /// (Sequential, Parallel-with-threshold=1) and a fresh edit
+    /// midway to make sure values truly flow level→level→level.
+    #[test]
+    fn snapshot_updates_between_levels_for_deep_chain() {
+        let cases: [(&str, Box<dyn RecalcExecutor>); 2] = [
+            ("seq", Box::new(SequentialExecutor)),
+            ("par", Box::new(ParallelExecutor { min_chunk: 1, parallel_threshold: 1 })),
+        ];
+        for (label, exec) in cases {
+            let mut wb = Workbook::default();
+            // A1=10, A2=A1+1, A3=A2+1, A4=A3+1 — four levels.
+            wb.sheets[0].cells.insert((0, 0), CellData {
+                value: "10".to_string(), formula: None, format: None,
+                comment: None, spill_anchor: None,
+            });
+            for (r, f) in [(1, "=A1+1"), (2, "=A2+1"), (3, "=A3+1")] {
+                wb.sheets[0].cells.insert((r, 0), CellData {
+                    value: "0".to_string(),
+                    formula: Some(f.to_string()),
+                    format: None, comment: None, spill_anchor: None,
+                });
+            }
+            wb.build_dep_graph_from_scratch();
+            wb.mark_dirty("Sheet1", 0, 0);
+            let plan = plan_from_workbook(&mut wb);
+            let mut ctx = RecalcContext::new();
+            exec.run(&plan, &mut ctx, &mut wb).expect(label);
+
+            assert_eq!(wb.sheets[0].get_cell(1, 0).value, "11", "{label}: A2");
+            assert_eq!(wb.sheets[0].get_cell(2, 0).value, "12", "{label}: A3");
+            assert_eq!(wb.sheets[0].get_cell(3, 0).value, "13", "{label}: A4");
+
+            // Re-edit A1 and recalc again — confirms the snapshot is
+            // freshly built each recalc (not reused across recalcs).
+            wb.sheets[0].cells.insert((0, 0), CellData {
+                value: "100".to_string(), formula: None, format: None,
+                comment: None, spill_anchor: None,
+            });
+            wb.mark_dirty("Sheet1", 0, 0);
+            let plan2 = plan_from_workbook(&mut wb);
+            let mut ctx2 = RecalcContext::new();
+            exec.run(&plan2, &mut ctx2, &mut wb).expect(label);
+            assert_eq!(wb.sheets[0].get_cell(3, 0).value, "103", "{label}: A4 after re-edit");
+        }
     }
 }

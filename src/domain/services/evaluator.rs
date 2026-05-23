@@ -1738,6 +1738,165 @@ mod tests {
         }
     }
 
+    /// Smart auto-seed: VolatileStructural cells record their resolved
+    /// targets after eval so the next recalc's auto-seed can skip
+    /// them when targets are unaffected.
+    #[test]
+    fn test_volatile_structural_targets_recorded_after_eval() {
+        use crate::domain::Workbook;
+        use crate::domain::models::SheetId;
+        let mut wb = Workbook::default();
+        wb.sheets[0].cells.insert((0, 0), CellData {
+            value: "50".to_string(), formula: None, format: None,
+            comment: None, spill_anchor: None,
+        });
+        wb.sheets[0].cells.insert((0, 1), CellData {
+            value: "7".to_string(), formula: None, format: None,
+            comment: None, spill_anchor: None,
+        });
+        wb.sheets[0].cells.insert((0, 2), CellData {
+            value: "0".to_string(),
+            formula: Some("=OFFSET(A1, 0, 1)".to_string()),
+            format: None, comment: None, spill_anchor: None,
+        });
+        wb.build_dep_graph_from_scratch();
+        wb.mark_dirty("Sheet1", 0, 0);
+        wb.mark_dirty("Sheet1", 0, 1);
+        wb.recalc_via_graph();
+
+        let offset_node = (SheetId(0), 0, 2);
+        let b1_node = (SheetId(0), 0, 1);
+        let targets = wb.structural_targets.get(&offset_node)
+            .expect("OFFSET should have recorded targets");
+        assert!(targets.contains(&b1_node),
+            "structural_targets should contain B1; got {:?}", targets);
+    }
+
+    /// Smart auto-seed skips a VolatileStructural cell when its
+    /// recorded dynamic targets are disjoint from the user-dirty
+    /// closure. Without the skip, every OFFSET/INDIRECT in a workbook
+    /// re-evaluates on every keystroke (the old unconditional-seed
+    /// behavior); with it, an unrelated edit leaves the cell alone.
+    #[test]
+    fn test_smart_auto_seed_skips_when_targets_disjoint_from_closure() {
+        use crate::domain::Workbook;
+        let mut wb = Workbook::default();
+        for (pos, val) in [((0,0), "10"), ((0,1), "7"), ((0,3), "100")] {
+            wb.sheets[0].cells.insert(pos, CellData {
+                value: val.to_string(), formula: None, format: None,
+                comment: None, spill_anchor: None,
+            });
+        }
+        // OFFSET targets B1.
+        wb.sheets[0].cells.insert((0, 2), CellData {
+            value: "0".to_string(),
+            formula: Some("=OFFSET(A1, 0, 1)".to_string()),
+            format: None, comment: None, spill_anchor: None,
+        });
+        wb.build_dep_graph_from_scratch();
+        wb.mark_dirty("Sheet1", 0, 0);
+        wb.mark_dirty("Sheet1", 0, 1);
+        wb.mark_dirty("Sheet1", 0, 3);
+        wb.recalc_via_graph();
+        assert_eq!(wb.sheets[0].get_cell(0, 2).value, "7");
+
+        // User edits D1 (unrelated to OFFSET's target). OFFSET targets
+        // = {B1}, dirty closure = {D1, deps-of-D1}. Disjoint → skip.
+        wb.sheets[0].cells.insert((0, 3), CellData {
+            value: "999".to_string(), formula: None, format: None,
+            comment: None, spill_anchor: None,
+        });
+        wb.mark_dirty("Sheet1", 0, 3);
+        let plan_before = wb.structural_targets.clone();
+        wb.recalc_via_graph();
+        // Sanity: targets cache was preserved (not cleared by recalc).
+        assert_eq!(wb.structural_targets, plan_before,
+            "targets cache must persist across recalc");
+        // OFFSET still reads B1 = "7" (unchanged).
+        assert_eq!(wb.sheets[0].get_cell(0, 2).value, "7");
+
+        // Now edit B1 — target intersects closure → re-eval fires.
+        wb.sheets[0].cells.insert((0, 1), CellData {
+            value: "42".to_string(), formula: None, format: None,
+            comment: None, spill_anchor: None,
+        });
+        wb.mark_dirty("Sheet1", 0, 1);
+        wb.recalc_via_graph();
+        assert_eq!(wb.sheets[0].get_cell(0, 2).value, "42");
+    }
+
+    /// `structural_targets` entries are cleared when the cell's
+    /// formula changes — without this, an INDIRECT→Pure edit leaves
+    /// stale target NodeKeys that would mis-trigger auto-seeding (or,
+    /// after enough churn, point at since-deleted cells).
+    #[test]
+    fn test_structural_targets_cleared_on_formula_edit() {
+        use crate::domain::Workbook;
+        use crate::domain::models::SheetId;
+        let mut wb = Workbook::default();
+        wb.sheets[0].cells.insert((0, 0), CellData {
+            value: "5".to_string(), formula: None, format: None,
+            comment: None, spill_anchor: None,
+        });
+        wb.sheets[0].cells.insert((0, 1), CellData {
+            value: "0".to_string(),
+            formula: Some("=OFFSET(A1, 0, 0)".to_string()),
+            format: None, comment: None, spill_anchor: None,
+        });
+        wb.build_dep_graph_from_scratch();
+        wb.mark_dirty("Sheet1", 0, 0);
+        wb.recalc_via_graph();
+        let node = (SheetId(0), 0, 1);
+        assert!(wb.structural_targets.get(&node).is_some(),
+            "OFFSET should record its target after eval");
+
+        // Edit to a Pure formula — entry must vanish.
+        wb.set_cell_on_active(0, 1, CellData {
+            value: "5".to_string(),
+            formula: Some("=A1*2".to_string()),
+            format: None, comment: None, spill_anchor: None,
+        });
+        assert!(wb.structural_targets.get(&node).is_none(),
+            "switching OFFSET→Pure must clear stale targets");
+    }
+
+    /// Regression: smart auto-seed still picks up target changes.
+    /// A bug in the skip logic would silently stop OFFSET from updating.
+    #[test]
+    fn test_smart_auto_seed_still_picks_up_target_changes() {
+        use crate::domain::Workbook;
+        let mut wb = Workbook::default();
+        wb.sheets[0].cells.insert((0, 0), CellData {
+            value: "10".to_string(), formula: None, format: None,
+            comment: None, spill_anchor: None,
+        });
+        wb.sheets[0].cells.insert((0, 1), CellData {
+            value: "7".to_string(), formula: None, format: None,
+            comment: None, spill_anchor: None,
+        });
+        wb.sheets[0].cells.insert((0, 2), CellData {
+            value: "0".to_string(),
+            formula: Some("=OFFSET(A1, 0, 1)".to_string()),
+            format: None, comment: None, spill_anchor: None,
+        });
+        wb.build_dep_graph_from_scratch();
+        wb.mark_dirty("Sheet1", 0, 0);
+        wb.mark_dirty("Sheet1", 0, 1);
+        wb.recalc_via_graph();
+        assert_eq!(wb.sheets[0].get_cell(0, 2).value, "7");
+
+        // Change B1 — OFFSET's target. Smart auto-seed sees B1 in
+        // closure (intersects targets) and re-evaluates.
+        wb.sheets[0].cells.insert((0, 1), CellData {
+            value: "99".to_string(), formula: None, format: None,
+            comment: None, spill_anchor: None,
+        });
+        wb.mark_dirty("Sheet1", 0, 1);
+        wb.recalc_via_graph();
+        assert_eq!(wb.sheets[0].get_cell(0, 2).value, "99",
+            "OFFSET should pick up B1's new value via smart auto-seed");
+    }
+
     /// Editing a formula from Pure to VolatileStructural (and back)
     /// updates the cached purity classification in real time, not just
     /// on the next full graph rebuild. Without this, the auto-seed
@@ -1845,6 +2004,44 @@ mod tests {
                 "NOW() at row {} = {} differs from row 0 = {}",
                 i, v, first);
         }
+    }
+
+    /// Non-convergence surfaces as a user-visible status message via
+    /// `App::recalc_all`. Matches Excel's "Calculation did not converge"
+    /// indicator.
+    #[test]
+    fn test_non_convergence_surfaces_to_status_message() {
+        use crate::application::App;
+        let mut app = App::default();
+        // A1 = B1 + 1, B1 = A1 + 1 — diverges by 2 per pass.
+        app.workbook.sheets[0].cells.insert((0, 0), CellData {
+            value: "0".to_string(),
+            formula: Some("=B1+1".to_string()),
+            format: None, comment: None, spill_anchor: None,
+        });
+        app.workbook.sheets[0].cells.insert((0, 1), CellData {
+            value: "0".to_string(),
+            formula: Some("=A1+1".to_string()),
+            format: None, comment: None, spill_anchor: None,
+        });
+        app.workbook.sheets[0].iterative_calc = true;
+        app.workbook.sheets[0].iter_max = 3;
+        app.workbook.sheets[0].iter_epsilon = 1e-6;
+
+        app.recalc_all();
+        let msg = app.status_message.expect("status message set");
+        assert!(
+            msg.contains("did not converge"),
+            "expected non-convergence message, got: {}", msg
+        );
+        assert!(
+            msg.contains("3 passes"),
+            "expected iter_max in message, got: {}", msg
+        );
+        assert!(
+            msg.contains("2 cells"),
+            "expected cycle size in message, got: {}", msg
+        );
     }
 
     /// Non-convergent cycle should hit iter_max and return Err. The
@@ -3706,6 +3903,7 @@ mod tests {
             next_sheet_id: 0,
             graph: Default::default(),
             cell_purities: Default::default(),
+            structural_targets: Default::default(),
         };
         let dir = std::env::temp_dir();
         let path = dir.join("empty_sheets_named_ranges.tshts");
@@ -3735,6 +3933,7 @@ mod tests {
             next_sheet_id: 0,
             graph: Default::default(),
             cell_purities: Default::default(),
+            structural_targets: Default::default(),
         };
         wb.sheets[0].set_cell(0, 0, CellData { value: "ok".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
         let dir = std::env::temp_dir();
@@ -3799,6 +3998,7 @@ mod tests {
             next_sheet_id: 0,
             graph: Default::default(),
             cell_purities: Default::default(),
+            structural_targets: Default::default(),
         };
         let dir = std::env::temp_dir();
         let path = dir.join("future_version.tshts");
@@ -3845,6 +4045,7 @@ mod tests {
             next_sheet_id: 0,
             graph: Default::default(),
             cell_purities: Default::default(),
+            structural_targets: Default::default(),
         };
         let dir = std::env::temp_dir();
         let path = dir.join("agent4_mismatched_names.tshts");
