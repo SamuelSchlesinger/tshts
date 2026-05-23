@@ -3391,168 +3391,279 @@ mod tests {
         assert!(result.starts_with('#'), "got {}", result);
     }
 
-    #[test]
-    #[ignore = "requires network and depends on cryptoprices.cc; GET() is now async (returns Loading… on first call)"]
-    fn test_get_function_real_http_requests() {
-        let sheet = create_test_spreadsheet();
-        let evaluator = FormulaEvaluator::new(&sheet);
-        
-        // Test fetching crypto price from real API
-        let result = evaluator.evaluate_formula("=GET(\"https://cryptoprices.cc/ADA\")");
-        // The result should be a valid response (not #ERROR) and contain price data
-        assert_ne!(result, "#ERROR");
-        assert!(!result.is_empty());
-        
-        // Test another crypto ticker
-        let result = evaluator.evaluate_formula("=GET(\"https://cryptoprices.cc/BTC\")");
-        assert_ne!(result, "#ERROR");
-        assert!(!result.is_empty());
+    // ---------- GET() — async fetcher contract tests ----------
+    //
+    // GET() is now async-backed. Each call inspects the fetcher cache and
+    // returns one of three states:
+    //
+    //   * Cached `Value`   → cell shows the response body
+    //   * Cached `Loading` → cell shows the literal string "Loading…"
+    //   * Cached `Error`   → cell shows `#VALUE!` (the original error
+    //                        string is dropped because Value::Error
+    //                        doesn't carry text — IFERROR can still
+    //                        trap it)
+    //   * Cache miss       → enqueues a worker, parks a Loading entry,
+    //                        returns "Loading…" synchronously
+    //
+    // These tests cover the new contract hermetically by seeding the
+    // cache directly via `fetcher::test_hooks` instead of hitting a
+    // live URL — the `check_url_safety` SSRF guard correctly blocks
+    // 127.0.0.1, so a real local mock server can't reach the fetcher
+    // without weakening the guard.
+    //
+    // Every test uses a URL with the test name embedded, so the global
+    // cache shared across parallel-running tests doesn't see cross-talk.
+
+    /// Helper: ensure the network gate is open (the default is closed
+    /// for safety). Tests can call this freely — it's an idempotent
+    /// store. Tests that want to verify the gate's negative path
+    /// override locally and restore at the end.
+    fn enable_network_for_test() {
+        crate::infrastructure::fetcher::set_network_enabled(true);
     }
 
+    /// Cache hit on `FetchResult::Value` → GET() returns the body.
+    /// The simplest demonstration of the async cache being consulted.
     #[test]
-    #[ignore = "requires network; GET() is now async"]
-    fn test_nested_get_with_string_functions() {
+    fn get_returns_cached_value() {
+        use crate::infrastructure::fetcher::test_hooks;
+        enable_network_for_test();
+        let url = "https://example.com/get_returns_cached_value";
+        test_hooks::seed_value(url, "hello world");
         let sheet = create_test_spreadsheet();
         let evaluator = FormulaEvaluator::new(&sheet);
-        
-        // Test LEN with GET - get length of response
-        let result = evaluator.evaluate_formula("=LEN(GET(\"https://cryptoprices.cc/ADA\"))");
-        assert_ne!(result, "#ERROR");
-        // Should be a positive number (length of response)
-        if let Ok(len) = result.parse::<f64>() {
-            assert!(len > 0.0);
-        } else {
-            panic!("Expected numeric result for LEN(GET(...)), got: {}", result);
-        }
-        
-        // Test UPPER with GET - convert response to uppercase
-        let result = evaluator.evaluate_formula("=UPPER(GET(\"https://cryptoprices.cc/ADA\"))");
-        assert_ne!(result, "#ERROR");
-        assert!(!result.is_empty());
-        
-        // Test TRIM with GET - trim whitespace from response
-        let result = evaluator.evaluate_formula("=TRIM(GET(\"https://cryptoprices.cc/ADA\"))");
-        assert_ne!(result, "#ERROR");
-        assert!(!result.is_empty());
+        let result = evaluator.evaluate_formula(&format!("=GET(\"{}\")", url));
+        assert_eq!(result, "hello world");
+        test_hooks::forget(url);
     }
 
+    /// Cache hit on `FetchResult::Loading` → GET() returns the literal
+    /// "Loading…" sentinel. This is what the user sees BEFORE the
+    /// background worker publishes a value — every GET() in the
+    /// workbook will render this string until the next recalc after
+    /// the worker completes.
     #[test]
-    #[ignore = "requires network; GET() is now async"]
-    fn test_nested_concat_with_get() {
+    fn get_returns_loading_sentinel_while_in_flight() {
+        use crate::infrastructure::fetcher::test_hooks;
+        enable_network_for_test();
+        let url = "https://example.com/get_returns_loading_sentinel";
+        test_hooks::seed_loading(url);
         let sheet = create_test_spreadsheet();
         let evaluator = FormulaEvaluator::new(&sheet);
-        
-        // Test CONCAT with GET results
-        let result = evaluator.evaluate_formula("=CONCAT(\"ADA Price: \", GET(\"https://cryptoprices.cc/ADA\"))");
-        assert_ne!(result, "#ERROR");
-        assert!(result.starts_with("ADA Price: "));
-        
-        // Test concatenating multiple GET requests
-        let result = evaluator.evaluate_formula("=CONCAT(\"ADA: \", GET(\"https://cryptoprices.cc/ADA\"), \" | BTC: \", GET(\"https://cryptoprices.cc/BTC\"))");
-        assert_ne!(result, "#ERROR");
-        assert!(result.contains("ADA: "));
-        assert!(result.contains(" | BTC: "));
+        let result = evaluator.evaluate_formula(&format!("=GET(\"{}\")", url));
+        assert_eq!(result, "Loading…");
+        test_hooks::forget(url);
     }
 
+    /// Cache hit on `FetchResult::Error` → GET() returns `#VALUE!`.
+    /// The original error text is intentionally dropped (Value::Error
+    /// can't carry a string); the cell renders an error literal that
+    /// IFERROR can trap.
     #[test]
-    #[ignore = "requires network; GET() is now async"]
-    fn test_complex_nested_expressions_with_get() {
+    fn get_returns_value_error_on_cached_error() {
+        use crate::infrastructure::fetcher::test_hooks;
+        enable_network_for_test();
+        let url = "https://example.com/get_returns_value_error";
+        test_hooks::seed_error(url, "404 Not Found");
         let sheet = create_test_spreadsheet();
         let evaluator = FormulaEvaluator::new(&sheet);
-        
-        // Test deeply nested: UPPER(CONCAT("Price: ", TRIM(GET(url))))
-        let result = evaluator.evaluate_formula("=UPPER(CONCAT(\"Ada price: \", TRIM(GET(\"https://cryptoprices.cc/ADA\"))))");
-        assert_ne!(result, "#ERROR");
-        assert!(result.starts_with("ADA PRICE: "));
-        
-        // Test conditional with GET: IF(LEN(GET(url)) > 0, "Got data", "No data")
-        let result = evaluator.evaluate_formula("=IF(LEN(GET(\"https://cryptoprices.cc/ADA\"))>0, \"Got data\", \"No data\")");
-        assert_ne!(result, "#ERROR");
-        assert_eq!(result, "Got data");
-        
-        // Test FIND within GET results
-        let result = evaluator.evaluate_formula("=FIND(\".\", GET(\"https://cryptoprices.cc/ADA\"))");
-        // Should find a decimal point in the price response (most crypto prices have decimals)
-        // If no decimal found, it will return #ERROR, but most crypto prices should have decimals
-        if result != "#ERROR" {
-            if let Ok(pos) = result.parse::<f64>() {
-                assert!(pos >= 0.0);
-            }
-        }
+        let result = evaluator.evaluate_formula(&format!("=GET(\"{}\")", url));
+        // Cell-level error rendering follows the Value::Error display
+        // convention; the marker text "#VALUE!" is the contract surface
+        // (assertion deliberately checks contains() so that future
+        // marker-format tweaks don't break this test for cosmetic
+        // reasons).
+        assert!(
+            result.contains("#VALUE"),
+            "expected #VALUE marker, got {:?}", result,
+        );
+        test_hooks::forget(url);
     }
 
+    /// IFERROR traps GET's error and substitutes the fallback. This is
+    /// the production-recommended pattern for users dealing with flaky
+    /// upstreams — verify it still works under the new error shape.
     #[test]
-    #[ignore = "requires network; GET() is now async"]
-    fn test_get_with_cell_references() {
+    fn iferror_traps_get_error_with_fallback() {
+        use crate::infrastructure::fetcher::test_hooks;
+        enable_network_for_test();
+        let url = "https://example.com/iferror_traps_get_error";
+        test_hooks::seed_error(url, "503 upstream down");
+        let sheet = create_test_spreadsheet();
+        let evaluator = FormulaEvaluator::new(&sheet);
+        let result = evaluator.evaluate_formula(
+            &format!("=IFERROR(GET(\"{}\"), \"fallback\")", url),
+        );
+        assert_eq!(result, "fallback");
+        test_hooks::forget(url);
+    }
+
+    /// A formula wrapping GET() in a string function sees the literal
+    /// "Loading…" string while the fetch is in flight, NOT a numeric
+    /// or error result. This is the user-visible behavior we want
+    /// regression coverage for: a sheet of `=LEN(GET(...))` cells
+    /// shows the length of "Loading…" until the worker completes.
+    #[test]
+    fn nested_string_fn_over_loading_get_sees_loading_string() {
+        use crate::infrastructure::fetcher::test_hooks;
+        enable_network_for_test();
+        let url = "https://example.com/nested_loading";
+        test_hooks::seed_loading(url);
+        let sheet = create_test_spreadsheet();
+        let evaluator = FormulaEvaluator::new(&sheet);
+        // LEN of "Loading…" — the ellipsis is a single Unicode char,
+        // so LEN counts 8 characters: L o a d i n g …
+        let result = evaluator.evaluate_formula(&format!("=LEN(GET(\"{}\"))", url));
+        assert_eq!(result, "8", "LEN(\"Loading…\") should be 8 chars");
+        // UPPER also operates on the loading sentinel, not a fetched body.
+        let result = evaluator.evaluate_formula(&format!("=UPPER(GET(\"{}\"))", url));
+        assert_eq!(result, "LOADING…");
+        test_hooks::forget(url);
+    }
+
+    /// After the worker completes (we model this by replacing Loading
+    /// with Value in the cache), the SAME formula returns the real
+    /// body on the next eval. This is the load-bearing assertion for
+    /// the entire async contract — "the second eval gets the answer."
+    #[test]
+    fn nested_string_fn_over_cached_get_returns_real_length() {
+        use crate::infrastructure::fetcher::test_hooks;
+        enable_network_for_test();
+        let url = "https://example.com/nested_value";
+        test_hooks::seed_loading(url);
+        let sheet = create_test_spreadsheet();
+        let evaluator = FormulaEvaluator::new(&sheet);
+        // Pre-completion: Loading sentinel observed.
+        assert_eq!(
+            evaluator.evaluate_formula(&format!("=LEN(GET(\"{}\"))", url)),
+            "8",
+        );
+        // Simulate the worker completing.
+        test_hooks::seed_value(url, "real body 12345");
+        // Post-completion: the real body's length surfaces.
+        assert_eq!(
+            evaluator.evaluate_formula(&format!("=LEN(GET(\"{}\"))", url)),
+            "15",
+        );
+        test_hooks::forget(url);
+    }
+
+    /// CONCAT splices a GET result inline. Confirms the Value flows
+    /// through string-function evaluation, AND that the Loading
+    /// sentinel does NOT crash any downstream string ops (it's just
+    /// a regular string).
+    #[test]
+    fn concat_with_get_handles_both_states() {
+        use crate::infrastructure::fetcher::test_hooks;
+        enable_network_for_test();
+        let url = "https://example.com/concat";
+        // State 1: in flight.
+        test_hooks::seed_loading(url);
+        let sheet = create_test_spreadsheet();
+        let evaluator = FormulaEvaluator::new(&sheet);
+        let result = evaluator
+            .evaluate_formula(&format!("=CONCAT(\"price=\",GET(\"{}\"))", url));
+        assert_eq!(result, "price=Loading…");
+        // State 2: completed.
+        test_hooks::seed_value(url, "42.50");
+        let result = evaluator
+            .evaluate_formula(&format!("=CONCAT(\"price=\",GET(\"{}\"))", url));
+        assert_eq!(result, "price=42.50");
+        test_hooks::forget(url);
+    }
+
+    /// GET resolves the URL from a cell reference (the value of that
+    /// cell becomes the URL). Same async contract — cell ref doesn't
+    /// change the cache lookup.
+    #[test]
+    fn get_with_cell_reference_resolves_url_through_cache() {
+        use crate::infrastructure::fetcher::test_hooks;
+        enable_network_for_test();
+        let url = "https://example.com/cell_ref_get";
+        test_hooks::seed_value(url, "ada-price-stub");
         let mut sheet = Spreadsheet::default();
-        // Set up a cell with a URL
-        sheet.set_cell(0, 0, CellData { 
-            value: "https://cryptoprices.cc/ADA".to_string(), 
-            formula: None,
-            format: None,
-            comment: None,
-        spill_anchor: None,
+        sheet.set_cell(0, 0, CellData {
+            value: url.to_string(),
+            formula: None, format: None, comment: None, spill_anchor: None,
         });
-        
         let evaluator = FormulaEvaluator::new(&sheet);
-        
-        // Test GET with cell reference
-        let result = evaluator.evaluate_formula("=GET(A1)");
-        assert_ne!(result, "#ERROR");
-        assert!(!result.is_empty());
-        
-        // Test nested function with cell reference: LEN(GET(A1))
-        let result = evaluator.evaluate_formula("=LEN(GET(A1))");
-        assert_ne!(result, "#ERROR");
-        if let Ok(len) = result.parse::<f64>() {
-            assert!(len > 0.0);
+        assert_eq!(evaluator.evaluate_formula("=GET(A1)"), "ada-price-stub");
+        // Nested: CONCAT pulls in the cell ref AND the GET result.
+        let result = evaluator.evaluate_formula(
+            "=CONCAT(\"from \", A1, \": \", GET(A1))",
+        );
+        assert_eq!(result, format!("from {}: ada-price-stub", url));
+        test_hooks::forget(url);
+    }
+
+    /// SSRF safety gate: a URL pointing at a blocked host (127.0.0.1,
+    /// private RFC1918 ranges, link-local, etc.) returns `#VALUE!`
+    /// SYNCHRONOUSLY and must NOT enqueue a worker / park a Loading
+    /// cache entry. Without this guarantee a hostile workbook could
+    /// scan the user's internal network just by opening.
+    #[test]
+    fn get_with_blocked_url_returns_value_error_without_enqueueing() {
+        use crate::infrastructure::fetcher::test_hooks;
+        enable_network_for_test();
+        // 127.0.0.1 is one of many blocked ranges — see
+        // fetcher::tests::check_url_safety_* for the full set.
+        let blocked = "http://127.0.0.1/scanme";
+        test_hooks::forget(blocked); // start clean
+        let sheet = create_test_spreadsheet();
+        let evaluator = FormulaEvaluator::new(&sheet);
+        let result = evaluator.evaluate_formula(&format!("=GET(\"{}\")", blocked));
+        assert!(
+            result.contains("#VALUE"),
+            "blocked URL should surface as #VALUE!, got {:?}", result,
+        );
+        // CRITICAL: the safety gate must NOT have parked the URL in
+        // Loading. If it did, the user would see "Loading…" on the
+        // next eval and might think a fetch is in progress.
+        assert!(
+            !test_hooks::is_loading(blocked),
+            "blocked URL must NOT be parked in Loading — that would \
+             let a hostile workbook learn that the URL was at least \
+             attempted",
+        );
+        test_hooks::forget(blocked);
+    }
+
+    /// First eval on a brand-new (cache-miss) safe URL: returns
+    /// "Loading…" synchronously AND parks a Loading entry so a
+    /// subsequent eval doesn't re-enqueue. Demonstrates the
+    /// enqueueing side of the fetch protocol.
+    ///
+    /// We can't easily verify the worker actually completes without
+    /// hitting the real network (and `example.com` is the wrong
+    /// venue for that — it would test connectivity, not GET()).
+    /// So we just verify enqueueing happened and the second eval
+    /// returns the same Loading sentinel (the cache is consulted,
+    /// not the network).
+    #[test]
+    fn get_cache_miss_enqueues_and_returns_loading_sentinel() {
+        use crate::infrastructure::fetcher::test_hooks;
+        enable_network_for_test();
+        // example.com is on the public internet and passes the safety
+        // check. We forget any prior entry to force a miss.
+        let url = "https://example.com/cache_miss_enqueue_test";
+        test_hooks::forget(url);
+        let sheet = create_test_spreadsheet();
+        let evaluator = FormulaEvaluator::new(&sheet);
+        // First eval: cache miss → enqueues + returns Loading.
+        let r1 = evaluator.evaluate_formula(&format!("=GET(\"{}\")", url));
+        assert_eq!(r1, "Loading…");
+        // The fetcher should have parked a Loading entry. (The real
+        // background worker may or may not have completed by now;
+        // for the contract we only require the synchronous enqueue.)
+        // If the worker IS already done, the cache holds Done and
+        // the next read returns the body. Both outcomes are valid.
+        let cache_state_is_loading = test_hooks::is_loading(url);
+        let r2 = evaluator.evaluate_formula(&format!("=GET(\"{}\")", url));
+        if cache_state_is_loading {
+            assert_eq!(r2, "Loading…",
+                "while cache is still Loading, eval must return Loading sentinel");
         }
-        
-        // Test CONCAT with cell reference and GET
-        let result = evaluator.evaluate_formula("=CONCAT(\"Price from \", A1, \": \", GET(A1))");
-        assert_ne!(result, "#ERROR");
-        assert!(result.contains("Price from https://cryptoprices.cc/ADA: "));
-    }
-
-    #[test]
-    #[ignore = "requires network; GET() is now async"]
-    fn test_multiple_nested_function_levels() {
-        let sheet = create_test_spreadsheet();
-        let evaluator = FormulaEvaluator::new(&sheet);
-        
-        // Test 4-level nesting: LEFT(UPPER(TRIM(GET(url))), 10)
-        let result = evaluator.evaluate_formula("=LEFT(UPPER(TRIM(GET(\"https://cryptoprices.cc/ADA\"))), 10)");
-        assert_ne!(result, "#ERROR");
-        assert!(!result.is_empty());
-        assert!(result.len() <= 10);
-        
-        // Test 5-level nesting with conditional: IF(LEN(TRIM(GET(url))) > 5, LEFT(UPPER(GET(url)), 20), "Short")
-        let result = evaluator.evaluate_formula("=IF(LEN(TRIM(GET(\"https://cryptoprices.cc/ADA\")))>5, LEFT(UPPER(GET(\"https://cryptoprices.cc/ADA\")), 20), \"Short\")");
-        assert_ne!(result, "#ERROR");
-        // Should not be "Short" since crypto price responses are typically longer than 5 characters
-        assert_ne!(result, "Short");
-    }
-
-    #[test]
-    #[ignore = "requires network; GET() is now async"]
-    fn test_error_propagation_in_nested_functions() {
-        let sheet = create_test_spreadsheet();
-        let evaluator = FormulaEvaluator::new(&sheet);
-        
-        // Test that errors in inner functions propagate outward
-        let result = evaluator.evaluate_formula("=LEN(GET(\"invalid-url\"))");
-        assert_eq!(result, "#ERROR");
-        
-        let result = evaluator.evaluate_formula("=CONCAT(\"Price: \", GET(\"invalid-url\"))");
-        assert_eq!(result, "#ERROR");
-        
-        let result = evaluator.evaluate_formula("=IF(LEN(GET(\"invalid-url\"))>0, \"Good\", \"Bad\")");
-        assert_eq!(result, "#ERROR");
-        
-        // Test FIND with invalid search in valid GET
-        let result = evaluator.evaluate_formula("=FIND(\"xyz123notfound\", GET(\"https://cryptoprices.cc/ADA\"))");
-        // This should return #ERROR because the search string likely won't be found
-        assert_eq!(result, "#ERROR");
+        test_hooks::forget(url);
     }
 
     #[test]

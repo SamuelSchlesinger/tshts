@@ -34,6 +34,8 @@
 
 #![allow(dead_code)]
 
+pub mod scenarios;
+
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
@@ -248,6 +250,16 @@ impl Harness {
     /// `data_row(1)` returns A1's row, etc.
     pub fn data_row(&self, n: u16) -> String {
         self.row(4 + n)
+    }
+
+    /// Returns the status-bar text row. The status bar is a 3-row bordered
+    /// block at the bottom of the screen (rows ROWS-3..ROWS); the actual
+    /// text lives on the middle row. Use this to read the mode label,
+    /// status messages, and (load-bearing for the scenario framework) the
+    /// `SUM=… AVG=… COUNT=…` line that Visual mode publishes for the
+    /// current selection.
+    pub fn status_bar(&self) -> String {
+        self.row(ROWS - 2)
     }
 
     /// Current cursor position as (row, col).

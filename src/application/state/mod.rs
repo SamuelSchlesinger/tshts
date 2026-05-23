@@ -1056,9 +1056,12 @@ impl App {
 
     pub fn get_selection_stats(&mut self) -> Option<(f64, f64, usize)> {
         let (start, end) = self.get_selection_range()?;
-        if start == end {
-            return None; // Single cell, no stats
-        }
+        // Always compute stats — even a 1x1 selection benefits from
+        // surfacing the cell's numeric value (the value the user is
+        // standing on, which the formula bar otherwise hides behind the
+        // formula text). The scenario test framework also relies on
+        // SUM= being published for single-cell selections to read
+        // computed values back out of tshts.
         if let Some((cs, ce, v)) = &self.stats_cache
             && *cs == start && *ce == end {
                 return *v;
@@ -1424,8 +1427,15 @@ mod tests {
         app.selection_start = Some((0, 0));
         app.selection_end = Some((0, 0));
 
-        // Single cell should return None
-        assert!(app.get_selection_stats().is_none());
+        // Single-cell selections now also publish stats (SUM=value,
+        // AVG=value, COUNT=1) — useful for the user (the value of the
+        // cell the cursor sits on) and required by the scenario test
+        // framework's status-bar value reads.
+        let (sum, avg, count) = app.get_selection_stats()
+            .expect("single-cell selection should yield stats");
+        assert_eq!(sum, 10.0);
+        assert_eq!(avg, 10.0);
+        assert_eq!(count, 1);
     }
 
     #[test]

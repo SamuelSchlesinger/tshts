@@ -406,6 +406,85 @@ pub fn clear_cache() {
         .clear();
 }
 
+/// Test-only scaffolding for exercising the GET() three-state contract
+/// (Loading / Value / Error) hermetically. We can't stand up a real
+/// local HTTP mock because `check_url_safety` blocks 127.0.0.1 — and
+/// weakening that defense for tests would be a real footgun. Instead
+/// we reach into the cache directly: seed the entry the test wants,
+/// then drive `fetch()` (or anything that wraps it, like GET()) and
+/// assert on the result.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use super::{inner, CacheEntry};
+    use std::time::Instant;
+
+    /// Seed `url` so the next `fetch(url)` returns `FetchResult::Value(body)`.
+    pub(crate) fn seed_value(url: &str, body: &str) {
+        let i = inner();
+        i.cache
+            .lock()
+            .expect("fetcher cache mutex poisoned")
+            .insert(
+                url.to_string(),
+                CacheEntry::Done {
+                    fetched_at: Instant::now(),
+                    body: body.to_string(),
+                },
+            );
+    }
+
+    /// Seed a cached error so the next `fetch(url)` returns
+    /// `FetchResult::Error(body)` synchronously. Useful for exercising
+    /// the IFERROR-traps-GET path without depending on a flaky upstream.
+    pub(crate) fn seed_error(url: &str, body: &str) {
+        let i = inner();
+        i.cache
+            .lock()
+            .expect("fetcher cache mutex poisoned")
+            .insert(
+                url.to_string(),
+                CacheEntry::Error {
+                    fetched_at: Instant::now(),
+                    body: body.to_string(),
+                },
+            );
+    }
+
+    /// Park `url` in the Loading state so the next `fetch(url)` returns
+    /// `FetchResult::Loading` without enqueueing. Models the racy
+    /// in-flight window where two evals see Loading before the worker
+    /// publishes the result.
+    pub(crate) fn seed_loading(url: &str) {
+        let i = inner();
+        i.cache
+            .lock()
+            .expect("fetcher cache mutex poisoned")
+            .insert(url.to_string(), CacheEntry::Loading);
+    }
+
+    /// True if `url` currently has a Loading entry — i.e. a fetch is
+    /// in flight (or seeded as such). Used to assert that `fetch()`
+    /// enqueued a request on first call.
+    pub(crate) fn is_loading(url: &str) -> bool {
+        let i = inner();
+        matches!(
+            i.cache.lock().expect("fetcher cache mutex poisoned").get(url),
+            Some(CacheEntry::Loading)
+        )
+    }
+
+    /// Drop a single URL from the cache. Lets tests reset just their
+    /// own seeded entry without nuking the global cache (which the
+    /// parallel test runner is sharing).
+    pub(crate) fn forget(url: &str) {
+        let i = inner();
+        i.cache
+            .lock()
+            .expect("fetcher cache mutex poisoned")
+            .remove(url);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
