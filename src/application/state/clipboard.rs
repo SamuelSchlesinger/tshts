@@ -137,7 +137,10 @@ impl App {
         });
         // Clear the cut cells and notify cross-sheet listeners so any
         // formula on another sheet that referenced these now goes stale.
+        // Route the clears through `clear_cells_on_active` so the dirty
+        // set is populated (single workbook call, one cross-sheet pass).
         let mut batch = Vec::new();
+        let mut positions: Vec<(usize, usize)> = Vec::new();
         for row in start_row..=end_row {
             for col in start_col..=end_col {
                 let old = if self.workbook.current_sheet().cells.contains_key(&(row, col)) {
@@ -147,10 +150,12 @@ impl App {
                 };
                 if old.is_some() {
                     batch.push(UndoAction::CellModified { row, col, old_cell: old, new_cell: None });
-                    self.workbook.current_sheet_mut().clear_cell(row, col);
-                    self.propagate_cell_change(row, col);
+                    positions.push((row, col));
                 }
             }
+        }
+        if !positions.is_empty() {
+            self.workbook.clear_cells_on_active(positions);
         }
         if !batch.is_empty() {
             self.record_action(UndoAction::Batch(batch));

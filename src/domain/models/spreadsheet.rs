@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use super::*;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Spreadsheet {
     /// Cell data stored as a sparse matrix using (row, col) coordinates
     #[serde(serialize_with = "serialize_cells", deserialize_with = "deserialize_cells")]
@@ -52,12 +52,41 @@ pub struct Spreadsheet {
     /// on first lookup; invalidated wholesale on any cell mutation or rule
     /// change. Refcell so `conditional_style_for(&self)` can write.
     #[serde(skip)]
-    pub cf_cache: std::cell::RefCell<HashMap<(usize, usize), Option<CellStyle>>>,
+    pub cf_cache: std::sync::Mutex<HashMap<(usize, usize), Option<CellStyle>>>,
     /// Persistent view state for this sheet. Save/load round-trips freezes,
     /// hidden rows/cols, filter criteria, and per-column data-validation
     /// rules so reopening a workbook restores the user's full workspace.
     #[serde(default)]
     pub view_state: SheetViewState,
+}
+
+impl Clone for Spreadsheet {
+    /// `Mutex<HashMap>` doesn't implement `Clone`. We hand-roll the impl
+    /// so cloning a Spreadsheet snapshots the cells and other persistent
+    /// state but DROPS the conditional-format cache — the cache is a
+    /// render-time memoization that the clone will re-populate as
+    /// needed. Dropping it also keeps the Sync property: the snapshot
+    /// can be shared across rayon workers without contending on the
+    /// cache's mutex (workers don't render).
+    fn clone(&self) -> Self {
+        Self {
+            cells: self.cells.clone(),
+            rows: self.rows,
+            cols: self.cols,
+            column_widths: self.column_widths.clone(),
+            default_column_width: self.default_column_width,
+            dependents: self.dependents.clone(),
+            dependencies: self.dependencies.clone(),
+            named_ranges: self.named_ranges.clone(),
+            conditional_formats: self.conditional_formats.clone(),
+            tables: self.tables.clone(),
+            iterative_calc: self.iterative_calc,
+            iter_max: self.iter_max,
+            iter_epsilon: self.iter_epsilon,
+            cf_cache: std::sync::Mutex::new(HashMap::new()),
+            view_state: self.view_state.clone(),
+        }
+    }
 }
 
 /// Persistent per-sheet view state. The App keeps these on its struct for
@@ -133,7 +162,7 @@ impl Default for Spreadsheet {
             iterative_calc: false,
             iter_max: default_iter_max(),
             iter_epsilon: default_iter_epsilon(),
-            cf_cache: std::cell::RefCell::new(HashMap::new()),
+            cf_cache: std::sync::Mutex::new(HashMap::new()),
             view_state: SheetViewState::default(),
         }
     }
@@ -158,7 +187,7 @@ impl Spreadsheet {
         // Any cell mutation could change a CF predicate's evaluation
         // (because predicates can reference other cells too). Drop the
         // whole cache; reads will repopulate lazily.
-        self.cf_cache.borrow_mut().clear();
+        self.cf_cache.lock().unwrap().clear();
     }
 
     /// Writes a cell, updates the dependency graph, and recalculates dependents.
@@ -225,7 +254,7 @@ impl Spreadsheet {
     /// Clear any spill ghosts whose anchor is the given cell. Called before
     /// the cell is rewritten so we don't leak stale ghosts when the
     /// formula's array shape shrinks (or disappears entirely).
-    fn sweep_spill_ghosts_for(&mut self, anchor_row: usize, anchor_col: usize) {
+    pub(crate) fn sweep_spill_ghosts_for(&mut self, anchor_row: usize, anchor_col: usize) {
         let targets: Vec<(usize, usize)> = self
             .cells
             .iter()
@@ -245,7 +274,7 @@ impl Spreadsheet {
     /// After a cell write, if its formula evaluated to a multi-cell Array,
     /// expand the array into ghost cells. If any target overlaps a
     /// non-empty cell, set the anchor to `#SPILL!`.
-    fn maybe_spill(&mut self, row: usize, col: usize) {
+    pub(crate) fn maybe_spill(&mut self, row: usize, col: usize) {
         use crate::domain::parser::{Parser, Value, ExpressionEvaluator, FunctionRegistry};
         let formula = match self
             .cells
@@ -385,6 +414,73 @@ impl Spreadsheet {
         self.cells.remove(&(row, col));
         // Recalculate cells that depend on this cell
         self.recalculate_dependents(row, col);
+    }
+
+    /// Bulk-clear many cells with a single topological recalc at the
+    /// end. Symmetric counterpart of `set_many`. Calling
+    /// `clear_cell` in a loop is O(N²) for a chain because each
+    /// individual call cascades through downstream dependents; this
+    /// path does one cascade over the union of dependents.
+    pub fn clear_many(&mut self, positions: Vec<(usize, usize)>) {
+        if positions.is_empty() {
+            return;
+        }
+        for &(row, col) in &positions {
+            self.remove_cell_dependencies(row, col);
+            self.sweep_spill_ghosts_for(row, col);
+            self.cells.remove(&(row, col));
+        }
+        // Union of transitive dependents — recalc once.
+        let mut to_recalc = HashSet::new();
+        let mut queue = VecDeque::new();
+        for &(row, col) in &positions {
+            if let Some(deps) = self.dependents.get(&(row, col)).cloned() {
+                for dep in deps {
+                    queue.push_back(dep);
+                }
+            }
+        }
+        while let Some(dep) = queue.pop_front() {
+            if to_recalc.insert(dep)
+                && let Some(next) = self.dependents.get(&dep).cloned()
+            {
+                for n in next {
+                    queue.push_back(n);
+                }
+            }
+        }
+        if to_recalc.is_empty() {
+            return;
+        }
+        // Topological recalc: same Kahn's algorithm as set_many's loop.
+        let mut in_degree: HashMap<(usize, usize), usize> =
+            to_recalc.iter().map(|&c| (c, 0)).collect();
+        for &cell in &to_recalc {
+            if let Some(deps) = self.dependencies.get(&cell) {
+                for dep in deps {
+                    if to_recalc.contains(dep) {
+                        *in_degree.entry(cell).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+        let mut ready: VecDeque<_> = in_degree
+            .iter()
+            .filter_map(|(c, &d)| if d == 0 { Some(*c) } else { None })
+            .collect();
+        while let Some((r, c)) = ready.pop_front() {
+            self.recalculate_cell(r, c);
+            if let Some(downs) = self.dependents.get(&(r, c)).cloned() {
+                for dep in downs {
+                    if let Some(d) = in_degree.get_mut(&dep) {
+                        *d = d.saturating_sub(1);
+                        if *d == 0 {
+                            ready.push_back(dep);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Bulk-set many cells with a single topological recalc at the end.
@@ -1077,7 +1173,7 @@ impl Spreadsheet {
             return None;
         }
         // Cache hit?
-        if let Some(cached) = self.cf_cache.borrow().get(&(row, col)) {
+        if let Some(cached) = self.cf_cache.lock().unwrap().get(&(row, col)) {
             return cached.clone();
         }
         let cell = self.get_cell(row, col);
@@ -1108,7 +1204,7 @@ impl Spreadsheet {
                 result = Some(layer_style(result.unwrap_or_default(), &rule.style));
             }
         }
-        self.cf_cache.borrow_mut().insert((row, col), result.clone());
+        self.cf_cache.lock().unwrap().insert((row, col), result.clone());
         result
     }
 

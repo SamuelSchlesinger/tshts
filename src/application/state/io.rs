@@ -246,6 +246,12 @@ impl App {
         match result {
             Ok(spreadsheet) => {
                 *self.workbook.current_sheet_mut() = spreadsheet;
+                // Wholesale-replaced the sheet — none of the per-cell
+                // mutation paths fired, so dirty-set is empty. Mark
+                // everything on the active sheet so the next recalc covers
+                // the new values.
+                let name = self.workbook.sheet_names[self.workbook.active_sheet].clone();
+                self.workbook.mark_sheet_dirty(&name);
                 self.selected_row = 0;
                 self.selected_col = 0;
                 self.scroll_row = 0;

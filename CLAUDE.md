@@ -83,10 +83,29 @@ Gotchas when writing new PTY tests:
 - `Enter` commits an edit (cursor moves down to A2); `Esc` cancels it.
 - The harness uses a 30x120 screen; assertions on layout should respect that.
 
+## Calc engine architecture
+
+tshts ships two recalc engines that produce identical results:
+
+**Legacy per-sheet cascade**: `Spreadsheet::set_cell` triggers `recalculate_dependents` which BFSes the per-sheet `dependents` HashMap. Cross-sheet propagation runs as a separate `Workbook::propagate_cross_sheet_changes` pass. This is the path most user edits flow through (every `set_cell_on_active` / `write_cells_on_active` call).
+
+**Graph-driven level executor**: `Workbook::recalc_via_graph` builds the unified workbook-level dep graph (`WorkbookGraph`, keyed by stable `SheetId(u32)`), drains the dirty set, computes topological levels via Kahn's algorithm, and walks levels in order. Each level evaluates against an immutable workbook snapshot; results merge back at the level boundary. Used by `:recalc` (`App::recalc_all`).
+
+The executor is pluggable via the `RecalcExecutor` trait (`src/domain/services/executor.rs`):
+- `SequentialExecutor` — single-threaded reference impl.
+- `ParallelExecutor` — rayon-based; partitions each level by function purity, dispatches pure cells via `par_iter().with_min_len(64)`, runs structural-volatile (`INDIRECT`, `OFFSET`) and side-effecting (`GET`) cells serially within the level barrier. Falls back to sequential below `parallel_threshold`.
+
+`recalc_via_graph` auto-selects between the two: Parallel when any level has ≥ `TSHTS_PAR_THRESHOLD` cells (default 512), otherwise Sequential. Below that the per-level workbook clone dominates the parallel savings.
+
+**Tuning**: set `TSHTS_PAR_THRESHOLD=N` to change the parallel-dispatch cutoff. `RAYON_NUM_THREADS=N` controls worker count. `cargo bench --bench calc_engine` runs the archetype benchmarks (wide/deep/fanout × small/medium/large) so you can pick a threshold that matches your workload.
+
+**Known limitations**: cross-sheet cycles converge only within each sheet's iterative loop (workbook-level iterative fallback is unimplemented). `NOW()`/`TODAY()` read `SystemTime::now()` directly rather than the `RecalcContext` clock snapshot, so two clock-volatile cells in one pass may differ by a few microseconds. `OFFSET`/`INDIRECT` dependencies are computed conservatively from literal args — they don't track value-derived precedents and thus may miss recalc opportunities.
+
 ## Dependencies
 
 - **ratatui/crossterm** - Terminal UI
 - **serde/serde_json** - .tshts file serialization
 - **csv** - CSV import/export
 - **reqwest** (blocking) - GET() formula function
+- **rayon** - Work-stealing parallel iterator (used by `ParallelExecutor`)
 - **portable-pty/vt100** (dev) - PTY-based end-to-end test harness

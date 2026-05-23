@@ -12,6 +12,7 @@ mod refs;
 mod cell;
 mod spreadsheet;
 mod workbook;
+mod dep_graph;
 
 pub use style::{NumberFormat, TerminalColor, CellStyle, CellFormat, format_cell_value};
 pub use refs::{
@@ -24,6 +25,8 @@ pub use spreadsheet::{Spreadsheet, Table, ConditionalFormat, SheetViewState};
 pub use workbook::{Workbook, WORKBOOK_SCHEMA_VERSION};
 #[allow(unused_imports)]
 pub use workbook::CrossSheetKey;
+pub use dep_graph::{NodeKey, SheetId, TopoLevels, WorkbookGraph};
+pub use workbook::with_recalc_context;
 
 #[cfg(test)]
 mod tests {

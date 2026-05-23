@@ -5,11 +5,11 @@
 //! function is called from `registry::FunctionRegistry::register_builtin_functions`.
 
 #![allow(unused_imports)]
-use crate::domain::parser::{FunctionRegistry, Value, ErrorKind, flatten_args, shape_of, broadcast_binary, criteria_matches, add_commas, glob_match, date_to_serial, serial_to_date, parse_iso_date, days_in_month, today_serial, now_serial};
+use crate::domain::parser::{FunctionRegistry, FunctionPurity, Value, ErrorKind, flatten_args, shape_of, broadcast_binary, criteria_matches, add_commas, glob_match, date_to_serial, serial_to_date, parse_iso_date, days_in_month, today_serial, now_serial};
 
 /// Register all `web` builtin functions on `reg`.
 pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
-        reg.register_function("GET", |args| {
+        reg.register_function_with_purity("GET", |args| {
             if args.len() != 1 {
                 return Ok(Value::Error(ErrorKind::Value));
             }
@@ -28,5 +28,5 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
                 // the cause is usually a transient network issue.
                 FetchResult::Error(_) => Ok(Value::Error(ErrorKind::Value)),
             }
-        });
+        }, FunctionPurity::SideEffecting);
 }

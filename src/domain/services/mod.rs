@@ -85,10 +85,14 @@ where
 mod evaluator;
 mod autofill_pattern;
 mod csv;
+mod executor;
 
 pub use evaluator::FormulaEvaluator;
 pub use autofill_pattern::AutofillPattern;
 pub use csv::CsvExporter;
+pub use executor::{
+    CalcError, ParallelExecutor, RecalcContext, RecalcExecutor, RecalcPlan, SequentialExecutor,
+};
 
 #[cfg(test)]
 mod tests {

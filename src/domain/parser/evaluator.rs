@@ -3,6 +3,82 @@
 #![allow(unused_imports)]
 use super::*;
 
+/// Walk an AST and return the maximal [`FunctionPurity`] of any function
+/// it transitively calls. A formula is parallel-safe iff its purity is
+/// `Pure`, `VolatileClock`, or `VolatileRandom` — the executor uses
+/// this to partition a level into parallel-dispatchable cells and
+/// serial-only cells.
+///
+/// Lookup priority for a function call:
+/// 1. **Inline structural functions** (INDIRECT, OFFSET, CHOOSE) —
+///    hard-coded as `VolatileStructural` because they're handled inline
+///    in `ExpressionEvaluator::evaluate` rather than via the registry.
+/// 2. **Registry purity** for everything else.
+///
+/// The walker is conservative: when in doubt about a function's purity,
+/// returning the higher-impurity value is always safe (only constrains
+/// parallel dispatch more). Returning a lower-impurity value than the
+/// truth would be a correctness bug.
+pub fn formula_purity(expr: &Expr, registry: &FunctionRegistry) -> FunctionPurity {
+    let mut acc = FunctionPurity::Pure;
+    walk_purity(expr, registry, &mut acc);
+    acc
+}
+
+fn walk_purity(expr: &Expr, registry: &FunctionRegistry, acc: &mut FunctionPurity) {
+    match expr {
+        Expr::Number(_)
+        | Expr::String(_)
+        | Expr::CellRef(_)
+        | Expr::NamedRef(_)
+        | Expr::ErrorLit(_) => {}
+        Expr::Range(_, _) => {}
+        Expr::Binary { left, right, .. } => {
+            walk_purity(left, registry, acc);
+            walk_purity(right, registry, acc);
+        }
+        Expr::Unary { operand, .. } => {
+            walk_purity(operand, registry, acc);
+        }
+        Expr::FunctionCall { name, args } => {
+            let upper = name.to_uppercase();
+            // INDIRECT and OFFSET have inline handling in
+            // `ExpressionEvaluator::evaluate` rather than in the
+            // registry. The other classical Excel volatile-structural
+            // functions (CHOOSE, ROW, COLUMN, FORMULATEXT, CELL, INFO,
+            // HYPERLINK) aren't yet implemented in tshts — they'd
+            // error before reaching here. Keep the list narrow to
+            // reflect actual coverage; widen as those functions land.
+            let inline_volatile_structural = matches!(
+                upper.as_str(),
+                "INDIRECT" | "OFFSET"
+            );
+            if inline_volatile_structural {
+                *acc = acc.join(FunctionPurity::VolatileStructural);
+            } else {
+                *acc = acc.join(registry.purity(&upper));
+            }
+            for a in args {
+                walk_purity(a, registry, acc);
+            }
+        }
+        Expr::Lambda { body, .. } => walk_purity(body, registry, acc),
+        Expr::Let { bindings, body } => {
+            for (_, v) in bindings {
+                walk_purity(v, registry, acc);
+            }
+            walk_purity(body, registry, acc);
+        }
+        Expr::ArrayLiteral { rows } => {
+            for row in rows {
+                for cell in row {
+                    walk_purity(cell, registry, acc);
+                }
+            }
+        }
+    }
+}
+
 /// Compare two values for ordering. Numbers compare numerically (with the
 /// same float-tolerance as `=`); strings compare lexicographically and
 /// case-insensitively (Excel convention). Mixed numeric/text uses Excel's

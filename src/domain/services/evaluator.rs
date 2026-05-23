@@ -1452,6 +1452,555 @@ mod tests {
             "Sheet2!B1 (same-sheet dependent of Sheet2!A1) should cascade");
     }
 
+    /// PR 0: dirty-set populated by mutation paths, drained on read.
+    /// No behavior change — the executor that uses this lands in PR 1+.
+    #[test]
+    fn test_workbook_dirty_set_populated_and_drained() {
+        use crate::domain::Workbook;
+        let mut wb = Workbook::default();
+        wb.add_sheet("S2".to_string());
+
+        assert!(wb.dirty_is_empty(), "fresh workbook has nothing dirty");
+
+        wb.set_cell_on_active(0, 0, CellData {
+            value: "1".to_string(), formula: None, format: None,
+            comment: None, spill_anchor: None,
+        });
+        assert!(!wb.dirty_is_empty(), "set_cell_on_active marks dirty");
+
+        let drained = wb.drain_dirty();
+        assert!(drained.contains(&("Sheet1".to_string(), 0, 0)));
+        assert!(wb.dirty_is_empty(), "drain_dirty empties the set");
+
+        // No-op write doesn't re-dirty (identical CellData)
+        wb.set_cell_on_active(0, 0, CellData {
+            value: "1".to_string(), formula: None, format: None,
+            comment: None, spill_anchor: None,
+        });
+        assert!(wb.dirty_is_empty(), "no-op set_cell_on_active does not dirty");
+
+        // Clearing an already-empty cell doesn't dirty
+        wb.clear_cell_on_active(5, 5);
+        assert!(wb.dirty_is_empty(), "clearing absent cell does not dirty");
+
+        // Batch write
+        wb.write_cells_on_active(vec![
+            (1, 0, CellData { value: "2".to_string(), formula: None, format: None, comment: None, spill_anchor: None }),
+            (1, 1, CellData { value: "3".to_string(), formula: None, format: None, comment: None, spill_anchor: None }),
+        ]);
+        assert_eq!(wb.dirty.len(), 2, "write_cells_on_active marks each cell");
+
+        // Clear: also dirties
+        wb.drain_dirty();
+        wb.clear_cell_on_active(1, 0);
+        wb.clear_cells_on_active(vec![(1, 1)]);
+        assert_eq!(wb.dirty.len(), 2, "clear paths also dirty cells");
+
+        // Structural edits dirty AFTER shift — keys reflect new coords.
+        wb.drain_dirty();
+        wb.set_cell_on_active(2, 0, CellData {
+            value: "5".to_string(),
+            formula: Some("=A1".to_string()),
+            format: None, comment: None, spill_anchor: None,
+        });
+        wb.drain_dirty();
+        wb.insert_row_on_active(0); // formula at row 2 should now be at row 3
+        assert!(!wb.dirty_is_empty(), "insert_row marks formula cells dirty");
+        assert!(
+            wb.dirty.iter().any(|k| k.0 == "Sheet1" && k.1 == 3 && k.2 == 0),
+            "insert_row dirty key uses POST-shift coords (row 3, not 2)"
+        );
+
+        // Rename: leave a formula cell in place; verify the dirty entries
+        // land under the NEW name (not re-introduced under the old one).
+        wb.drain_dirty();
+        wb.rename_sheet("Renamed".to_string());
+        assert!(
+            !wb.dirty.iter().any(|k| k.0.eq_ignore_ascii_case("Sheet1")),
+            "rename clears old-name dirty entries"
+        );
+        assert!(
+            wb.dirty.iter().any(|k| k.0 == "Renamed"),
+            "rename re-dirties formula cells under new name"
+        );
+
+        // set_name / remove_name dirty too (formulas may reference the name).
+        wb.drain_dirty();
+        wb.set_name("MyRange", "A1:A10");
+        assert!(!wb.dirty_is_empty(), "set_name dirties formula cells");
+        wb.drain_dirty();
+        wb.remove_name("MyRange");
+        assert!(!wb.dirty_is_empty(), "remove_name dirties formula cells");
+    }
+
+    /// PR 1: WorkbookGraph captures the same dep structure as the legacy
+    /// per-sheet + cross-sheet graphs.
+    #[test]
+    fn test_workbook_graph_captures_same_and_cross_sheet_deps() {
+        use crate::domain::Workbook;
+        use crate::domain::models::SheetId;
+
+        let mut wb = Workbook::default();
+        wb.add_sheet("S2".to_string());
+        wb.sheets[0].set_cell(0, 0, CellData {
+            value: "10".to_string(), formula: None, format: None,
+            comment: None, spill_anchor: None,
+        });
+        wb.sheets[0].set_cell(1, 0, CellData {
+            value: "11".to_string(),
+            formula: Some("=A1+1".to_string()),
+            format: None, comment: None, spill_anchor: None,
+        });
+        wb.sheets[1].set_cell(0, 0, CellData {
+            value: "10".to_string(),
+            formula: Some("=Sheet1!A1".to_string()),
+            format: None, comment: None, spill_anchor: None,
+        });
+        wb.sheets[1].set_cell(1, 0, CellData {
+            value: "20".to_string(),
+            formula: Some("=A1*2".to_string()),
+            format: None, comment: None, spill_anchor: None,
+        });
+        wb.build_dep_graph_from_scratch();
+
+        let s1_a1 = (SheetId(0), 0, 0);
+        let s1_a2 = (SheetId(0), 1, 0);
+        let s2_a1 = (SheetId(1), 0, 0);
+        let s2_a2 = (SheetId(1), 1, 0);
+
+        assert!(wb.graph.dependencies[&s1_a2].contains(&s1_a1),
+            "Sheet1!A2 depends on Sheet1!A1");
+        assert!(wb.graph.dependents[&s1_a1].contains(&s1_a2));
+        assert!(wb.graph.dependencies[&s2_a1].contains(&s1_a1),
+            "Sheet2!A1 depends on Sheet1!A1 (cross-sheet)");
+        assert!(wb.graph.dependents[&s1_a1].contains(&s2_a1));
+        assert!(wb.graph.dependencies[&s2_a2].contains(&s2_a1),
+            "Sheet2!A2 depends on Sheet2!A1 (same-sheet on S2)");
+        assert!(wb.graph.dependents[&s2_a1].contains(&s2_a2));
+    }
+
+    /// Topo levels respect the cross-sheet edges.
+    #[test]
+    fn test_workbook_graph_topo_levels_seeded_at_root() {
+        use crate::domain::Workbook;
+        use crate::domain::models::SheetId;
+        use std::collections::HashSet;
+
+        let mut wb = Workbook::default();
+        wb.add_sheet("S2".to_string());
+        wb.sheets[0].set_cell(0, 0, CellData {
+            value: "10".to_string(), formula: None, format: None,
+            comment: None, spill_anchor: None,
+        });
+        wb.sheets[0].set_cell(1, 0, CellData {
+            value: "11".to_string(),
+            formula: Some("=A1+1".to_string()),
+            format: None, comment: None, spill_anchor: None,
+        });
+        wb.sheets[1].set_cell(0, 0, CellData {
+            value: "10".to_string(),
+            formula: Some("=Sheet1!A1".to_string()),
+            format: None, comment: None, spill_anchor: None,
+        });
+        wb.sheets[1].set_cell(1, 0, CellData {
+            value: "20".to_string(),
+            formula: Some("=A1*2".to_string()),
+            format: None, comment: None, spill_anchor: None,
+        });
+        wb.build_dep_graph_from_scratch();
+
+        let s1_a1 = (SheetId(0), 0, 0);
+        let seeds: HashSet<_> = [s1_a1].into_iter().collect();
+        let levels = wb.graph.topo_levels_from_seeds(&seeds);
+        assert!(levels.cyclic.is_empty(), "no cycles expected");
+        assert_eq!(levels.levels[0].len(), 1);
+        assert_eq!(levels.levels[0][0], s1_a1);
+
+        let s1_a2 = (SheetId(0), 1, 0);
+        let s2_a1 = (SheetId(1), 0, 0);
+        let s2_a2 = (SheetId(1), 1, 0);
+        // S1!A2 and S2!A1 both depend only on S1!A1 → same level
+        assert!(levels.levels[1].contains(&s1_a2));
+        assert!(levels.levels[1].contains(&s2_a1));
+        // S2!A2 depends on S2!A1 → strictly later
+        let s2_a2_level = levels.levels.iter().position(|l| l.contains(&s2_a2));
+        let s2_a1_level = levels.levels.iter().position(|l| l.contains(&s2_a1));
+        assert!(s2_a2_level > s2_a1_level);
+    }
+
+    /// `recalc_via_graph` produces correct values for a mixed
+    /// same-sheet + cross-sheet dependency graph. PR 3 will swap this
+    /// in for the live recalc path.
+    #[test]
+    fn test_recalc_via_graph_propagates_through_levels() {
+        use crate::domain::Workbook;
+
+        let mut wb = Workbook::default();
+        wb.add_sheet("S2".to_string());
+        // Sheet1!A1 = 10 (raw)
+        wb.sheets[0].cells.insert((0, 0), CellData {
+            value: "10".to_string(), formula: None, format: None,
+            comment: None, spill_anchor: None,
+        });
+        // Sheet1!A2 = =A1+1 (formula, stale value)
+        wb.sheets[0].cells.insert((1, 0), CellData {
+            value: "STALE".to_string(),
+            formula: Some("=A1+1".to_string()),
+            format: None, comment: None, spill_anchor: None,
+        });
+        // Sheet2!A1 = =Sheet1!A1*10
+        wb.sheets[1].cells.insert((0, 0), CellData {
+            value: "STALE".to_string(),
+            formula: Some("=Sheet1!A1*10".to_string()),
+            format: None, comment: None, spill_anchor: None,
+        });
+        // Sheet2!A2 = =A1+5 (depends on Sheet2!A1)
+        wb.sheets[1].cells.insert((1, 0), CellData {
+            value: "STALE".to_string(),
+            formula: Some("=A1+5".to_string()),
+            format: None, comment: None, spill_anchor: None,
+        });
+        // Sheet1!B1 = =A2*2 (depends on Sheet1!A2)
+        wb.sheets[0].cells.insert((0, 1), CellData {
+            value: "STALE".to_string(),
+            formula: Some("=A2*2".to_string()),
+            format: None, comment: None, spill_anchor: None,
+        });
+        // Seed: Sheet1!A1 just got set. Mark dirty + recalc.
+        wb.mark_dirty("Sheet1", 0, 0);
+        wb.recalc_via_graph();
+
+        // Sheet1!A2 = 10 + 1 = 11
+        assert_eq!(wb.sheets[0].get_cell(1, 0).value, "11");
+        // Sheet1!B1 = 11 * 2 = 22 — depends on Sheet1!A2, which depends
+        // on Sheet1!A1. Two levels deep.
+        assert_eq!(wb.sheets[0].get_cell(0, 1).value, "22");
+        // Sheet2!A1 = 10 * 10 = 100 — cross-sheet ref.
+        assert_eq!(wb.sheets[1].get_cell(0, 0).value, "100");
+        // Sheet2!A2 = 100 + 5 = 105 — same-sheet dep on Sheet2!A1,
+        // which is itself downstream of Sheet1!A1.
+        assert_eq!(wb.sheets[1].get_cell(1, 0).value, "105");
+    }
+
+    /// Regression: Batch::apply / revert must be O(N) not O(N²). With
+    /// 200 chained cells, a naive per-cell cascade-on-restore would
+    /// take ~40k re-evaluations. The bulk path does 200 writes + 1
+    /// graph-driven recalc = 200 evaluations.
+    ///
+    /// We don't assert wall-clock (flaky) but we do assert that the
+    /// after-undo state matches the after-redo state, which exercises
+    /// the bulk-restore path through both apply and revert.
+    #[test]
+    fn test_batch_undo_redo_chain_is_correct() {
+        use crate::application::{App, UndoAction};
+        let mut app = App::default();
+        // Build a chain: A1=1, A2==A1+1, A3==A2+1, ..., A50==A49+1.
+        let n = 50;
+        let mut writes: Vec<(usize, usize, CellData)> = Vec::with_capacity(n);
+        writes.push((0, 0, CellData {
+            value: "1".to_string(), formula: None, format: None,
+            comment: None, spill_anchor: None,
+        }));
+        for i in 1..n {
+            writes.push((i, 0, CellData {
+                value: format!("{}", i + 1),
+                formula: Some(format!("=A{}+1", i)),
+                format: None, comment: None, spill_anchor: None,
+            }));
+        }
+        // Apply as a single batch (use set_many_with_undo which produces
+        // a Batch undo entry).
+        app.set_many_with_undo(writes);
+        // Verify all values present.
+        for i in 0..n {
+            assert_eq!(
+                app.workbook.sheets[0].get_cell(i, 0).value,
+                format!("{}", i + 1),
+                "row {} pre-undo", i
+            );
+        }
+        // Undo the batch — should restore the empty workbook.
+        app.undo();
+        for i in 0..n {
+            assert!(
+                !app.workbook.sheets[0].cells.contains_key(&(i, 0)),
+                "row {} should be cleared after undo", i
+            );
+        }
+        // Redo — every cell should reappear with the correct value.
+        app.redo();
+        for i in 0..n {
+            assert_eq!(
+                app.workbook.sheets[0].get_cell(i, 0).value,
+                format!("{}", i + 1),
+                "row {} post-redo", i
+            );
+        }
+    }
+
+    /// `recalc_via_graph` with empty dirty is a no-op (no panics).
+    #[test]
+    fn test_recalc_via_graph_no_op_when_clean() {
+        use crate::domain::Workbook;
+        let mut wb = Workbook::default();
+        wb.sheets[0].cells.insert((0, 0), CellData {
+            value: "5".to_string(),
+            formula: Some("=2+3".to_string()),
+            format: None, comment: None, spill_anchor: None,
+        });
+        // Don't mark dirty.
+        wb.recalc_via_graph();
+        // Value unchanged.
+        assert_eq!(wb.sheets[0].get_cell(0, 0).value, "5");
+    }
+
+    /// `recalc_via_graph` silently drops dirty entries whose sheet was
+    /// removed, never panics.
+    #[test]
+    fn test_recalc_via_graph_handles_dirty_for_removed_sheet() {
+        use crate::domain::Workbook;
+        let mut wb = Workbook::default();
+        // Mark a dirty entry for a sheet that doesn't exist.
+        wb.mark_dirty("Nonexistent", 0, 0);
+        // Should not panic.
+        wb.recalc_via_graph();
+        // No values changed.
+        assert!(wb.sheets[0].cells.is_empty());
+    }
+
+    /// `set_prereqs` replaces a node's outgoing edges. The legacy `link`
+    /// would have ADDED on top of existing edges; the new safe API
+    /// clears first.
+    #[test]
+    fn test_dep_graph_set_prereqs_replaces_edges() {
+        use crate::domain::models::{SheetId, WorkbookGraph};
+        let mut g = WorkbookGraph::new();
+        let a = (SheetId(0), 0, 0);
+        let b = (SheetId(0), 0, 1);
+        let c = (SheetId(0), 0, 2);
+        let target = (SheetId(0), 1, 0);
+        // Initial: target depends on a AND b.
+        g.set_prereqs(target, [a, b]);
+        assert!(g.dependencies[&target].contains(&a));
+        assert!(g.dependencies[&target].contains(&b));
+        // Replace: target depends ONLY on c.
+        g.set_prereqs(target, [c]);
+        let deps = &g.dependencies[&target];
+        assert!(deps.contains(&c));
+        assert!(!deps.contains(&a), "old a→target edge should be gone");
+        assert!(!deps.contains(&b), "old b→target edge should be gone");
+        // Reverse edges from a/b should be cleaned up.
+        assert!(!g.dependents.contains_key(&a));
+        assert!(!g.dependents.contains_key(&b));
+    }
+
+    /// `recalc_via_graph` invokes `maybe_spill` so array-valued formulas
+    /// produce ghost cells after the new engine runs.
+    #[test]
+    fn test_recalc_via_graph_invokes_spill() {
+        use crate::domain::Workbook;
+        let mut wb = Workbook::default();
+        wb.sheets[0].cells.insert((0, 0), CellData {
+            value: "STALE".to_string(),
+            formula: Some("=SEQUENCE(3,1)".to_string()),
+            format: None, comment: None, spill_anchor: None,
+        });
+        wb.mark_dirty("Sheet1", 0, 0);
+        wb.recalc_via_graph();
+        // Anchor cell evaluates to first element.
+        assert_eq!(wb.sheets[0].get_cell(0, 0).value, "1");
+        // Ghost cells exist (sheet has more cells than just A1).
+        assert!(wb.sheets[0].cells.len() > 1,
+            "spill should have created ghost cells; got {} cells",
+            wb.sheets[0].cells.len());
+        // The ghosts carry the spill_anchor back-pointer.
+        let a2 = wb.sheets[0].get_cell(1, 0);
+        assert_eq!(a2.spill_anchor, Some((0, 0)));
+    }
+
+    /// `remove_sheet` purges the workbook graph so re-adding doesn't
+    /// inherit dead nodes.
+    #[test]
+    fn test_remove_sheet_purges_dep_graph() {
+        use crate::domain::Workbook;
+        use crate::domain::models::SheetId;
+        let mut wb = Workbook::default();
+        wb.add_sheet("S2".to_string());
+        // Put a formula on S2 that depends on Sheet1!A1.
+        wb.sheets[1].cells.insert((0, 0), CellData {
+            value: "1".to_string(),
+            formula: Some("=Sheet1!A1".to_string()),
+            format: None, comment: None, spill_anchor: None,
+        });
+        wb.build_dep_graph_from_scratch();
+        let s1_a1 = (SheetId(0), 0, 0);
+        let s2_a1 = (SheetId(1), 0, 0);
+        // Graph has an edge.
+        assert!(wb.graph.dependents[&s1_a1].contains(&s2_a1));
+        // Remove S2.
+        wb.remove_sheet(1);
+        // The s2_a1 node should be gone from the graph.
+        assert!(!wb.graph.dependencies.contains_key(&s2_a1),
+            "s2_a1 still has outgoing edges after sheet removal");
+        // s1_a1's dependents shouldn't list a dead node.
+        if let Some(deps) = wb.graph.dependents.get(&s1_a1) {
+            assert!(!deps.contains(&s2_a1));
+        }
+    }
+
+    /// PR 2: purity classification for built-in functions and AST walker.
+    #[test]
+    fn test_function_purity_classification() {
+        use crate::domain::parser::{FunctionPurity, FunctionRegistry, Parser, formula_purity};
+        let reg = FunctionRegistry::new();
+
+        // Direct lookups
+        assert_eq!(reg.purity("SUM"), FunctionPurity::Pure);
+        assert_eq!(reg.purity("ABS"), FunctionPurity::Pure);
+        assert_eq!(reg.purity("NOW"), FunctionPurity::VolatileClock);
+        assert_eq!(reg.purity("TODAY"), FunctionPurity::VolatileClock);
+        assert_eq!(reg.purity("RAND"), FunctionPurity::VolatileRandom);
+        assert_eq!(reg.purity("RANDBETWEEN"), FunctionPurity::VolatileRandom);
+        assert_eq!(reg.purity("GET"), FunctionPurity::SideEffecting);
+        // Unknown function: defaults to Pure (the formula will error
+        // elsewhere if the name is invalid).
+        assert_eq!(reg.purity("NOTREALFN"), FunctionPurity::Pure);
+
+        // Case-insensitive
+        assert_eq!(reg.purity("rand"), FunctionPurity::VolatileRandom);
+        assert_eq!(reg.purity("rAnD"), FunctionPurity::VolatileRandom);
+
+        // AST walker: composition follows the lattice join.
+        fn purity_of(formula: &str, reg: &FunctionRegistry) -> FunctionPurity {
+            let mut p = Parser::new(formula).expect("parse");
+            let ast = p.parse().expect("parse");
+            formula_purity(&ast, reg)
+        }
+
+        assert_eq!(purity_of("1+2", &reg), FunctionPurity::Pure);
+        assert_eq!(purity_of("SUM(A1:A10)", &reg), FunctionPurity::Pure);
+        assert_eq!(purity_of("NOW()", &reg), FunctionPurity::VolatileClock);
+        assert_eq!(purity_of("RAND()", &reg), FunctionPurity::VolatileRandom);
+        // Join: Clock + Random → Random (the higher of the two).
+        assert_eq!(
+            purity_of("NOW()+RAND()", &reg),
+            FunctionPurity::VolatileRandom
+        );
+        // INDIRECT and OFFSET are hard-coded VolatileStructural in the
+        // walker since they're handled inline.
+        assert_eq!(
+            purity_of("INDIRECT(\"A1\")", &reg),
+            FunctionPurity::VolatileStructural
+        );
+        assert_eq!(
+            purity_of("OFFSET(A1, 1, 0)", &reg),
+            FunctionPurity::VolatileStructural
+        );
+        // SideEffecting wins all joins.
+        assert_eq!(
+            purity_of("IF(GET(\"u\")=\"x\", NOW(), RAND())", &reg),
+            FunctionPurity::SideEffecting
+        );
+        // Pure nested inside volatile still bubbles up.
+        assert_eq!(
+            purity_of("SUM(RAND(), 1, 2)", &reg),
+            FunctionPurity::VolatileRandom
+        );
+    }
+
+    /// `build_dep_graph_from_scratch` populates `cell_purities`.
+    #[test]
+    fn test_workbook_cell_purity_cache_populated() {
+        use crate::domain::Workbook;
+        use crate::domain::parser::FunctionPurity;
+        use crate::domain::models::SheetId;
+        let mut wb = Workbook::default();
+        wb.sheets[0].cells.insert((0, 0), CellData {
+            value: "1".to_string(), formula: None, format: None,
+            comment: None, spill_anchor: None,
+        });
+        wb.sheets[0].cells.insert((1, 0), CellData {
+            value: "3".to_string(),
+            formula: Some("=SUM(A1, 2)".to_string()),
+            format: None, comment: None, spill_anchor: None,
+        });
+        wb.sheets[0].cells.insert((2, 0), CellData {
+            value: "0".to_string(),
+            formula: Some("=RAND()".to_string()),
+            format: None, comment: None, spill_anchor: None,
+        });
+        wb.sheets[0].cells.insert((3, 0), CellData {
+            value: "0".to_string(),
+            formula: Some("=NOW()".to_string()),
+            format: None, comment: None, spill_anchor: None,
+        });
+        wb.sheets[0].cells.insert((4, 0), CellData {
+            value: "0".to_string(),
+            formula: Some("=OFFSET(A1, 0, 0)".to_string()),
+            format: None, comment: None, spill_anchor: None,
+        });
+        wb.build_dep_graph_from_scratch();
+
+        assert_eq!(wb.cell_purity((SheetId(0), 0, 0)), FunctionPurity::Pure);
+        assert_eq!(wb.cell_purity((SheetId(0), 1, 0)), FunctionPurity::Pure);
+        assert_eq!(wb.cell_purity((SheetId(0), 2, 0)), FunctionPurity::VolatileRandom);
+        assert_eq!(wb.cell_purity((SheetId(0), 3, 0)), FunctionPurity::VolatileClock);
+        assert_eq!(wb.cell_purity((SheetId(0), 4, 0)), FunctionPurity::VolatileStructural);
+        assert_eq!(wb.cell_purities.len(), 3,
+            "only volatile cells get explicit entries");
+    }
+
+    /// is_parallel_safe / is_volatile contracts.
+    #[test]
+    fn test_function_purity_predicates() {
+        use crate::domain::parser::FunctionPurity;
+        assert!(FunctionPurity::Pure.is_parallel_safe());
+        assert!(FunctionPurity::VolatileClock.is_parallel_safe());
+        assert!(FunctionPurity::VolatileRandom.is_parallel_safe());
+        assert!(!FunctionPurity::VolatileStructural.is_parallel_safe());
+        assert!(!FunctionPurity::SideEffecting.is_parallel_safe());
+
+        assert!(!FunctionPurity::Pure.is_volatile());
+        assert!(FunctionPurity::VolatileClock.is_volatile());
+        assert!(FunctionPurity::VolatileStructural.is_volatile());
+        assert!(FunctionPurity::VolatileRandom.is_volatile());
+        assert!(FunctionPurity::SideEffecting.is_volatile());
+
+        // Lattice ordering: Pure < Clock < Structural < Random < SideEffecting
+        assert!(FunctionPurity::Pure < FunctionPurity::VolatileClock);
+        assert!(FunctionPurity::VolatileClock < FunctionPurity::VolatileStructural);
+        assert!(FunctionPurity::VolatileStructural < FunctionPurity::VolatileRandom);
+        assert!(FunctionPurity::VolatileRandom < FunctionPurity::SideEffecting);
+    }
+
+    /// SheetId allocation: monotonic, never reused.
+    #[test]
+    fn test_sheet_id_allocation_monotonic_no_reuse() {
+        use crate::domain::Workbook;
+        use crate::domain::models::SheetId;
+
+        let mut wb = Workbook::default();
+        assert_eq!(wb.sheet_id_at(0), Some(SheetId(0)));
+
+        wb.add_sheet("S2".to_string());
+        assert_eq!(wb.sheet_id_at(1), Some(SheetId(1)));
+
+        wb.add_sheet("S3".to_string());
+        assert_eq!(wb.sheet_id_at(2), Some(SheetId(2)));
+
+        // Remove S2: indices shift but the surviving sheet keeps its ID.
+        wb.remove_sheet(1);
+        assert_eq!(wb.sheet_id_at(0), Some(SheetId(0)));
+        assert_eq!(wb.sheet_id_at(1), Some(SheetId(2)));
+
+        // New sheet allocates ID 3 — does NOT reuse 1.
+        wb.add_sheet("S4".to_string());
+        assert_eq!(wb.sheet_id_at(2), Some(SheetId(3)));
+
+        // The dead ID no longer resolves.
+        assert!(wb.sheet_name_of(SheetId(1)).is_none());
+    }
+
     #[test]
     fn test_cross_sheet_range() {
         use crate::domain::Workbook;
@@ -2795,6 +3344,11 @@ mod tests {
             cross_sheet_dependents: Default::default(),
             cross_sheet_dependencies: Default::default(),
             cells_with_qualified_refs: Default::default(),
+            dirty: Default::default(),
+            sheet_ids: Vec::new(),
+            next_sheet_id: 0,
+            graph: Default::default(),
+            cell_purities: Default::default(),
         };
         let dir = std::env::temp_dir();
         let path = dir.join("empty_sheets_named_ranges.tshts");
@@ -2819,6 +3373,11 @@ mod tests {
             cross_sheet_dependents: Default::default(),
             cross_sheet_dependencies: Default::default(),
             cells_with_qualified_refs: Default::default(),
+            dirty: Default::default(),
+            sheet_ids: Vec::new(),
+            next_sheet_id: 0,
+            graph: Default::default(),
+            cell_purities: Default::default(),
         };
         wb.sheets[0].set_cell(0, 0, CellData { value: "ok".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
         let dir = std::env::temp_dir();
@@ -2878,6 +3437,11 @@ mod tests {
             cross_sheet_dependents: Default::default(),
             cross_sheet_dependencies: Default::default(),
             cells_with_qualified_refs: Default::default(),
+            dirty: Default::default(),
+            sheet_ids: Vec::new(),
+            next_sheet_id: 0,
+            graph: Default::default(),
+            cell_purities: Default::default(),
         };
         let dir = std::env::temp_dir();
         let path = dir.join("future_version.tshts");
@@ -2919,6 +3483,11 @@ mod tests {
             cross_sheet_dependents: Default::default(),
             cross_sheet_dependencies: Default::default(),
             cells_with_qualified_refs: Default::default(),
+            dirty: Default::default(),
+            sheet_ids: Vec::new(),
+            next_sheet_id: 0,
+            graph: Default::default(),
+            cell_purities: Default::default(),
         };
         let dir = std::env::temp_dir();
         let path = dir.join("agent4_mismatched_names.tshts");

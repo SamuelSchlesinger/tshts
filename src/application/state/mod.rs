@@ -205,8 +205,27 @@ impl UndoAction {
                 restore_cell(workbook, *row, *col, old_cell.as_ref());
             }
             UndoAction::Batch(actions) => {
+                // O(N) batch revert: write every cell directly (no
+                // per-cell cascade), mark dirty, then run a single
+                // graph-driven recalc. The naive loop-and-cascade
+                // approach would be O(N²) for a chain — undo of a
+                // 10k-cell replace_all would take ~15s rather than
+                // ~150ms.
+                batch_apply_cells_then_recalc(workbook, actions.iter().rev(), |a| {
+                    if let UndoAction::CellModified { row, col, old_cell, .. } = a {
+                        Some((*row, *col, old_cell.clone()))
+                    } else {
+                        None
+                    }
+                });
+                // Non-CellModified actions inside the batch (rare today
+                // — most batches are pure CellModified) get the usual
+                // per-action revert. This is still O(actions) in the
+                // count of non-CellModified entries, which is bounded.
                 for a in actions.iter().rev() {
-                    a.revert(workbook);
+                    if !matches!(a, UndoAction::CellModified { .. }) {
+                        a.revert(workbook);
+                    }
                 }
             }
             UndoAction::ConditionalFormatsReplaced { sheet_idx, old, new: _ } => {
@@ -241,8 +260,19 @@ impl UndoAction {
                 restore_cell(workbook, *row, *col, new_cell.as_ref());
             }
             UndoAction::Batch(actions) => {
+                // O(N) batch apply — same shape as revert above. See
+                // `batch_apply_cells_then_recalc` for the rationale.
+                batch_apply_cells_then_recalc(workbook, actions.iter(), |a| {
+                    if let UndoAction::CellModified { row, col, new_cell, .. } = a {
+                        Some((*row, *col, new_cell.clone()))
+                    } else {
+                        None
+                    }
+                });
                 for a in actions {
-                    a.apply(workbook);
+                    if !matches!(a, UndoAction::CellModified { .. }) {
+                        a.apply(workbook);
+                    }
                 }
             }
             UndoAction::ConditionalFormatsReplaced { sheet_idx, old: _, new } => {
@@ -284,22 +314,86 @@ fn restore_workbook(workbook: &mut Workbook, pre: &Workbook) {
     for sheet in &mut workbook.sheets {
         sheet.resweep_all_spills();
     }
+    // Conservatively re-dirty every formula cell. The snapshot's `dirty`
+    // is unrelated to what's stale now (cells dirtied between the
+    // snapshot and this undo would otherwise be lost), and the
+    // wholesale-replace makes per-cell tracking unreliable.
+    workbook.mark_all_formula_cells_dirty();
 }
 
 /// Restore `(row, col)` to `data` (or clear if `None`), then propagate.
 /// Shared by `apply` and `revert` for `CellModified`.
 fn restore_cell(workbook: &mut Workbook, row: usize, col: usize, data: Option<&CellData>) {
+    // Route through the workbook chokepoints so the dirty set is
+    // populated; undo/redo were previously skipping dirty entirely.
     match data {
-        Some(d) => workbook.current_sheet_mut().set_cell(row, col, d.clone()),
-        None => workbook.current_sheet_mut().clear_cell(row, col),
+        Some(d) => workbook.set_cell_on_active(row, col, d.clone()),
+        None => workbook.clear_cell_on_active(row, col),
     }
     workbook.propagate_active_cell(row, col);
+}
+
+/// Bulk-apply CellModified-style entries from a batch in O(N) total —
+/// write every cell directly to the live workbook, mark the union
+/// dirty, then run a single graph-driven recalc. The naive
+/// `for a in batch { a.revert(wb) }` approach is O(N²) for a chain
+/// because each per-action revert triggers its own downstream cascade.
+///
+/// Generic over the iterator + projection so it can serve both apply
+/// (reads `new_cell`) and revert (reads `old_cell` in reverse order)
+/// without duplicating the body.
+fn batch_apply_cells_then_recalc<'a, I, F>(
+    workbook: &mut Workbook,
+    actions: I,
+    project: F,
+)
+where
+    I: Iterator<Item = &'a UndoAction>,
+    F: Fn(&'a UndoAction) -> Option<(usize, usize, Option<CellData>)>,
+{
+    let sheet_name = workbook.sheet_names[workbook.active_sheet].clone();
+    let active_idx = workbook.active_sheet;
+    let mut count = 0usize;
+    for a in actions {
+        if let Some((row, col, data)) = project(a) {
+            // Write the cell value directly into the active sheet's
+            // cells map. Skip set_cell so the per-sheet cascade
+            // doesn't fire; we'll do ONE recalc at the end.
+            let sheet = &mut workbook.sheets[active_idx];
+            match data {
+                Some(d) => {
+                    // sweep prior spill ghosts if this cell was an
+                    // anchor; the new cell may not be.
+                    sheet.sweep_spill_ghosts_for(row, col);
+                    sheet.cells.insert((row, col), d);
+                }
+                None => {
+                    sheet.sweep_spill_ghosts_for(row, col);
+                    sheet.cells.remove(&(row, col));
+                }
+            }
+            // Clear the CF cache once per write (cheap; render-only).
+            sheet.cf_cache.lock().unwrap().clear();
+            workbook.dirty.insert((sheet_name.clone(), row, col));
+            count += 1;
+        }
+    }
+    if count == 0 {
+        return;
+    }
+    // The legacy per-sheet dep graph needs rebuilding because we
+    // bypassed `add_cell_dependencies`. The unified graph gets
+    // rebuilt lazily inside recalc_via_graph.
+    workbook.sheets[active_idx].rebuild_dependencies();
+    workbook.rebuild_cross_sheet_deps();
+    workbook.build_dep_graph_from_scratch();
+    workbook.recalc_via_graph();
 }
 
 fn restore_cf(workbook: &mut Workbook, sheet_idx: usize, rules: &[crate::domain::ConditionalFormat]) {
     if let Some(sheet) = workbook.sheets.get_mut(sheet_idx) {
         sheet.conditional_formats = rules.to_vec();
-        sheet.cf_cache.borrow_mut().clear();
+        sheet.cf_cache.lock().unwrap().clear();
     }
 }
 
@@ -591,32 +685,32 @@ impl App {
     }
 
     pub fn recalc_all(&mut self) {
-        // Clone the workbook so we can give the evaluator a read-only view
-        // while mutating the originals. Cheap-ish: cells are Arc-free clones
-        // of strings + small metadata.
-        let wb_snapshot = self.workbook.clone();
-        let names = wb_snapshot.named_ranges.clone();
+        // PR 3/4 path: mark every formula cell dirty and let the
+        // graph-driven executor walk the topo levels. The dirty mark
+        // covers the case where the user manually invoked :recalc — we
+        // want to recompute everything even if mutation paths didn't
+        // touch a cell since last recalc (e.g. RAND should re-roll;
+        // NOW should pick up the current time).
         for (idx, sheet) in self.workbook.sheets.iter_mut().enumerate() {
+            // Keep the per-sheet dep graph in sync — the legacy cross-
+            // sheet engine still reads it, and `build_dep_graph_from_scratch`
+            // uses the per-sheet refs as input.
             sheet.rebuild_dependencies();
-            let cells: Vec<(usize, usize, String)> = sheet
-                .cells
-                .iter()
-                .filter_map(|(&(r, c), cd)| cd.formula.as_ref().map(|f| (r, c, f.clone())))
-                .collect();
-            let snap_sheet = &wb_snapshot.sheets[idx];
-            for (row, col, formula) in cells {
-                let evaluator =
-                    FormulaEvaluator::for_workbook(&wb_snapshot, snap_sheet, &names);
-                let value = evaluator.evaluate_formula(&formula);
-                let mut cd = sheet.get_cell(row, col);
-                cd.value = value;
-                sheet.cells.insert((row, col), cd);
+            // Mark every formula cell on this sheet dirty.
+            let name = self.workbook.sheet_names[idx].clone();
+            for (&(r, c), cd) in &sheet.cells {
+                if cd.formula.is_some() {
+                    self.workbook.dirty.insert((name.clone(), r, c));
+                }
             }
         }
-        // The cross-sheet dep graph is built off formulas; rebuild it after
-        // a recalc so any prior drift (e.g. graph populated before some
-        // sheets were loaded) is corrected.
+        // Rebuild the workbook dep graph in case it's stale (e.g. a
+        // load path that didn't pre-build, or a structural edit that
+        // invalidated entries).
+        self.workbook.build_dep_graph_from_scratch();
         self.workbook.rebuild_cross_sheet_deps();
+        // The unified executor drains dirty and walks topo levels.
+        self.workbook.recalc_via_graph();
         self.status_message = Some("Recalculated all formulas".to_string());
     }
 
@@ -721,6 +815,11 @@ impl App {
                 s.named_ranges.insert(key.clone(), value.clone());
             }
         }
+        // Named-range bounds shifted; any formula referencing this table
+        // by Table[Col] sees a different range. Conservative dirty mark
+        // — table-extends are rare (only fires when typing into the row
+        // immediately below an existing table).
+        self.workbook.mark_all_formula_cells_dirty();
     }
 
     pub fn set_cell_with_undo(&mut self, row: usize, col: usize, new_data: CellData) {

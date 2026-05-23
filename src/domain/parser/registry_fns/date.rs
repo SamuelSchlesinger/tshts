@@ -5,22 +5,22 @@
 //! function is called from `registry::FunctionRegistry::register_builtin_functions`.
 
 #![allow(unused_imports)]
-use crate::domain::parser::{FunctionRegistry, Value, ErrorKind, flatten_args, shape_of, broadcast_binary, criteria_matches, add_commas, glob_match, date_to_serial, serial_to_date, parse_iso_date, days_in_month, today_serial, now_serial};
+use crate::domain::parser::{FunctionRegistry, FunctionPurity, Value, ErrorKind, flatten_args, shape_of, broadcast_binary, criteria_matches, add_commas, glob_match, date_to_serial, serial_to_date, parse_iso_date, days_in_month, today_serial, now_serial};
 
 /// Register all `date` builtin functions on `reg`.
 pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
-        reg.register_function("TODAY", |args| {
+        reg.register_function_with_purity("TODAY", |args| {
             if !args.is_empty() {
                 return Ok(Value::Error(ErrorKind::Value));
             }
             Ok(Value::Number(today_serial()))
-        });
-        reg.register_function("NOW", |args| {
+        }, FunctionPurity::VolatileClock);
+        reg.register_function_with_purity("NOW", |args| {
             if !args.is_empty() {
                 return Ok(Value::Error(ErrorKind::Value));
             }
             Ok(Value::Number(now_serial()))
-        });
+        }, FunctionPurity::VolatileClock);
         reg.register_function("DATE", |args| {
             if args.len() != 3 {
                 return Ok(Value::Error(ErrorKind::Value));

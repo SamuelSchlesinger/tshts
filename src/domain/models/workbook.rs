@@ -4,6 +4,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use super::*;
+use crate::domain::parser::{FunctionPurity, formula_purity, FunctionRegistry, Parser};
 
 /// A cell address that includes the sheet name. Used as the key type for
 /// the workbook-level cross-sheet dependency graph.
@@ -108,6 +109,49 @@ pub struct Workbook {
     /// context. Maintained by `register_cross_sheet_deps`.
     #[serde(skip)]
     pub cells_with_qualified_refs: HashSet<CrossSheetKey>,
+    /// Cells whose value may be stale. Populated by every mutation site
+    /// (set/clear/structural-edit/sheet-rename/sheet-remove). Drained by
+    /// the recalc executor. Not serialized — after a fresh load, on-disk
+    /// values are authoritative; dirty starts empty and grows only from
+    /// subsequent mutations.
+    ///
+    /// Foundation for the parallel-calc engine (PR 1+): the level
+    /// scheduler walks this set instead of re-deriving "what changed
+    /// since last recalc" on every call. Today the existing per-sheet
+    /// `recalculate_dependents` cascades remain authoritative; the
+    /// graph-driven recalc lands in PR 3.
+    #[serde(skip)]
+    pub dirty: HashSet<CrossSheetKey>,
+    /// Stable per-sheet IDs, parallel to `sheets` and `sheet_names`.
+    /// Allocated monotonically; never reused. A sheet's ID survives
+    /// rename and shifts in `active_sheet`; removing a sheet drops its
+    /// entry from this vec but the next allocation still increments
+    /// past `next_sheet_id`. Used as the node-key prefix in
+    /// [`WorkbookGraph`](dep_graph::WorkbookGraph).
+    #[serde(default)]
+    pub sheet_ids: Vec<SheetId>,
+    /// Monotonic SheetId allocator. Bumped on every `add_sheet`; never
+    /// decremented even when sheets are removed.
+    #[serde(default)]
+    pub next_sheet_id: u32,
+    /// Workbook-level unified dependency graph. Bidirectional; nodes are
+    /// `(SheetId, row, col)`. Subsumes both the per-`Spreadsheet`
+    /// same-sheet graphs and the workbook's cross-sheet graph. Built
+    /// lazily on demand via `build_dep_graph_from_scratch`; PR 3 will
+    /// keep it incrementally maintained on writes.
+    ///
+    /// PR 1 keeps the legacy per-sheet `dependents`/`dependencies` and
+    /// the `cross_sheet_*` maps as the runtime authority; this graph is
+    /// validated via tests but not yet consulted by the recalc path.
+    #[serde(skip)]
+    pub graph: WorkbookGraph,
+    /// Derived per-cell purity classification, keyed parallel to the
+    /// graph. Populated by `build_dep_graph_from_scratch` so PR 4's
+    /// executor can partition a level into parallel and serial cells
+    /// without re-parsing formulas. Non-formula cells default to `Pure`
+    /// and are stored implicitly (absence = `Pure`).
+    #[serde(skip)]
+    pub cell_purities: HashMap<NodeKey, FunctionPurity>,
 }
 
 impl Default for Workbook {
@@ -121,6 +165,11 @@ impl Default for Workbook {
             cross_sheet_dependents: HashMap::new(),
             cross_sheet_dependencies: HashMap::new(),
             cells_with_qualified_refs: HashSet::new(),
+            dirty: HashSet::new(),
+            sheet_ids: vec![SheetId(0)],
+            next_sheet_id: 1,
+            graph: WorkbookGraph::new(),
+            cell_purities: HashMap::new(),
         }
     }
 }
@@ -136,10 +185,260 @@ impl Workbook {
         &mut self.sheets[self.active_sheet]
     }
 
-    /// Adds a new empty sheet with the given name.
+    /// Adds a new empty sheet with the given name. Allocates a fresh
+    /// [`SheetId`] from the monotonic counter so the new sheet has a
+    /// stable identity for the duration of the workbook.
     pub fn add_sheet(&mut self, name: String) {
         self.sheets.push(Spreadsheet::default());
         self.sheet_names.push(name);
+        let id = SheetId(self.next_sheet_id);
+        self.next_sheet_id = self.next_sheet_id.saturating_add(1);
+        self.sheet_ids.push(id);
+    }
+
+    /// Returns the [`SheetId`] at the given index, allocating a fresh one
+    /// if the parallel `sheet_ids` vec is missing or stale (e.g. after
+    /// loading a pre-PR-1 file). Bounded by the live sheet count.
+    pub fn sheet_id_at(&mut self, idx: usize) -> Option<SheetId> {
+        if idx >= self.sheets.len() {
+            return None;
+        }
+        self.ensure_sheet_ids();
+        self.sheet_ids.get(idx).copied()
+    }
+
+    /// Look up the sheet index for a given [`SheetId`]. Returns `None` if
+    /// the ID is unknown (e.g. the sheet was removed).
+    pub fn sheet_idx_of(&self, id: SheetId) -> Option<usize> {
+        self.sheet_ids.iter().position(|&s| s == id)
+    }
+
+    /// Display name for a [`SheetId`]. Returns `None` if the sheet has
+    /// been removed.
+    #[allow(dead_code)]
+    pub fn sheet_name_of(&self, id: SheetId) -> Option<&str> {
+        self.sheet_idx_of(id)
+            .and_then(|i| self.sheet_names.get(i).map(|s| s.as_str()))
+    }
+
+    /// Ensure `sheet_ids` is parallel to `sheets`. Fills in fresh IDs for
+    /// sheets that don't have one yet — happens on load of files written
+    /// before SheetId existed, where the serde `#[serde(default)]` falls
+    /// back to an empty vec.
+    fn ensure_sheet_ids(&mut self) {
+        if self.sheet_ids.len() == self.sheets.len() {
+            return;
+        }
+        // Special-case the all-empty legacy load: if sheet_ids is empty
+        // AND next_sheet_id is at its serde default of 0, start fresh at
+        // SheetId(0) to match the `Default::default()` convention. Without
+        // this, the first synthesized ID would be 1 (one off, leaving 0
+        // unused).
+        if !self.sheet_ids.is_empty() {
+            // Some IDs exist already (e.g. some sheets serialized, others
+            // added after load). Bump next_sheet_id past the maximum to
+            // avoid collisions with surviving IDs.
+            let max_existing = self.sheet_ids.iter().map(|s| s.0).max().unwrap_or(0);
+            if self.next_sheet_id <= max_existing {
+                self.next_sheet_id = max_existing.saturating_add(1);
+            }
+        }
+        while self.sheet_ids.len() < self.sheets.len() {
+            let id = SheetId(self.next_sheet_id);
+            self.next_sheet_id = self.next_sheet_id.saturating_add(1);
+            self.sheet_ids.push(id);
+        }
+        // If somehow sheet_ids is longer than sheets (corrupt file), trim.
+        self.sheet_ids.truncate(self.sheets.len());
+    }
+
+    /// Rebuild the workbook-level [`WorkbookGraph`] from scratch by
+    /// walking every formula cell on every sheet and registering its
+    /// dependencies. Also populates `cell_purities` so the executor can
+    /// partition by purity without re-parsing. O(sum of formula
+    /// lengths). PR 3+ will maintain both incrementally on writes.
+    pub fn build_dep_graph_from_scratch(&mut self) {
+        self.ensure_sheet_ids();
+        self.graph.clear();
+        self.cell_purities.clear();
+        let registry = FunctionRegistry::shared_builtin();
+        let sheet_count = self.sheets.len();
+        // We need an evaluator with workbook context to extract qualified
+        // refs (cross-sheet). Snapshot the workbook so the evaluator can
+        // borrow it immutably while we walk the sheets.
+        let snapshot = self.clone_for_graph_build();
+        for sheet_idx in 0..sheet_count {
+            let sheet_id = self.sheet_ids[sheet_idx];
+            // Collect (node, refs, formula) tuples first so we don't borrow self.
+            let edges: Vec<(NodeKey, Vec<NodeKey>, String)> = {
+                let sheet = &self.sheets[sheet_idx];
+                let names = &self.named_ranges;
+                let evaluator =
+                    crate::domain::services::FormulaEvaluator::for_workbook(
+                        &snapshot, sheet, names,
+                    );
+                sheet
+                    .cells
+                    .iter()
+                    .filter_map(|(&(r, c), cd)| {
+                        cd.formula.as_ref().map(|f| {
+                            let qrefs = evaluator.extract_qualified_refs(f);
+                            let resolved: Vec<NodeKey> = qrefs
+                                .into_iter()
+                                .filter_map(|(maybe_sheet, rr, cc)| {
+                                    let owner_idx = match maybe_sheet {
+                                        Some(name) => snapshot
+                                            .sheet_names
+                                            .iter()
+                                            .position(|n| n.eq_ignore_ascii_case(&name))?,
+                                        None => sheet_idx,
+                                    };
+                                    Some((
+                                        snapshot.sheet_ids[owner_idx],
+                                        rr,
+                                        cc,
+                                    ))
+                                })
+                                .collect();
+                            ((sheet_id, r, c), resolved, f.clone())
+                        })
+                    })
+                    .collect()
+            };
+            for (node, prereqs, formula) in edges {
+                self.graph.link(node, prereqs);
+                // Compute and cache the per-cell purity. Pure cells are
+                // implicit (absent from the map) so the common case
+                // doesn't pay a HashMap insert. Volatile/side-effecting
+                // cells get an explicit entry.
+                let strip_eq = formula.strip_prefix('=').unwrap_or(&formula);
+                if let Ok(mut p) = Parser::new(strip_eq) {
+                    if let Ok(ast) = p.parse() {
+                        let pur = formula_purity(&ast, &registry);
+                        if pur != FunctionPurity::Pure {
+                            self.cell_purities.insert(node, pur);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Look up a cell's cached purity. Returns `Pure` for non-formula
+    /// cells and for any cell not present in `cell_purities` (the
+    /// implicit-Pure default keeps the hot map small).
+    pub fn cell_purity(&self, node: NodeKey) -> FunctionPurity {
+        self.cell_purities
+            .get(&node)
+            .copied()
+            .unwrap_or(FunctionPurity::Pure)
+    }
+
+    /// Cheap snapshot for graph building. The evaluator only reads cell
+    /// values and named ranges, so a full deep-clone is enough; PR 3
+    /// will avoid this entirely by passing fields by reference once the
+    /// borrow shape can be unified.
+    fn clone_for_graph_build(&self) -> Workbook {
+        self.clone()
+    }
+
+    /// Convert a [`NodeKey`] to the equivalent [`CrossSheetKey`] used by
+    /// the legacy cross-sheet graph and the dirty-set. The sheet name is
+    /// returned as a fresh String; allocates on every call.
+    #[allow(dead_code)]
+    pub fn node_to_cross_sheet_key(&self, node: NodeKey) -> Option<CrossSheetKey> {
+        self.sheet_idx_of(node.0)
+            .and_then(|i| self.sheet_names.get(i).cloned())
+            .map(|name| (name, node.1, node.2))
+    }
+
+    /// Convert a [`CrossSheetKey`] to the matching [`NodeKey`]. Returns
+    /// `None` if the sheet name is unknown.
+    #[allow(dead_code)]
+    pub fn cross_sheet_key_to_node(&self, key: &CrossSheetKey) -> Option<NodeKey> {
+        let idx = self
+            .sheet_names
+            .iter()
+            .position(|n| n.eq_ignore_ascii_case(&key.0))?;
+        Some((self.sheet_ids[idx], key.1, key.2))
+    }
+
+    /// Sequential recalc driven by the workbook-level graph and dirty set.
+    /// Drains [`Workbook::dirty`], expands the closure via the graph,
+    /// computes topological levels, and re-evaluates each cell in level
+    /// order. Cyclic cells fall back to the per-sheet iterative-calc loop.
+    ///
+    /// This is the level-based scheduler from PR 1 of the parallel-calc
+    /// plan; PR 3 will extract it into a trait, PR 4 will add a parallel
+    /// implementation. Today it's exposed alongside the legacy recalc so
+    /// callers can switch over while tests verify behavior parity.
+    ///
+    /// Known gaps vs the legacy path (closed in later PRs):
+    /// - **OFFSET / INDIRECT / CHOOSE** dynamic references are not
+    ///   captured in the dep graph by `extract_qualified_refs_from_ast`
+    ///   (they require value-level evaluation to know their targets).
+    ///   PR 2's purity classification surfaces these so the scheduler
+    ///   can serialize their evaluation.
+    /// - **Cross-sheet cycles** are detected but routed to per-sheet
+    ///   iterative-calc, which only sees one leg of the cycle and may
+    ///   not converge. PR 3 introduces a workbook-level iterative loop.
+    /// - **Per-level workbook clone** is O(workbook size) per level.
+    ///   Acceptable for PR 1; replaced by `Arc<WorkbookSnapshot>` in PR 4.
+    pub fn recalc_via_graph(&mut self) {
+        // Lazy build: if the graph is empty, rebuild from scratch. PR 3+
+        // will keep it incrementally maintained on writes.
+        if self.graph.is_empty() {
+            self.build_dep_graph_from_scratch();
+        }
+        if self.dirty.is_empty() {
+            return;
+        }
+
+        // Map dirty cross-sheet keys to graph node keys.
+        let dirty_keys = self.drain_dirty();
+        let mut seeds: HashSet<NodeKey> = HashSet::with_capacity(dirty_keys.len());
+        for k in dirty_keys {
+            if let Some(node) = self.cross_sheet_key_to_node(&k) {
+                seeds.insert(node);
+            }
+        }
+        if seeds.is_empty() {
+            return;
+        }
+
+        let topo = self.graph.topo_levels_from_seeds(&seeds);
+        let plan = crate::domain::services::RecalcPlan {
+            levels: topo.levels,
+            cyclic: topo.cyclic,
+        };
+        let mut ctx = crate::domain::services::RecalcContext::new();
+        use crate::domain::services::RecalcExecutor;
+        // Auto-tune: pick Parallel when the workload is large enough to
+        // amortize rayon's dispatch overhead. The threshold reflects the
+        // bench numbers from `benches/calc_engine.rs` — below ~512 cells
+        // Sequential wins on every archetype because the per-level
+        // workbook clone dominates the parallel savings. Above that, the
+        // crossover depends on archetype shape; users can override via
+        // the `TSHTS_PAR_THRESHOLD` environment variable.
+        let threshold: usize = std::env::var("TSHTS_PAR_THRESHOLD")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(512);
+        let max_level_size = plan.levels.iter().map(|l| l.len()).max().unwrap_or(0);
+        let result = if max_level_size >= threshold {
+            crate::domain::services::ParallelExecutor::new().run(&plan, &mut ctx, self)
+        } else {
+            crate::domain::services::SequentialExecutor.run(&plan, &mut ctx, self)
+        };
+        if let Err(e) = result {
+            // The only error we can hit today is WorkerPanic from the
+            // parallel executor. Surface to stderr so a developer can
+            // see it; the UI layer (App::recalc_all) can still set a
+            // status message if it wants. Eating the error silently
+            // would let the workbook display stale values without any
+            // signal that recalc failed.
+            eprintln!("tshts: recalc failed: {:?}", e);
+        }
     }
 
     /// Structural row insert on the active sheet, with cross-sheet ref
@@ -152,6 +451,10 @@ impl Workbook {
         self.adjust_other_sheets_for_structural(active_idx, |evaluator, formula, target| {
             evaluator.adjust_formula_for_sheet_row_insert(formula, target, at)
         });
+        // Dirty AFTER the mutation so keys reflect post-shift coordinates.
+        // Marking pre-shift would leave dirty pointing at empty cells while
+        // the actually-shifted cells go unrecorded.
+        self.mark_all_formula_cells_dirty();
     }
 
     /// Structural row delete on the active sheet, with cross-sheet ref
@@ -162,6 +465,7 @@ impl Workbook {
         self.adjust_other_sheets_for_structural(active_idx, |evaluator, formula, target| {
             evaluator.adjust_formula_for_sheet_row_delete(formula, target, at)
         });
+        self.mark_all_formula_cells_dirty();
     }
 
     pub fn insert_col_on_active(&mut self, at: usize) {
@@ -170,6 +474,7 @@ impl Workbook {
         self.adjust_other_sheets_for_structural(active_idx, |evaluator, formula, target| {
             evaluator.adjust_formula_for_sheet_col_insert(formula, target, at)
         });
+        self.mark_all_formula_cells_dirty();
     }
 
     pub fn delete_col_on_active(&mut self, at: usize) {
@@ -178,6 +483,23 @@ impl Workbook {
         self.adjust_other_sheets_for_structural(active_idx, |evaluator, formula, target| {
             evaluator.adjust_formula_for_sheet_col_delete(formula, target, at)
         });
+        self.mark_all_formula_cells_dirty();
+    }
+
+    /// Mark every cell on every sheet that holds a formula as dirty.
+    /// Used by structural edits and sheet rename/remove: those operations
+    /// can shift refs anywhere, so the conservative-but-correct policy is
+    /// to mark the whole formula population. The recalc executor (PR 1+)
+    /// will compute the actual closure.
+    pub(crate) fn mark_all_formula_cells_dirty(&mut self) {
+        for (idx, sheet) in self.sheets.iter().enumerate() {
+            let name = self.sheet_names[idx].clone();
+            for (&(r, c), cd) in &sheet.cells {
+                if cd.formula.is_some() {
+                    self.dirty.insert((name.clone(), r, c));
+                }
+            }
+        }
     }
 
     /// Walk every sheet OTHER than `mutated_idx` and apply `adjust` to each
@@ -266,8 +588,37 @@ impl Workbook {
             return false;
         }
         let removed_name = self.sheet_names[index].clone();
+        // Purge the removed sheet's nodes from the unified graph so PR 3's
+        // incremental maintenance doesn't leak stale entries across
+        // remove/re-add cycles. The legacy cross_sheet_* maps are cleaned
+        // up further down.
+        if index < self.sheet_ids.len() {
+            let dead_id = self.sheet_ids[index];
+            let dead_nodes: Vec<NodeKey> = self.sheets[index]
+                .cells
+                .keys()
+                .map(|&(r, c)| (dead_id, r, c))
+                .collect();
+            for node in dead_nodes {
+                self.graph.forget_node(node);
+            }
+        }
+        // Every surviving formula cell that referenced the removed sheet
+        // will be rewritten to #REF!, plus any cross-sheet dependent of
+        // those formulas needs its value recomputed. Conservative dirty
+        // mark across all formula cells handles both cases.
+        self.mark_all_formula_cells_dirty();
+        // Cells on the removed sheet itself: their dirty entries become
+        // unreachable after removal. We pre-clean them here so the dirty
+        // set never references a non-existent sheet.
+        self.dirty.retain(|k| !k.0.eq_ignore_ascii_case(&removed_name));
         self.sheets.remove(index);
         self.sheet_names.remove(index);
+        // Drop the parallel sheet_ids entry too. ID stays "dead" — never
+        // reused even after the slot is removed.
+        if index < self.sheet_ids.len() {
+            self.sheet_ids.remove(index);
+        }
         if self.active_sheet >= self.sheets.len() {
             self.active_sheet = self.sheets.len() - 1;
         } else if self.active_sheet > index {
@@ -347,7 +698,24 @@ impl Workbook {
         {
             return false;
         }
+        // Migrate dirty entries from old name → new name before the rename
+        // lands. After the rename, lookups by sheet name would miss entries
+        // still keyed under `old_name`.
+        let migrated: Vec<CrossSheetKey> = self
+            .dirty
+            .iter()
+            .filter(|k| k.0.eq_ignore_ascii_case(&old_name))
+            .cloned()
+            .collect();
+        for k in migrated {
+            self.dirty.remove(&k);
+            self.dirty.insert((new_name.clone(), k.1, k.2));
+        }
         self.sheet_names[self.active_sheet] = new_name.clone();
+        // Mark all formula cells dirty AFTER the rename so the keys land
+        // under the new sheet name (mark_all_formula_cells_dirty reads
+        // sheet_names at insert time).
+        self.mark_all_formula_cells_dirty();
         // Rewrite formulas in every sheet. Track which cells were touched per
         // sheet so we can propagate changes after the global rebuild — the
         // rewrite is value-neutral in the steady state (the formula points
@@ -400,11 +768,14 @@ impl Workbook {
         self.rebuild_cross_sheet_deps();
         // Propagate from every cell whose formula was rewritten so any
         // dependents that previously errored on the old name recompute.
+        // Batched per-sheet so we pay one workbook clone per sheet
+        // rather than one per touched cell.
         for (sheet_idx, touched) in touched_per_sheet.iter().enumerate() {
-            let sheet_name = self.sheet_names[sheet_idx].clone();
-            for &(r, c) in touched {
-                self.propagate_cross_sheet_changes(&sheet_name, r, c);
+            if touched.is_empty() {
+                continue;
             }
+            let sheet_name = self.sheet_names[sheet_idx].clone();
+            self.propagate_cross_sheet_changes_batch(&sheet_name, touched);
         }
         true
     }
@@ -418,6 +789,9 @@ impl Workbook {
             sheet.named_ranges.insert(key.clone(), value.to_string());
             sheet.rebuild_dependencies();
         }
+        // Any formula referencing the name now resolves to a (potentially
+        // different) value or range; conservative dirty mark covers it.
+        self.mark_all_formula_cells_dirty();
     }
 
     /// Remove a named range. Returns true if it existed.
@@ -427,6 +801,11 @@ impl Workbook {
         for sheet in &mut self.sheets {
             sheet.named_ranges.remove(&key);
             sheet.rebuild_dependencies();
+        }
+        if existed {
+            // Formulas referencing the removed name now produce errors;
+            // mark them all so the next recalc picks up the change.
+            self.mark_all_formula_cells_dirty();
         }
         existed
     }
@@ -449,11 +828,68 @@ impl Workbook {
         !self.cells_with_qualified_refs.is_empty()
     }
 
+    /// Mark a single cell as dirty. The cell's value may be stale and must
+    /// be recomputed on the next recalc. Future readers (the parallel calc
+    /// executor in PR 1+) walk this set to compute the recalc closure.
+    pub fn mark_dirty(&mut self, sheet_name: &str, row: usize, col: usize) {
+        self.dirty.insert((sheet_name.to_string(), row, col));
+    }
+
+    /// Mark a cell on the currently-active sheet as dirty.
+    pub fn mark_dirty_active(&mut self, row: usize, col: usize) {
+        let key = (self.sheet_names[self.active_sheet].clone(), row, col);
+        self.dirty.insert(key);
+    }
+
+    /// Mark every cell on a given sheet as dirty. Reserved for callers
+    /// that need maximal coverage (e.g. wholesale sheet replacement like
+    /// CSV import) where even non-formula cells should participate in
+    /// the next recalc closure. Sheet-name lookup is case-insensitive;
+    /// inserted keys use the canonical-cased name from `sheet_names`.
+    pub fn mark_sheet_dirty(&mut self, sheet_name: &str) {
+        let Some(idx) = self
+            .sheet_names
+            .iter()
+            .position(|n| n.eq_ignore_ascii_case(sheet_name))
+        else {
+            return;
+        };
+        let canonical = self.sheet_names[idx].clone();
+        for &(r, c) in self.sheets[idx].cells.keys() {
+            self.dirty.insert((canonical.clone(), r, c));
+        }
+    }
+
+    /// Take the current dirty set, leaving the workbook's `dirty` empty.
+    /// The recalc executor (PR 1+) calls this at the start of a recalc
+    /// pass; mutation sites repopulate it between recalcs.
+    pub fn drain_dirty(&mut self) -> HashSet<CrossSheetKey> {
+        std::mem::take(&mut self.dirty)
+    }
+
+    /// True if no cells are dirty (i.e. a recalc would be a no-op).
+    #[allow(dead_code)]
+    pub fn dirty_is_empty(&self) -> bool {
+        self.dirty.is_empty()
+    }
+
     /// Write a single cell on the active sheet with workbook context
     /// published for the same-sheet recalc cascade. Use this instead of
     /// `current_sheet_mut().set_cell(...)` when downstream cells on the same
     /// sheet may contain cross-sheet refs that need to resolve correctly.
     pub fn set_cell_on_active(&mut self, row: usize, col: usize, data: CellData) {
+        // Suppress no-op writes so the dirty set doesn't accumulate entries
+        // for unchanged cells (PR 1's executor would otherwise re-eval
+        // them needlessly).
+        let unchanged = self.sheets[self.active_sheet]
+            .cells
+            .get(&(row, col))
+            .map(|existing| existing == &data)
+            .unwrap_or(false);
+        if unchanged {
+            return;
+        }
+        self.mark_dirty_active(row, col);
         if self.needs_workbook_context() {
             let snapshot = self.clone();
             with_recalc_context(&snapshot, || {
@@ -467,6 +903,12 @@ impl Workbook {
     /// Clear a single cell on the active sheet with workbook context
     /// published for the same-sheet recalc cascade.
     pub fn clear_cell_on_active(&mut self, row: usize, col: usize) {
+        // No-op suppression: clearing an already-absent cell shouldn't
+        // dirty the set.
+        if !self.sheets[self.active_sheet].cells.contains_key(&(row, col)) {
+            return;
+        }
+        self.mark_dirty_active(row, col);
         if self.needs_workbook_context() {
             let snapshot = self.clone();
             with_recalc_context(&snapshot, || {
@@ -495,6 +937,9 @@ impl Workbook {
         let positions: Vec<(usize, usize)> =
             writes.iter().map(|(r, c, _)| (*r, *c)).collect();
         let sheet_name = self.sheet_names[self.active_sheet].clone();
+        for &(r, c) in &positions {
+            self.dirty.insert((sheet_name.clone(), r, c));
+        }
         // Snapshot for cross-sheet ref resolution during this sheet's
         // recalc cascade. Without this, formulas like `=B1 + Sheet2!A1`
         // re-evaluated as part of the dependent recalc lose workbook
@@ -508,10 +953,11 @@ impl Workbook {
         } else {
             self.sheets[self.active_sheet].set_many(writes);
         }
-        for (r, c) in positions {
-            self.register_cross_sheet_deps(&sheet_name, r, c);
-            self.propagate_cross_sheet_changes(&sheet_name, r, c);
-        }
+        // Cross-sheet propagation in one shot — single workbook clone +
+        // single BFS over the union closure, rather than N per-cell
+        // clones (which was O(N × workbook_size)).
+        self.register_cross_sheet_deps_batch(&sheet_name, &positions);
+        self.propagate_cross_sheet_changes_batch(&sheet_name, &positions);
     }
 
     /// Clear a batch of cells on the active sheet, then propagate.
@@ -521,22 +967,23 @@ impl Workbook {
             return;
         }
         let sheet_name = self.sheet_names[self.active_sheet].clone();
+        for &(r, c) in &positions {
+            self.dirty.insert((sheet_name.clone(), r, c));
+        }
+        // Bulk clear via clear_many — one topological cascade for the
+        // entire union of dependents rather than N per-cell cascades.
         if self.needs_workbook_context() {
             let snapshot = self.clone();
             with_recalc_context(&snapshot, || {
-                for (r, c) in &positions {
-                    self.sheets[self.active_sheet].clear_cell(*r, *c);
-                }
+                self.sheets[self.active_sheet].clear_many(positions.clone());
             });
         } else {
-            for (r, c) in &positions {
-                self.sheets[self.active_sheet].clear_cell(*r, *c);
-            }
+            self.sheets[self.active_sheet].clear_many(positions.clone());
         }
-        for (r, c) in positions {
-            self.register_cross_sheet_deps(&sheet_name, r, c);
-            self.propagate_cross_sheet_changes(&sheet_name, r, c);
-        }
+        // Cross-sheet propagation: one batch call for the whole set
+        // rather than N per-cell BFS + workbook clones.
+        self.register_cross_sheet_deps_batch(&sheet_name, &positions);
+        self.propagate_cross_sheet_changes_batch(&sheet_name, &positions);
     }
 
     /// Creates a Workbook from a single Spreadsheet (for backward compatibility).
@@ -550,6 +997,11 @@ impl Workbook {
             cross_sheet_dependents: HashMap::new(),
             cross_sheet_dependencies: HashMap::new(),
             cells_with_qualified_refs: HashSet::new(),
+            dirty: HashSet::new(),
+            sheet_ids: vec![SheetId(0)],
+            next_sheet_id: 1,
+            graph: WorkbookGraph::new(),
+            cell_purities: HashMap::new(),
         }
     }
 
@@ -639,6 +1091,130 @@ impl Workbook {
                 .entry(prec)
                 .or_default()
                 .insert(key.clone());
+        }
+    }
+
+    /// Batch variant of `register_cross_sheet_deps`. Calling
+    /// `register_cross_sheet_deps` in a loop is O(N × formula_size)
+    /// per cell which is fine — the per-call work doesn't BFS. We
+    /// expose this as a separate API just for symmetry with the batch
+    /// propagation below.
+    pub fn register_cross_sheet_deps_batch(
+        &mut self,
+        sheet_name: &str,
+        positions: &[(usize, usize)],
+    ) {
+        for &(r, c) in positions {
+            self.register_cross_sheet_deps(sheet_name, r, c);
+        }
+    }
+
+    /// Batch variant of `propagate_cross_sheet_changes`. Clones the
+    /// workbook ONCE and walks a single BFS over the union of seed
+    /// cells. The per-cell variant clones per call — O(N × workbook_size)
+    /// for an N-cell batch. The batch version is O(workbook_size +
+    /// closure_size).
+    pub fn propagate_cross_sheet_changes_batch(
+        &mut self,
+        sheet_name: &str,
+        seeds: &[(usize, usize)],
+    ) {
+        use crate::domain::services::FormulaEvaluator;
+        if seeds.is_empty() {
+            return;
+        }
+
+        // Quick gate: skip the clone if none of the seed cells have any
+        // cross-sheet dependents. The single-cell path had the same
+        // optimization; here we widen it to "any seed has deps".
+        let has_any_deps = seeds.iter().any(|&(r, c)| {
+            self.cross_sheet_dependents
+                .get(&(sheet_name.to_string(), r, c))
+                .is_some_and(|s| !s.is_empty())
+        });
+        if !has_any_deps {
+            return;
+        }
+
+        let mut queue: std::collections::VecDeque<CrossSheetKey> =
+            std::collections::VecDeque::new();
+        let mut visited: HashSet<CrossSheetKey> = HashSet::new();
+        for &(r, c) in seeds {
+            queue.push_back((sheet_name.to_string(), r, c));
+        }
+
+        let mut snapshot = self.clone();
+        let names = snapshot.named_ranges.clone();
+
+        while let Some(key) = queue.pop_front() {
+            if !visited.insert(key.clone()) {
+                continue;
+            }
+            let deps: Vec<CrossSheetKey> = self
+                .cross_sheet_dependents
+                .get(&key)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            if deps.is_empty() {
+                continue;
+            }
+            for dep in deps {
+                let (dep_sheet, dep_row, dep_col) = dep.clone();
+                let Some(dep_idx) = snapshot
+                    .sheet_names
+                    .iter()
+                    .position(|n| n.eq_ignore_ascii_case(&dep_sheet))
+                else {
+                    continue;
+                };
+                let new_value = {
+                    let snap_sheet = &snapshot.sheets[dep_idx];
+                    let Some(cd) = snap_sheet.cells.get(&(dep_row, dep_col)) else {
+                        continue;
+                    };
+                    let Some(formula) = cd.formula.clone() else {
+                        continue;
+                    };
+                    let evaluator =
+                        FormulaEvaluator::for_workbook(&snapshot, snap_sheet, &names);
+                    evaluator.evaluate_formula(&formula)
+                };
+                if let Some(snap_cd) = snapshot.sheets[dep_idx]
+                    .cells
+                    .get_mut(&(dep_row, dep_col))
+                {
+                    snap_cd.value = new_value.clone();
+                }
+                let dep_real_idx = self
+                    .sheet_names
+                    .iter()
+                    .position(|n| n.eq_ignore_ascii_case(&dep_sheet));
+                if let Some(idx) = dep_real_idx {
+                    let value_actually_changed = self.sheets[idx]
+                        .cells
+                        .get_mut(&(dep_row, dep_col))
+                        .map(|real_cd| {
+                            if real_cd.value != new_value {
+                                real_cd.value = new_value.clone();
+                                true
+                            } else {
+                                false
+                            }
+                        })
+                        .unwrap_or(false);
+                    if value_actually_changed {
+                        // Same-sheet cascade on the destination sheet
+                        // (same logic as the single-cell propagator).
+                        with_recalc_context(&snapshot, || {
+                            self.sheets[idx].recalculate_dependents(dep_row, dep_col);
+                        });
+                        snapshot.sheets[idx] = self.sheets[idx].clone();
+                        queue.push_back(dep);
+                    }
+                }
+            }
         }
     }
 

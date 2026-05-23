@@ -54,6 +54,7 @@ pub fn load_xlsx(path: &str) -> Result<Workbook, String> {
     if sheet_names.is_empty() {
         return Err("xlsx has no sheets".to_string());
     }
+    let sheet_count = sheet_names.len() as u32;
     let mut out = Workbook {
         version: crate::domain::models::WORKBOOK_SCHEMA_VERSION,
         sheets: Vec::with_capacity(sheet_names.len()),
@@ -63,6 +64,11 @@ pub fn load_xlsx(path: &str) -> Result<Workbook, String> {
         cross_sheet_dependents: std::collections::HashMap::new(),
         cross_sheet_dependencies: std::collections::HashMap::new(),
         cells_with_qualified_refs: std::collections::HashSet::new(),
+        dirty: std::collections::HashSet::new(),
+        sheet_ids: (0..sheet_count).map(crate::domain::models::SheetId).collect(),
+        next_sheet_id: sheet_count,
+        graph: crate::domain::models::WorkbookGraph::new(),
+        cell_purities: std::collections::HashMap::new(),
     };
     for name in &sheet_names {
         let range = wb
@@ -155,6 +161,10 @@ pub fn load_xlsx(path: &str) -> Result<Workbook, String> {
     // Build the cross-sheet dep graph so subsequent edits propagate
     // correctly. Same-sheet graphs were built per-sheet above.
     out.rebuild_cross_sheet_deps();
+    // Pre-build the unified workbook graph too so .xlsx files behave
+    // identically to .tshts on first recalc. The lazy build inside
+    // recalc_via_graph would otherwise run on the first edit.
+    out.build_dep_graph_from_scratch();
     Ok(out)
 }
 

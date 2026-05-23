@@ -118,13 +118,20 @@ impl FileRepository {
                         sheet.rebuild_dependencies();
                     }
                     workbook.rebuild_cross_sheet_deps();
+                    // Pre-PR-1 files have no sheet_ids; allocate now so
+                    // the new graph builder has stable identities. Files
+                    // saved by PR-1+ carry their own IDs and ensure_*
+                    // becomes a no-op.
+                    workbook.build_dep_graph_from_scratch();
                     return Ok((workbook, filename.to_string()));
                 }
                 // Fall back to single spreadsheet format
                 match serde_json::from_str::<Spreadsheet>(&content) {
                     Ok(mut spreadsheet) => {
                         spreadsheet.rebuild_dependencies();
-                        Ok((Workbook::from_spreadsheet(spreadsheet), filename.to_string()))
+                        let mut wb = Workbook::from_spreadsheet(spreadsheet);
+                        wb.build_dep_graph_from_scratch();
+                        Ok((wb, filename.to_string()))
                     }
                     Err(e) => Err(format!("Invalid file format - {}", e)),
                 }

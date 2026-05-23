@@ -5,6 +5,10 @@ use super::*;
 
 pub struct FunctionRegistry {
     functions: HashMap<String, FunctionImpl>,
+    /// Purity classification per registered function. Defaults to
+    /// `Pure` for entries registered via `register_function`; volatile
+    /// functions register via `register_function_with_purity`.
+    purities: HashMap<String, FunctionPurity>,
 }
 
 thread_local! {
@@ -23,6 +27,7 @@ impl FunctionRegistry {
     pub fn new() -> Self {
         let mut registry = Self {
             functions: HashMap::new(),
+            purities: HashMap::new(),
         };
         registry.register_builtin_functions();
         registry
@@ -37,14 +42,43 @@ impl FunctionRegistry {
         })
     }
     
-    /// Registers a new function in the registry.
+    /// Registers a new function. Default purity is `Pure`; use
+    /// `register_function_with_purity` for volatile / side-effecting
+    /// functions.
     pub fn register_function(&mut self, name: &str, func: FunctionImpl) {
-        self.functions.insert(name.to_uppercase(), func);
+        let key = name.to_uppercase();
+        self.functions.insert(key.clone(), func);
+        // Only set Pure if no prior purity exists — re-registration
+        // with the volatile API should win regardless of order.
+        self.purities.entry(key).or_insert(FunctionPurity::Pure);
     }
-    
+
+    /// Registers a new function and explicitly tags its purity. Used by
+    /// volatile / side-effecting builtins (RAND, NOW, GET, etc.).
+    pub fn register_function_with_purity(
+        &mut self,
+        name: &str,
+        func: FunctionImpl,
+        purity: FunctionPurity,
+    ) {
+        let key = name.to_uppercase();
+        self.functions.insert(key.clone(), func);
+        self.purities.insert(key, purity);
+    }
+
     /// Gets a function by name.
     pub fn get_function(&self, name: &str) -> Option<&FunctionImpl> {
         self.functions.get(&name.to_uppercase())
+    }
+
+    /// Look up a function's purity. Returns `Pure` for unknown functions
+    /// — the formula walker will surface an error elsewhere if the
+    /// function name itself is invalid, so this fallback is safe.
+    pub fn purity(&self, name: &str) -> FunctionPurity {
+        self.purities
+            .get(&name.to_uppercase())
+            .copied()
+            .unwrap_or(FunctionPurity::Pure)
     }
     
     /// Registers all built-in spreadsheet functions.

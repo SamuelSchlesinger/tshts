@@ -385,10 +385,84 @@ pub use lexer::Lexer;
 pub use registry::FunctionRegistry;
 pub use parser_impl::Parser;
 pub use evaluator::ExpressionEvaluator;
+pub use evaluator::formula_purity;
 
 
 /// Function signature for built-in and user-defined functions.
 pub type FunctionImpl = fn(&[Value]) -> Result<Value, String>;
+
+/// How a function interacts with shared state and parallel evaluation.
+///
+/// The classification follows Excel's terminology and OpenFormula
+/// §3.5, refined into categories that have distinct scheduling
+/// implications under parallel calc:
+///
+/// - **Pure**: idempotent, side-effect-free. Safe to dispatch on any
+///   worker; safe to memoize.
+/// - **VolatileClock**: reads the wall clock (NOW, TODAY). The recalc
+///   executor snapshots a single timestamp at pass start into a
+///   `RecalcContext`; all volatile-clock cells read the snapshot, so
+///   they remain parallel-safe and return consistent values within a
+///   pass.
+/// - **VolatileRandom**: advances a random-number generator (RAND,
+///   RANDBETWEEN, RANDARRAY). tshts seeds a thread-local PRNG per
+///   worker; cells get unrelated random values across runs but
+///   correct within-pass independence.
+/// - **VolatileStructural**: changes the dep graph based on cell
+///   *values*, not just formulas (INDIRECT, OFFSET when args are
+///   dynamic, CELL("address" / "format"), FORMULATEXT, INFO). The
+///   scheduler dispatches these cells serially because the parallel
+///   path assumes a static graph for the duration of a level.
+/// - **SideEffecting**: external I/O (GET). Rate-limited and cached
+///   to avoid hammering external services from N workers in parallel.
+///
+/// Combining: when a formula references multiple functions, its
+/// effective purity is the **maximum** of their purities under the
+/// total order `Pure < VolatileClock < VolatileStructural <
+/// VolatileRandom < SideEffecting`. The ordering reflects how strongly
+/// each category constrains parallel dispatch (Random shares mutable
+/// state ordering across cells more loosely than Structural shares
+/// graph identity, and SideEffecting is the strongest).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum FunctionPurity {
+    Pure,
+    VolatileClock,
+    VolatileStructural,
+    VolatileRandom,
+    SideEffecting,
+}
+
+impl FunctionPurity {
+    /// True if a formula with this purity can be safely dispatched on
+    /// a rayon worker as part of a level batch. Pure / VolatileClock /
+    /// VolatileRandom qualify; VolatileStructural and SideEffecting
+    /// run sequentially.
+    #[allow(dead_code)]
+    pub fn is_parallel_safe(self) -> bool {
+        matches!(
+            self,
+            FunctionPurity::Pure
+                | FunctionPurity::VolatileClock
+                | FunctionPurity::VolatileRandom
+        )
+    }
+
+    /// True if this purity requires the recalc engine to re-evaluate the
+    /// cell every pass even when its precedents are unchanged (e.g. NOW
+    /// changes between calls without any cell having been mutated).
+    /// Used by `Workbook::recalc_via_graph` to seed volatile cells into
+    /// the dirty set automatically at pass start.
+    #[allow(dead_code)]
+    pub fn is_volatile(self) -> bool {
+        self != FunctionPurity::Pure
+    }
+
+    /// The join (least upper bound) on the purity lattice. Used by the
+    /// AST walker to combine the purities of a formula's subexpressions.
+    pub fn join(self, other: FunctionPurity) -> FunctionPurity {
+        self.max(other)
+    }
+}
 
 /// Returns names of every registered built-in function. Used for autocomplete
 /// and the help library.

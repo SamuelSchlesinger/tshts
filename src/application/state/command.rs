@@ -891,7 +891,7 @@ impl App {
                 let n = old.len();
                 if n > 0 {
                     self.workbook.current_sheet_mut().conditional_formats.clear();
-                    self.workbook.current_sheet_mut().cf_cache.borrow_mut().clear();
+                    self.workbook.current_sheet_mut().cf_cache.lock().unwrap().clear();
                     self.record_action(UndoAction::ConditionalFormatsReplaced {
                         sheet_idx,
                         old,
@@ -951,7 +951,7 @@ impl App {
                         {
                             let sheet = self.workbook.current_sheet_mut();
                             sheet.conditional_formats = new.clone();
-                            sheet.cf_cache.borrow_mut().clear();
+                            sheet.cf_cache.lock().unwrap().clear();
                         }
                         self.record_action(UndoAction::ConditionalFormatsReplaced {
                             sheet_idx,

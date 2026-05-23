@@ -5,7 +5,7 @@
 //! function is called from `registry::FunctionRegistry::register_builtin_functions`.
 
 #![allow(unused_imports)]
-use crate::domain::parser::{FunctionRegistry, Value, ErrorKind, flatten_args, shape_of, broadcast_binary, criteria_matches, add_commas, glob_match, date_to_serial, serial_to_date, parse_iso_date, days_in_month, today_serial, now_serial};
+use crate::domain::parser::{FunctionRegistry, FunctionPurity, Value, ErrorKind, flatten_args, shape_of, broadcast_binary, criteria_matches, add_commas, glob_match, date_to_serial, serial_to_date, parse_iso_date, days_in_month, today_serial, now_serial};
 
 /// Register all `numeric` builtin functions on `reg`.
 pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
@@ -177,14 +177,14 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
                 Ok(Value::Number(std::f64::consts::PI))
             }
         });
-        reg.register_function("RAND", |_args| {
+        reg.register_function_with_purity("RAND", |_args| {
             // xorshift64 PRNG advanced per call. Seeded once per thread
             // from a high-entropy source. Two RAND() calls in the same
             // millisecond used to return identical or highly-correlated
             // values because the previous seed was just `subsec_nanos()`.
             Ok(Value::Number(next_rand_u64() as f64 / u64::MAX as f64))
-        });
-        reg.register_function("RANDBETWEEN", |args| {
+        }, FunctionPurity::VolatileRandom);
+        reg.register_function_with_purity("RANDBETWEEN", |args| {
             if args.len() != 2 {
                 Ok(Value::Error(ErrorKind::Value))
             } else {
@@ -197,7 +197,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
                 let result = (low + r * (high - low + 1.0)).floor();
                 Ok(Value::Number(result))
             }
-        });
+        }, FunctionPurity::VolatileRandom);
         reg.register_function("SIGN", |args| {
             if args.len() != 1 {
                 Ok(Value::Error(ErrorKind::Value))
