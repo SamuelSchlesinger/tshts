@@ -350,6 +350,16 @@ impl App {
                     &path,
                 ) {
                     Ok(n) => {
+                        // Appended rows bypass the workbook mutation API,
+                        // so the unified graph and cross-sheet maps don't
+                        // know about them. Rebuild + dirty so the next
+                        // recalc picks up any new formulas in the import.
+                        self.workbook.rebuild_cross_sheet_deps();
+                        let name = self
+                            .workbook
+                            .sheet_names[self.workbook.active_sheet]
+                            .clone();
+                        self.workbook.mark_sheet_dirty(&name);
                         self.dirty = true;
                         self.status_message =
                             Some(format!("Appended {} row(s) from {}", n, path));

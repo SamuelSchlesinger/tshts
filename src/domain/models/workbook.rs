@@ -475,13 +475,32 @@ impl Workbook {
             let mut all_strings_stable = true;
             let snapshot = self.clone();
             let names = snapshot.named_ranges.clone();
+            // Collected per pass so we can record outside the borrow of
+            // self.sheets that the inner loop holds.
+            let mut pass_targets: Vec<(NodeKey, Vec<crate::domain::parser::DynamicTarget>)> =
+                Vec::new();
             for (node, sheet_idx, formula) in &work {
+                // Drain any leakage from a prior cell's eval so the
+                // targets we collect after evaluate_formula are this
+                // cell's only. Matches the eval_one drain-before-eval
+                // pattern used by the level executors.
+                let _ = crate::domain::parser::take_dynamic_targets();
                 let new_value = {
                     let snap_sheet = &snapshot.sheets[*sheet_idx];
                     let evaluator =
                         FormulaEvaluator::for_workbook(&snapshot, snap_sheet, &names);
                     evaluator.evaluate_formula(formula)
                 };
+                // Capture INDIRECT/OFFSET targets so the smart auto-seed
+                // for cyclic structural cells has the same cache the
+                // acyclic path enjoys.
+                let targets = crate::domain::parser::take_dynamic_targets();
+                if !targets.is_empty()
+                    && self.cell_purity(*node)
+                        == crate::domain::parser::FunctionPurity::VolatileStructural
+                {
+                    pass_targets.push((*node, targets));
+                }
                 let prev_value = self.sheets[*sheet_idx]
                     .cells
                     .get(&(node.1, node.2))
@@ -539,6 +558,13 @@ impl Workbook {
                     sheet.sweep_spill_ghosts_for(node.1, node.2);
                     sheet.maybe_spill(node.1, node.2);
                 });
+            }
+            // Push captured structural targets to the workbook-level
+            // cache. Done outside the per-cell loop because
+            // record_structural_targets borrows &mut self while the
+            // cell loop holds &self.sheets[*sheet_idx].
+            for (node, targets) in pass_targets {
+                self.record_structural_targets(node, &targets);
             }
             // Converged when numeric deltas are below epsilon AND no
             // non-numeric flip-flops remain.
@@ -1058,13 +1084,17 @@ impl Workbook {
         existed
     }
 
-    /// Run register_cross_sheet_deps + propagate_cross_sheet_changes for a
-    /// single cell on the active sheet. Use from mutation paths that bypass
-    /// `write_cells_on_active` / `clear_cells_on_active` (e.g. undo/redo
-    /// apply that restores via `set_cell` directly).
+    /// Run propagate_cross_sheet_changes for a single cell on the active
+    /// sheet. Assumes the caller already registered cross-sheet deps
+    /// (via `set_cell_on_active` / `clear_cell_on_active` / direct
+    /// `register_cross_sheet_deps`). Use from mutation paths that need to
+    /// fan-out value changes to dependents without re-registering.
+    ///
+    /// Re-registering here would clear and rebuild the cell's
+    /// structural_targets cache twice per write, defeating the smart
+    /// auto-seed perf win for OFFSET/INDIRECT cells.
     pub fn propagate_active_cell(&mut self, row: usize, col: usize) {
         let sheet_name = self.sheet_names[self.active_sheet].clone();
-        self.register_cross_sheet_deps(&sheet_name, row, col);
         self.propagate_cross_sheet_changes(&sheet_name, row, col);
     }
 
@@ -1305,7 +1335,20 @@ impl Workbook {
             .and_then(|cd| cd.formula.clone())
         {
             Some(f) => f,
-            None => return,
+            None => {
+                // Formula → literal (or cell cleared). Drop unified-graph
+                // outgoing edges, cached purity, and recorded dynamic
+                // targets so they don't pin the auto-seed loop on a node
+                // whose formula no longer exists. Step 1 already cleared
+                // cross_sheet_dependencies; this completes the cleanup
+                // on the unified-graph side.
+                if let Some(node) = self.cross_sheet_key_to_node(&key) {
+                    self.graph.unlink_node(node);
+                    self.cell_purities.remove(&node);
+                    self.structural_targets.remove(&node);
+                }
+                return;
+            }
         };
 
         // Step 3: extract qualified refs from the formula. Use a snapshot
@@ -1768,6 +1811,22 @@ impl Workbook {
     pub fn rebuild_cross_sheet_deps(&mut self) {
         self.cross_sheet_dependents.clear();
         self.cross_sheet_dependencies.clear();
+        // Entries from since-deleted formula cells (or formula→value
+        // transitions before the per-cell cleanup landed) would otherwise
+        // make needs_workbook_context() falsely true, forcing unnecessary
+        // workbook clones in the *_on_active fast path.
+        self.cells_with_qualified_refs.clear();
+        // Wipe unified-graph state too. The per-cell `register_cross_sheet_deps`
+        // below will repopulate from cells.iter(), but it only refreshes
+        // entries for CURRENT (sheet_id, row, col) positions. Stale entries
+        // from positions whose cells were shifted by a structural edit
+        // (row/col insert/delete) would otherwise leak indefinitely —
+        // their NodeKeys are unreachable from cells.iter() so per-cell
+        // registration can't touch them, but `recalc_via_graph` would still
+        // walk them via cell_purities/structural_targets.
+        self.graph.clear();
+        self.cell_purities.clear();
+        self.structural_targets.clear();
         let cells: Vec<(String, usize, usize)> = self
             .sheet_names
             .iter()

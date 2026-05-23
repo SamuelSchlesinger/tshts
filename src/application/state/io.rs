@@ -247,9 +247,11 @@ impl App {
             Ok(spreadsheet) => {
                 *self.workbook.current_sheet_mut() = spreadsheet;
                 // Wholesale-replaced the sheet — none of the per-cell
-                // mutation paths fired, so dirty-set is empty. Mark
-                // everything on the active sheet so the next recalc covers
-                // the new values.
+                // mutation paths fired, so dirty-set is empty AND the
+                // unified graph still holds entries for the OLD cells.
+                // Rebuild the cross-sheet + unified-graph state, then
+                // mark the new cells dirty so the next recalc covers them.
+                self.workbook.rebuild_cross_sheet_deps();
                 let name = self.workbook.sheet_names[self.workbook.active_sheet].clone();
                 self.workbook.mark_sheet_dirty(&name);
                 self.selected_row = 0;

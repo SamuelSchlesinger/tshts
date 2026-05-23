@@ -1860,6 +1860,137 @@ mod tests {
             "switching OFFSET→Pure must clear stale targets");
     }
 
+    /// Formula→value transition (formula cell becomes a literal, or
+    /// cell cleared entirely) must drop the cell's unified-graph
+    /// entries, cached purity, and recorded dynamic targets. Without
+    /// the cleanup, recalc_via_graph's smart auto-seed walks NodeKeys
+    /// for cells that no longer have formulas.
+    #[test]
+    fn test_formula_to_value_transition_drops_unified_graph_state() {
+        use crate::domain::Workbook;
+        use crate::domain::models::SheetId;
+        let mut wb = Workbook::default();
+        wb.sheets[0].cells.insert((0, 0), CellData {
+            value: "5".to_string(), formula: None, format: None,
+            comment: None, spill_anchor: None,
+        });
+        wb.sheets[0].cells.insert((0, 1), CellData {
+            value: "0".to_string(),
+            formula: Some("=OFFSET(A1, 0, 0)".to_string()),
+            format: None, comment: None, spill_anchor: None,
+        });
+        wb.build_dep_graph_from_scratch();
+        wb.mark_dirty("Sheet1", 0, 0);
+        wb.recalc_via_graph();
+        let node = (SheetId(0), 0, 1);
+        assert!(wb.cell_purities.get(&node).is_some(), "purity populated");
+        assert!(wb.structural_targets.get(&node).is_some(), "targets populated");
+
+        // Replace formula with a literal value.
+        wb.set_cell_on_active(0, 1, CellData {
+            value: "42".to_string(), formula: None, format: None,
+            comment: None, spill_anchor: None,
+        });
+        assert!(wb.cell_purities.get(&node).is_none(),
+            "formula→literal must drop cached purity");
+        assert!(wb.structural_targets.get(&node).is_none(),
+            "formula→literal must drop recorded dynamic targets");
+    }
+
+    /// After a row insert that shifts an OFFSET cell down by one,
+    /// recalc must still re-evaluate that cell with the smart
+    /// auto-seed (i.e. its purity classification must end up keyed
+    /// at the NEW position, not the OLD). Pre-fix, `cell_purities`
+    /// retained the OLD NodeKey and the cell at the NEW position
+    /// was silently treated as Pure by the auto-seed loop.
+    #[test]
+    fn test_row_insert_relocates_volatile_structural_purity_key() {
+        use crate::domain::Workbook;
+        use crate::domain::models::SheetId;
+        let mut wb = Workbook::default();
+        wb.sheets[0].cells.insert((0, 0), CellData {
+            value: "10".to_string(), formula: None, format: None,
+            comment: None, spill_anchor: None,
+        });
+        wb.sheets[0].cells.insert((3, 1), CellData {
+            value: "0".to_string(),
+            formula: Some("=OFFSET($A$1, 0, 0)".to_string()),
+            format: None, comment: None, spill_anchor: None,
+        });
+        wb.build_dep_graph_from_scratch();
+        wb.mark_dirty("Sheet1", 0, 0);
+        wb.recalc_via_graph();
+        assert_eq!(wb.sheets[0].get_cell(3, 1).value, "10");
+        let old_node = (SheetId(0), 3, 1);
+        assert!(wb.cell_purities.get(&old_node).is_some(),
+            "purity populated at original position");
+
+        // Insert a row at row 0 — OFFSET shifts from (3, 1) to (4, 1).
+        wb.insert_row_on_active(0);
+        wb.recalc_via_graph();
+        let new_node = (SheetId(0), 4, 1);
+        assert!(wb.cell_purities.get(&old_node).is_none(),
+            "stale purity at OLD position must be cleared");
+        assert!(wb.cell_purities.get(&new_node).is_some(),
+            "purity must be re-keyed at NEW position; got cell_purities = {:?}",
+            wb.cell_purities);
+        assert_eq!(wb.sheets[0].get_cell(4, 1).value, "10");
+    }
+
+    /// After a CSV import wholesale-replaces a sheet, the unified
+    /// graph must reflect the imported cells. Pre-fix, recalc walked
+    /// stale NodeKeys from the prior sheet content.
+    #[test]
+    fn test_csv_import_rebuilds_unified_graph() {
+        use crate::application::App;
+        use crate::domain::Workbook;
+        use crate::domain::models::SheetId;
+        use crate::domain::Spreadsheet;
+
+        let mut app = App::default();
+        // Pre-populate a formula on the active sheet so the OLD graph
+        // has at least one entry to leak.
+        app.workbook.sheets[0].cells.insert((0, 0), CellData {
+            value: "5".to_string(), formula: None, format: None,
+            comment: None, spill_anchor: None,
+        });
+        app.workbook.sheets[0].cells.insert((0, 1), CellData {
+            value: "0".to_string(),
+            formula: Some("=A1*2".to_string()),
+            format: None, comment: None, spill_anchor: None,
+        });
+        app.workbook.build_dep_graph_from_scratch();
+        let stale_node = (SheetId(0), 0, 1);
+        // Pre-import: the unified graph holds an entry for the formula
+        // cell. `graph` itself is private; cell_purities tracks every
+        // formula cell that's non-Pure, but `=A1*2` is Pure (no entry).
+        // Instead probe a side-effect: the unified graph's transitive
+        // dependents include the formula cell as a downstream of A1.
+        use std::collections::HashSet;
+        let mut a1: HashSet<_> = HashSet::new();
+        a1.insert((SheetId(0), 0, 0));
+        assert!(app.workbook.graph.transitive_dependents(&a1).contains(&stale_node),
+            "pre-import: stale node should be a dependent of A1");
+
+        // Build a fresh spreadsheet and import it (wholesale replace).
+        let mut imported = Spreadsheet::default();
+        imported.cells.insert((0, 0), CellData {
+            value: "100".to_string(), formula: None, format: None,
+            comment: None, spill_anchor: None,
+        });
+        app.set_csv_import_result(Ok(imported));
+
+        // Post-import: the stale dependent edge must be gone (its
+        // source cell no longer exists on the imported sheet).
+        assert!(!app.workbook.graph.transitive_dependents(&a1).contains(&stale_node),
+            "post-import: stale node must no longer be a dependent of A1");
+
+        // And :recalc on the new content shouldn't crash or invent
+        // values from stale entries.
+        app.workbook.recalc_via_graph();
+        assert_eq!(app.workbook.sheets[0].get_cell(0, 0).value, "100");
+    }
+
     /// Regression: smart auto-seed still picks up target changes.
     /// A bug in the skip logic would silently stop OFFSET from updating.
     #[test]
