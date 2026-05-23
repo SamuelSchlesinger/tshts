@@ -99,7 +99,13 @@ The executor is pluggable via the `RecalcExecutor` trait (`src/domain/services/e
 
 **Tuning**: set `TSHTS_PAR_THRESHOLD=N` to change the parallel-dispatch cutoff. `RAYON_NUM_THREADS=N` controls worker count. `cargo bench --bench calc_engine` runs the archetype benchmarks (wide/deep/fanout × small/medium/large) so you can pick a threshold that matches your workload.
 
-**Known limitations**: cross-sheet cycles converge only within each sheet's iterative loop (workbook-level iterative fallback is unimplemented). `NOW()`/`TODAY()` read `SystemTime::now()` directly rather than the `RecalcContext` clock snapshot, so two clock-volatile cells in one pass may differ by a few microseconds. `OFFSET`/`INDIRECT` dependencies are computed conservatively from literal args — they don't track value-derived precedents and thus may miss recalc opportunities.
+**Volatile semantics** (matched to Excel/OpenFormula):
+- `NOW`/`TODAY` read a clock snapshot captured at recalc start (via the `RECALC_CLOCK` thread-local published by each executor's `run`). Two clock-volatile cells in the same pass return identical values; calls outside a recalc fall back to `SystemTime::now()`.
+- `RAND`/`RANDBETWEEN` use a thread-local PRNG; cross-worker non-determinism is the intended trade — within a pass each worker's outputs are independent.
+- `OFFSET`/`INDIRECT` are tagged `VolatileStructural` and auto-seeded into the dirty set on every recalc, so changes to their value-derived targets propagate through their static dependents within one pass (matches Excel's "always recompute volatile").
+- `GET` is `SideEffecting`; serialized via the existing HTTP-fetcher worker (no executor changes needed).
+
+**Cross-sheet cycles**: handled by `Workbook::iterative_calc_cyclic` — a workbook-level Gauss-Seidel loop that walks every cyclic cell across all sheets per pass. Uses the highest `iter_max` and tightest `iter_epsilon` across participating sheets. Detects non-convergence (returns `Err(iter_max)`) and handles non-numeric flip-flop via two-pass string stability. Per-pass post-write maintenance (CF cache, spill ghosts, `maybe_spill`) is performed inside `with_recalc_context` to mirror the acyclic path.
 
 ## Dependencies
 

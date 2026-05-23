@@ -437,7 +437,6 @@ impl FunctionPurity {
     /// a rayon worker as part of a level batch. Pure / VolatileClock /
     /// VolatileRandom qualify; VolatileStructural and SideEffecting
     /// run sequentially.
-    #[allow(dead_code)]
     pub fn is_parallel_safe(self) -> bool {
         matches!(
             self,
@@ -661,7 +660,52 @@ pub(super) fn days_in_month(year: i32, month: u32) -> u32 {
     }
 }
 
+thread_local! {
+    /// Per-recalc-pass clock snapshot. When `Some(serial)`, NOW() and
+    /// TODAY() return values derived from `serial` rather than reading
+    /// `SystemTime::now()` directly. The executor publishes this at
+    /// pass start so every volatile-clock cell in a single pass returns
+    /// the same value — matching Excel's invariant that volatile cells
+    /// are consistent within a recalc.
+    ///
+    /// When `None` (no executor in scope, e.g. interactive cell-entry
+    /// preview or out-of-recalc evaluation), NOW/TODAY fall back to
+    /// reading the system clock. That fallback isn't observable to
+    /// users in the common case because they only see results at the
+    /// end of a recalc pass.
+    static RECALC_CLOCK: std::cell::Cell<Option<f64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` with `serial` published as the clock-snapshot context for
+/// the closure's duration. The previous value (likely `None`) is
+/// restored on exit, including when `f` panics — a `Drop` guard
+/// ensures the thread-local doesn't leak the snapshot to subsequent
+/// calls on the same worker. Supports nesting.
+///
+/// Called by `RecalcExecutor` impls. NOW/TODAY inside the closure
+/// (including from rayon workers — the thread-local fires per-thread,
+/// so we publish on workers via the same wrapper) read this snapshot.
+pub fn with_recalc_clock<R>(serial: f64, f: impl FnOnce() -> R) -> R {
+    struct ClockGuard(Option<f64>);
+    impl Drop for ClockGuard {
+        fn drop(&mut self) {
+            RECALC_CLOCK.with(|c| c.set(self.0));
+        }
+    }
+    let prev = RECALC_CLOCK.with(|c| c.replace(Some(serial)));
+    let _guard = ClockGuard(prev);
+    f()
+}
+
+/// Excel serial value for the current day (midnight). Reads the
+/// `RECALC_CLOCK` thread-local if a recalc is in scope, otherwise
+/// falls back to the live system clock. The result is the integer
+/// part of the now-serial, matching Excel's TODAY semantics.
 pub(super) fn today_serial() -> f64 {
+    if let Some(serial) = RECALC_CLOCK.with(|c| c.get()) {
+        return serial.floor();
+    }
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -671,7 +715,13 @@ pub(super) fn today_serial() -> f64 {
     25569.0 + days as f64
 }
 
+/// Excel serial value for the current instant. Reads the
+/// `RECALC_CLOCK` thread-local if a recalc is in scope, otherwise
+/// falls back to the live system clock.
 pub(super) fn now_serial() -> f64 {
+    if let Some(serial) = RECALC_CLOCK.with(|c| c.get()) {
+        return serial;
+    }
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)

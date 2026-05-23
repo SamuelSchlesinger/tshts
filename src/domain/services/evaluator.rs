@@ -1738,6 +1738,363 @@ mod tests {
         }
     }
 
+    /// Editing a formula from Pure to VolatileStructural (and back)
+    /// updates the cached purity classification in real time, not just
+    /// on the next full graph rebuild. Without this, the auto-seed
+    /// path for VolatileStructural cells silently disables itself for
+    /// any cell whose formula was edited after the initial load.
+    #[test]
+    fn test_incremental_purity_classification_updates_on_edit() {
+        use crate::domain::Workbook;
+        use crate::domain::models::SheetId;
+        use crate::domain::parser::FunctionPurity;
+
+        let mut wb = Workbook::default();
+        wb.sheets[0].cells.insert((0, 0), CellData {
+            value: "1".to_string(), formula: None, format: None,
+            comment: None, spill_anchor: None,
+        });
+        wb.sheets[0].cells.insert((1, 0), CellData {
+            value: "2".to_string(),
+            formula: Some("=A1+1".to_string()),
+            format: None, comment: None, spill_anchor: None,
+        });
+        wb.build_dep_graph_from_scratch();
+        let target = (SheetId(0), 1, 0);
+        assert_eq!(wb.cell_purity(target), FunctionPurity::Pure);
+
+        // Edit to INDIRECT — should become VolatileStructural.
+        wb.set_cell_on_active(1, 0, CellData {
+            value: "1".to_string(),
+            formula: Some("=INDIRECT(\"A1\")".to_string()),
+            format: None, comment: None, spill_anchor: None,
+        });
+        assert_eq!(
+            wb.cell_purity(target),
+            FunctionPurity::VolatileStructural,
+            "edit Pure → INDIRECT should update purity cache"
+        );
+
+        // Edit back to Pure — should drop the entry.
+        wb.set_cell_on_active(1, 0, CellData {
+            value: "2".to_string(),
+            formula: Some("=A1*2".to_string()),
+            format: None, comment: None, spill_anchor: None,
+        });
+        assert_eq!(
+            wb.cell_purity(target),
+            FunctionPurity::Pure,
+            "edit INDIRECT → Pure should clear the stale Structural classification"
+        );
+
+        // Clear entirely — purity cache should drop the entry.
+        wb.clear_cell_on_active(1, 0);
+        assert_eq!(wb.cell_purity(target), FunctionPurity::Pure);
+        assert!(
+            !wb.cell_purities.contains_key(&target),
+            "cleared cell should not have a cached purity"
+        );
+    }
+
+    /// Parallel executor with multiple NOW() cells — exercises the
+    /// per-worker `with_recalc_clock` publishing. Without correct
+    /// thread-local plumbing, workers would each call SystemTime and
+    /// get drift across cells.
+    #[test]
+    fn test_parallel_executor_now_consistent() {
+        use crate::domain::Workbook;
+        use crate::domain::services::{
+            ParallelExecutor, RecalcContext, RecalcExecutor, RecalcPlan,
+        };
+
+        let mut wb = Workbook::default();
+        // 8 cells with =NOW() — enough to fan out across rayon workers.
+        for i in 0..8 {
+            wb.sheets[0].cells.insert((i, 0), CellData {
+                value: "0".to_string(),
+                formula: Some("=NOW()".to_string()),
+                format: None, comment: None, spill_anchor: None,
+            });
+        }
+        wb.build_dep_graph_from_scratch();
+        for i in 0..8 {
+            wb.mark_dirty("Sheet1", i, 0);
+        }
+
+        // Build the plan manually and force ParallelExecutor with
+        // min_chunk=1 so multiple workers actually get the work.
+        let seeds: std::collections::HashSet<_> = wb
+            .drain_dirty()
+            .into_iter()
+            .filter_map(|k| wb.cross_sheet_key_to_node(&k))
+            .collect();
+        let topo = wb.graph.topo_levels_from_seeds(&seeds);
+        let plan = RecalcPlan { levels: topo.levels, cyclic: topo.cyclic };
+        let mut ctx = RecalcContext::new();
+        let exec = ParallelExecutor {
+            min_chunk: 1,
+            parallel_threshold: 1,
+        };
+        exec.run(&plan, &mut ctx, &mut wb).expect("parallel run");
+
+        // Every NOW() cell must return the snapshot value.
+        let first = wb.sheets[0].get_cell(0, 0).value;
+        for i in 1..8 {
+            let v = wb.sheets[0].get_cell(i, 0).value;
+            assert_eq!(v, first,
+                "NOW() at row {} = {} differs from row 0 = {}",
+                i, v, first);
+        }
+    }
+
+    /// Non-convergent cycle should hit iter_max and return Err. The
+    /// values aren't expected to be meaningful — we're just verifying
+    /// the engine doesn't loop forever or panic.
+    #[test]
+    fn test_iterative_calc_non_convergent_returns_err() {
+        use crate::domain::Workbook;
+        use crate::domain::models::NodeKey;
+
+        let mut wb = Workbook::default();
+        // A1 = B1 + 1, B1 = A1 + 1 — diverges by 2 each pass.
+        wb.sheets[0].cells.insert((0, 0), CellData {
+            value: "0".to_string(),
+            formula: Some("=B1+1".to_string()),
+            format: None, comment: None, spill_anchor: None,
+        });
+        wb.sheets[0].cells.insert((0, 1), CellData {
+            value: "0".to_string(),
+            formula: Some("=A1+1".to_string()),
+            format: None, comment: None, spill_anchor: None,
+        });
+        wb.sheets[0].iterative_calc = true;
+        wb.sheets[0].iter_max = 5; // keep the test fast
+        wb.sheets[0].iter_epsilon = 1e-6;
+
+        let cyclic: Vec<NodeKey> = vec![
+            wb.cross_sheet_key_to_node(&("Sheet1".to_string(), 0, 0)).unwrap(),
+            wb.cross_sheet_key_to_node(&("Sheet1".to_string(), 0, 1)).unwrap(),
+        ];
+        let result = wb.iterative_calc_cyclic(&cyclic);
+        assert!(matches!(result, Err(5)),
+            "diverging cycle should hit iter_max=5, got {:?}", result);
+    }
+
+    /// VolatileStructural cells (INDIRECT, OFFSET) auto-recompute on
+    /// every recalc so changes to their value-derived targets
+    /// propagate to their static dependents. Without this, INDIRECT(A1)
+    /// where A1 names B5 wouldn't pick up B5's changes (B5 isn't a
+    /// statically-tracked precedent of the INDIRECT cell).
+    #[test]
+    fn test_indirect_picks_up_target_changes() {
+        use crate::domain::Workbook;
+        let mut wb = Workbook::default();
+
+        // A1 = "B5" (literal: the target reference)
+        wb.sheets[0].cells.insert((0, 0), CellData {
+            value: "B5".to_string(),
+            formula: None, format: None, comment: None, spill_anchor: None,
+        });
+        // B5 = 100 (the target cell)
+        wb.sheets[0].cells.insert((4, 1), CellData {
+            value: "100".to_string(),
+            formula: None, format: None, comment: None, spill_anchor: None,
+        });
+        // C1 = =INDIRECT(A1) — should evaluate to B5's value (100)
+        wb.sheets[0].cells.insert((0, 2), CellData {
+            value: "0".to_string(),
+            formula: Some("=INDIRECT(A1)".to_string()),
+            format: None, comment: None, spill_anchor: None,
+        });
+        // D1 = =C1+1 — depends statically on C1
+        wb.sheets[0].cells.insert((0, 3), CellData {
+            value: "0".to_string(),
+            formula: Some("=C1+1".to_string()),
+            format: None, comment: None, spill_anchor: None,
+        });
+        wb.build_dep_graph_from_scratch();
+
+        // Initial recalc: seed everything dirty.
+        wb.mark_dirty("Sheet1", 0, 0);
+        wb.mark_dirty("Sheet1", 4, 1);
+        wb.recalc_via_graph();
+        assert_eq!(wb.sheets[0].get_cell(0, 2).value, "100", "C1 = INDIRECT(A1) → B5 = 100");
+        assert_eq!(wb.sheets[0].get_cell(0, 3).value, "101", "D1 = C1+1 = 101");
+
+        // Change B5 to 200. NOTHING ELSE changes — A1 still says "B5".
+        // C1 doesn't statically depend on B5, but as a VolatileStructural
+        // cell it auto-seeds on every recalc.
+        wb.sheets[0].cells.insert((4, 1), CellData {
+            value: "200".to_string(),
+            formula: None, format: None, comment: None, spill_anchor: None,
+        });
+        wb.mark_dirty("Sheet1", 4, 1);
+        wb.recalc_via_graph();
+        assert_eq!(wb.sheets[0].get_cell(0, 2).value, "200",
+            "C1 should pick up B5's new value via auto-seeded re-evaluation");
+        assert_eq!(wb.sheets[0].get_cell(0, 3).value, "201",
+            "D1 should cascade from updated C1");
+    }
+
+    /// Same property for OFFSET — the value-derived target update
+    /// propagates via the auto-seed mechanism.
+    #[test]
+    fn test_offset_picks_up_target_changes() {
+        use crate::domain::Workbook;
+        let mut wb = Workbook::default();
+
+        // A1 = 50 (base; OFFSET(A1, 0, 1) points at B1)
+        wb.sheets[0].cells.insert((0, 0), CellData {
+            value: "50".to_string(),
+            formula: None, format: None, comment: None, spill_anchor: None,
+        });
+        // B1 = 7 (the offset target)
+        wb.sheets[0].cells.insert((0, 1), CellData {
+            value: "7".to_string(),
+            formula: None, format: None, comment: None, spill_anchor: None,
+        });
+        // C1 = =OFFSET(A1, 0, 1) — should read B1
+        wb.sheets[0].cells.insert((0, 2), CellData {
+            value: "0".to_string(),
+            formula: Some("=OFFSET(A1, 0, 1)".to_string()),
+            format: None, comment: None, spill_anchor: None,
+        });
+        wb.build_dep_graph_from_scratch();
+        wb.mark_dirty("Sheet1", 0, 0);
+        wb.mark_dirty("Sheet1", 0, 1);
+        wb.recalc_via_graph();
+        assert_eq!(wb.sheets[0].get_cell(0, 2).value, "7");
+
+        // Change B1 to 99. OFFSET cell doesn't statically depend on B1
+        // (only on A1). Auto-seed picks it up.
+        wb.sheets[0].cells.insert((0, 1), CellData {
+            value: "99".to_string(),
+            formula: None, format: None, comment: None, spill_anchor: None,
+        });
+        wb.mark_dirty("Sheet1", 0, 1);
+        wb.recalc_via_graph();
+        assert_eq!(wb.sheets[0].get_cell(0, 2).value, "99",
+            "OFFSET should pick up B1's new value");
+    }
+
+    /// Within a single recalc pass, two NOW() cells must return the
+    /// same value. Tests the RECALC_CLOCK thread-local plumbing.
+    #[test]
+    fn test_now_consistent_within_recalc_pass() {
+        use crate::domain::Workbook;
+
+        let mut wb = Workbook::default();
+        // Two cells, both =NOW(). After recalc they should be equal.
+        wb.sheets[0].cells.insert((0, 0), CellData {
+            value: "0".to_string(),
+            formula: Some("=NOW()".to_string()),
+            format: None, comment: None, spill_anchor: None,
+        });
+        wb.sheets[0].cells.insert((1, 0), CellData {
+            value: "0".to_string(),
+            formula: Some("=NOW()".to_string()),
+            format: None, comment: None, spill_anchor: None,
+        });
+        wb.build_dep_graph_from_scratch();
+        wb.mark_dirty("Sheet1", 0, 0);
+        wb.mark_dirty("Sheet1", 1, 0);
+        wb.recalc_via_graph();
+
+        let a = wb.sheets[0].get_cell(0, 0).value;
+        let b = wb.sheets[0].get_cell(1, 0).value;
+        assert_eq!(a, b,
+            "two NOW() in the same recalc pass should return identical values");
+    }
+
+    /// TODAY() also reads the snapshot clock — verify it returns a
+    /// consistent value across the pass.
+    #[test]
+    fn test_today_consistent_within_recalc_pass() {
+        use crate::domain::Workbook;
+
+        let mut wb = Workbook::default();
+        wb.sheets[0].cells.insert((0, 0), CellData {
+            value: "0".to_string(),
+            formula: Some("=TODAY()".to_string()),
+            format: None, comment: None, spill_anchor: None,
+        });
+        wb.sheets[0].cells.insert((1, 0), CellData {
+            value: "0".to_string(),
+            formula: Some("=TODAY()".to_string()),
+            format: None, comment: None, spill_anchor: None,
+        });
+        wb.build_dep_graph_from_scratch();
+        wb.mark_dirty("Sheet1", 0, 0);
+        wb.mark_dirty("Sheet1", 1, 0);
+        wb.recalc_via_graph();
+
+        let a = wb.sheets[0].get_cell(0, 0).value;
+        let b = wb.sheets[0].get_cell(1, 0).value;
+        assert_eq!(a, b);
+    }
+
+    /// Outside a recalc context, NOW() still falls back to SystemTime
+    /// (no panic, returns a real serial).
+    #[test]
+    fn test_now_outside_recalc_uses_system_time() {
+        use crate::domain::Spreadsheet;
+        let sheet = Spreadsheet::default();
+        let evaluator = FormulaEvaluator::new(&sheet);
+        let v: f64 = evaluator.evaluate_formula("=NOW()").parse().expect("numeric");
+        // Should be a reasonable Excel serial (year 2020+ ≈ 43800+).
+        assert!(v > 40000.0 && v < 200000.0, "got {}", v);
+    }
+
+    /// Cross-sheet iterative-calc converges via the workbook-level
+    /// loop. Two cells form a cycle: Sheet1!A1 = Sheet2!A1 * 0.5 + 10,
+    /// Sheet2!A1 = Sheet1!A1 * 0.5 + 5. Fixed point: A1=20, A2=15.
+    #[test]
+    fn test_cross_sheet_cycle_converges() {
+        use crate::domain::Workbook;
+        let mut wb = Workbook::default();
+        wb.add_sheet("Sheet2".to_string());
+
+        // Enable iterative_calc on both sheets.
+        for s in &mut wb.sheets {
+            s.iterative_calc = true;
+            s.iter_max = 200;
+            s.iter_epsilon = 1e-6;
+        }
+
+        // Sheet1!A1 = Sheet2!A1 * 0.5 + 10
+        wb.sheets[0].cells.insert((0, 0), CellData {
+            value: "10".to_string(),
+            formula: Some("=Sheet2!A1 * 0.5 + 10".to_string()),
+            format: None, comment: None, spill_anchor: None,
+        });
+        // Sheet2!A1 = Sheet1!A1 * 0.5 + 5
+        wb.sheets[1].cells.insert((0, 0), CellData {
+            value: "5".to_string(),
+            formula: Some("=Sheet1!A1 * 0.5 + 5".to_string()),
+            format: None, comment: None, spill_anchor: None,
+        });
+        wb.build_dep_graph_from_scratch();
+        wb.mark_dirty("Sheet1", 0, 0);
+        wb.mark_dirty("Sheet2", 0, 0);
+        wb.recalc_via_graph();
+
+        // Expected fixed point: solve A = B*0.5 + 10, B = A*0.5 + 5
+        //                       A = (A*0.5 + 5)*0.5 + 10 = A*0.25 + 12.5
+        //                       0.75A = 12.5
+        //                       A = 16.666...
+        //                       B = 16.666*0.5 + 5 = 13.333...
+        let a: f64 = wb.sheets[0].get_cell(0, 0).value.parse().expect("A1 numeric");
+        let b: f64 = wb.sheets[1].get_cell(0, 0).value.parse().expect("S2!A1 numeric");
+        assert!(
+            (a - 16.666_666_666_666_668).abs() < 1e-3,
+            "Sheet1!A1 should converge to ~16.667, got {}", a
+        );
+        assert!(
+            (b - 13.333_333_333_333_334).abs() < 1e-3,
+            "S2!A1 should converge to ~13.333, got {}", b
+        );
+    }
+
     /// `recalc_via_graph` with empty dirty is a no-op (no panics).
     #[test]
     fn test_recalc_via_graph_no_op_when_clean() {

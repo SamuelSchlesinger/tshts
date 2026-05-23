@@ -363,6 +363,164 @@ impl Workbook {
         Some((self.sheet_ids[idx], key.1, key.2))
     }
 
+    /// Iterative recalc for a set of cyclic cells that span sheets.
+    /// Loops up to `iter_max` passes; converges when every cell's
+    /// numeric delta from the previous pass is below `iter_epsilon`.
+    /// Returns `Ok(passes_taken)` on convergence, `Err(iter_max)` on
+    /// non-convergence so callers can surface the result.
+    ///
+    /// Replaces the per-sheet `recalculate_dependents` fallback that
+    /// the executors previously used for cyclic remainder — that path
+    /// only saw one leg of a cross-sheet cycle and never converged.
+    ///
+    /// `iter_max` / `iter_epsilon` are read from the active sheet
+    /// (matches the per-sheet behavior; if a workbook user wants
+    /// different settings per cycle, they can adjust the active sheet
+    /// before triggering recalc). PRNG-based volatile cells inside a
+    /// cycle remain non-deterministic across iterations — they're a
+    /// pathological case the user opts into by enabling iterative_calc.
+    pub fn iterative_calc_cyclic(
+        &mut self,
+        cyclic: &[NodeKey],
+    ) -> Result<usize, usize> {
+        use crate::domain::services::FormulaEvaluator;
+
+        if cyclic.is_empty() {
+            return Ok(0);
+        }
+
+        // Pre-resolve (node, sheet_idx, formula) so the hot loop doesn't
+        // re-walk sheet_idx_of every iteration.
+        let mut work: Vec<(NodeKey, usize, String)> = Vec::with_capacity(cyclic.len());
+        for &node in cyclic {
+            let Some(sheet_idx) = self.sheet_idx_of(node.0) else {
+                continue;
+            };
+            let Some(formula) = self.sheets[sheet_idx]
+                .cells
+                .get(&(node.1, node.2))
+                .and_then(|cd| cd.formula.clone())
+            else {
+                continue;
+            };
+            work.push((node, sheet_idx, formula));
+        }
+        if work.is_empty() {
+            return Ok(0);
+        }
+
+        // Settings: take the most-permissive iter_max and tightest
+        // iter_epsilon across every sheet that owns a cyclic cell, so
+        // a multi-sheet cycle's convergence isn't constrained by the
+        // active sheet's (possibly conservative) settings. The legacy
+        // per-sheet path used the owning sheet's settings; this is the
+        // workbook-level analog.
+        let involved_sheets: std::collections::HashSet<usize> =
+            work.iter().map(|(_, idx, _)| *idx).collect();
+        let iter_max = involved_sheets
+            .iter()
+            .map(|&i| self.sheets[i].iter_max)
+            .max()
+            .unwrap_or(100)
+            .max(1); // Always allow at least one pass — iter_max=0 would
+                     // otherwise leave cyclic cells with stale values
+                     // and confuse callers about convergence.
+        let iter_epsilon = involved_sheets
+            .iter()
+            .map(|&i| self.sheets[i].iter_epsilon)
+            .fold(f64::INFINITY, f64::min);
+
+        // Track non-numeric stability across two consecutive passes.
+        // Pure flip-flop (A → B → A → B ...) would otherwise force
+        // every cycle to iter_max with no signal of failure; we detect
+        // "value stable for 2 consecutive passes" as convergence even
+        // when only string-valued.
+        let mut prev_string_values: HashMap<NodeKey, String> = HashMap::new();
+        let mut string_stable_for_one_pass: HashSet<NodeKey> = HashSet::new();
+
+        // Iterate. Each pass evaluates against a snapshot that includes
+        // results from prior passes (Gauss-Seidel-like: each iteration
+        // mutates the live workbook and the next iteration's snapshot
+        // reflects it).
+        for pass in 1..=iter_max {
+            let mut max_delta: f64 = 0.0;
+            let mut all_strings_stable = true;
+            let snapshot = self.clone();
+            let names = snapshot.named_ranges.clone();
+            for (node, sheet_idx, formula) in &work {
+                let new_value = {
+                    let snap_sheet = &snapshot.sheets[*sheet_idx];
+                    let evaluator =
+                        FormulaEvaluator::for_workbook(&snapshot, snap_sheet, &names);
+                    evaluator.evaluate_formula(formula)
+                };
+                let prev_value = self.sheets[*sheet_idx]
+                    .cells
+                    .get(&(node.1, node.2))
+                    .map(|cd| cd.value.clone())
+                    .unwrap_or_default();
+                let prev_num: Option<f64> = prev_value.parse().ok();
+                let new_num: Option<f64> = new_value.parse().ok();
+                match (prev_num, new_num) {
+                    (Some(a), Some(b)) => {
+                        let delta = (a - b).abs();
+                        if delta > max_delta {
+                            max_delta = delta;
+                        }
+                    }
+                    _ => {
+                        // Non-numeric branch: convergence requires the
+                        // value to remain identical for 2 consecutive
+                        // passes. First pass after a change → marked
+                        // "stable for one pass" but not converged.
+                        // Second consecutive pass with the same value
+                        // → converged for this cell.
+                        if prev_value == new_value
+                            && prev_string_values
+                                .get(node)
+                                .is_some_and(|p| p == &new_value)
+                        {
+                            // Stable across two passes; nothing to do.
+                        } else if prev_value == new_value
+                            || prev_string_values
+                                .get(node)
+                                .is_some_and(|p| p == &new_value)
+                        {
+                            // Stable across one pass — need another to
+                            // confirm. Treat as still-unstable for now.
+                            string_stable_for_one_pass.insert(*node);
+                            all_strings_stable = false;
+                        } else {
+                            all_strings_stable = false;
+                            string_stable_for_one_pass.remove(node);
+                        }
+                        prev_string_values.insert(*node, new_value.clone());
+                    }
+                }
+                // Apply the new value with the same post-write
+                // maintenance the acyclic path performs: clear CF
+                // cache, sweep stale spill ghosts, re-spill array
+                // formulas. Wrap in with_recalc_context so a spill
+                // re-evaluation resolves cross-sheet refs.
+                with_recalc_context(&snapshot, || {
+                    let sheet = &mut self.sheets[*sheet_idx];
+                    if let Some(cd) = sheet.cells.get_mut(&(node.1, node.2)) {
+                        cd.value = new_value;
+                    }
+                    sheet.cf_cache.lock().unwrap().clear();
+                    sheet.sweep_spill_ghosts_for(node.1, node.2);
+                    sheet.maybe_spill(node.1, node.2);
+                });
+            }
+            // Converged when numeric deltas are below epsilon AND no
+            // non-numeric flip-flops remain.
+            if max_delta < iter_epsilon && all_strings_stable {
+                return Ok(pass);
+            }
+        }
+        Err(iter_max)
+    }
+
     /// Sequential recalc driven by the workbook-level graph and dirty set.
     /// Drains [`Workbook::dirty`], expands the closure via the graph,
     /// computes topological levels, and re-evaluates each cell in level
@@ -373,24 +531,27 @@ impl Workbook {
     /// implementation. Today it's exposed alongside the legacy recalc so
     /// callers can switch over while tests verify behavior parity.
     ///
-    /// Known gaps vs the legacy path (closed in later PRs):
-    /// - **OFFSET / INDIRECT / CHOOSE** dynamic references are not
-    ///   captured in the dep graph by `extract_qualified_refs_from_ast`
-    ///   (they require value-level evaluation to know their targets).
-    ///   PR 2's purity classification surfaces these so the scheduler
-    ///   can serialize their evaluation.
-    /// - **Cross-sheet cycles** are detected but routed to per-sheet
-    ///   iterative-calc, which only sees one leg of the cycle and may
-    ///   not converge. PR 3 introduces a workbook-level iterative loop.
+    /// Behavior notes:
+    /// - **OFFSET / INDIRECT** dependencies on value-derived targets
+    ///   can't be statically extracted. These cells are tagged
+    ///   `VolatileStructural` and auto-seeded into the dirty set on
+    ///   every recalc, so changes to their value-derived targets
+    ///   propagate through their static dependents within one pass.
+    ///   This matches Excel's "always recompute volatile" semantics.
+    /// - **Cross-sheet cycles** are handled by `iterative_calc_cyclic`
+    ///   (workbook-level iterative loop). Uses the highest iter_max
+    ///   and tightest iter_epsilon across sheets participating in the
+    ///   cycle.
     /// - **Per-level workbook clone** is O(workbook size) per level.
-    ///   Acceptable for PR 1; replaced by `Arc<WorkbookSnapshot>` in PR 4.
+    ///   A future PR can replace this with `Arc<WorkbookSnapshot>` for
+    ///   deeper graphs where the clone dominates.
     pub fn recalc_via_graph(&mut self) {
         // Lazy build: if the graph is empty, rebuild from scratch. PR 3+
         // will keep it incrementally maintained on writes.
         if self.graph.is_empty() {
             self.build_dep_graph_from_scratch();
         }
-        if self.dirty.is_empty() {
+        if self.dirty.is_empty() && self.cell_purities.is_empty() {
             return;
         }
 
@@ -402,6 +563,24 @@ impl Workbook {
                 seeds.insert(node);
             }
         }
+
+        // Auto-seed VolatileStructural cells (OFFSET, INDIRECT, etc.)
+        // on every recalc. Their dep edges are computed conservatively
+        // from literal args, so they don't pick up changes to their
+        // value-derived targets — but if we re-evaluate them every
+        // pass, the new result propagates through their (static)
+        // dependents and the user observes correct values. Matches
+        // Excel's "always recompute volatile" semantics. The same
+        // policy is implied for VolatileClock/Random by the auto-
+        // seeding of `recalc_all` (which seeds all formula cells);
+        // we narrow here to structural since clock/random recompute
+        // is handled separately by RecalcContext + thread-local PRNG.
+        for (&node, &purity) in &self.cell_purities {
+            if purity == crate::domain::parser::FunctionPurity::VolatileStructural {
+                seeds.insert(node);
+            }
+        }
+
         if seeds.is_empty() {
             return;
         }
@@ -601,6 +780,10 @@ impl Workbook {
                 .collect();
             for node in dead_nodes {
                 self.graph.forget_node(node);
+                // Drop stale purity entries too — without this the
+                // auto-seed loop in `recalc_via_graph` walks dead
+                // (sheet_id, r, c) keys forever.
+                self.cell_purities.remove(&node);
             }
         }
         // Every surviving formula cell that referenced the removed sheet
@@ -898,6 +1081,12 @@ impl Workbook {
         } else {
             self.sheets[self.active_sheet].set_cell(row, col, data);
         }
+        // Keep the unified graph + purity cache in sync with the new
+        // formula. Without this, an interactive edit from `=A1+1` to
+        // `=INDIRECT(A1)` would leave the cell classified as Pure and
+        // miss the VolatileStructural auto-seed in recalc_via_graph.
+        let sheet_name = self.sheet_names[self.active_sheet].clone();
+        self.register_cross_sheet_deps(&sheet_name, row, col);
     }
 
     /// Clear a single cell on the active sheet with workbook context
@@ -917,6 +1106,11 @@ impl Workbook {
         } else {
             self.sheets[self.active_sheet].clear_cell(row, col);
         }
+        // Drop the cell's graph + purity entries; an Indirect-after-
+        // clear would otherwise auto-seed on the next recalc and try
+        // to evaluate a now-empty cell.
+        let sheet_name = self.sheet_names[self.active_sheet].clone();
+        self.forget_cell_in_graph(&sheet_name, row, col);
     }
 
     /// Write a batch of cells to the active sheet, then propagate.
@@ -1091,6 +1285,89 @@ impl Workbook {
                 .entry(prec)
                 .or_default()
                 .insert(key.clone());
+        }
+
+        // Step 5: keep the unified workbook graph and per-cell purity
+        // cache consistent with the formula change. Without this,
+        // graph-driven recalc walks a stale graph after any
+        // interactive edit. The legacy cross_sheet_* maps above only
+        // cover cross-sheet edges; the unified graph covers both
+        // same-sheet AND cross-sheet, and `cell_purities` is the
+        // engine's only signal that this cell is volatile.
+        self.update_unified_graph_and_purity(sheet_idx, key.clone(), &formula);
+    }
+
+    /// Re-derive the unified graph edges + purity classification for a
+    /// single cell. Called from `register_cross_sheet_deps` so every
+    /// interactive cell-mutation path keeps the graph and purity cache
+    /// in sync. Replaces the cell's outgoing edges via `set_prereqs`
+    /// (which clears the old set first), so a formula edit from
+    /// `=INDIRECT(A1)` to `=A1+1` removes the structural-volatile
+    /// classification and the dynamic edges.
+    fn update_unified_graph_and_purity(
+        &mut self,
+        sheet_idx: usize,
+        key: CrossSheetKey,
+        formula: &str,
+    ) {
+        use crate::domain::services::FormulaEvaluator;
+        // Translate the cross-sheet key into a unified graph node key.
+        let Some(node) = self.cross_sheet_key_to_node(&key) else {
+            return;
+        };
+        // Pull the workbook-context evaluator from a snapshot so we
+        // can borrow `self` immutably while updating the graph.
+        let snapshot = self.clone();
+        let names = snapshot.named_ranges.clone();
+        let evaluator = FormulaEvaluator::for_workbook(
+            &snapshot,
+            &snapshot.sheets[sheet_idx],
+            &names,
+        );
+        let qrefs = evaluator.extract_qualified_refs(formula);
+        let resolved: Vec<NodeKey> = qrefs
+            .into_iter()
+            .filter_map(|(maybe_sheet, rr, cc)| {
+                let owner_idx = match maybe_sheet {
+                    Some(name) => snapshot
+                        .sheet_names
+                        .iter()
+                        .position(|n| n.eq_ignore_ascii_case(&name))?,
+                    None => sheet_idx,
+                };
+                Some((snapshot.sheet_ids[owner_idx], rr, cc))
+            })
+            .collect();
+        self.graph.set_prereqs(node, resolved);
+        // Recompute purity. Pure cells are stored implicitly (absent
+        // from the map) so we explicitly remove the entry when the
+        // new formula is Pure — a Pure-after-VolatileStructural edit
+        // would otherwise leave a stale Structural entry.
+        let registry = crate::domain::parser::FunctionRegistry::shared_builtin();
+        let strip_eq = formula.strip_prefix('=').unwrap_or(formula);
+        let pur = match crate::domain::parser::Parser::new(strip_eq) {
+            Ok(mut p) => p
+                .parse()
+                .map(|ast| crate::domain::parser::formula_purity(&ast, &registry))
+                .unwrap_or(crate::domain::parser::FunctionPurity::Pure),
+            Err(_) => crate::domain::parser::FunctionPurity::Pure,
+        };
+        if pur == crate::domain::parser::FunctionPurity::Pure {
+            self.cell_purities.remove(&node);
+        } else {
+            self.cell_purities.insert(node, pur);
+        }
+    }
+
+    /// Drop unified-graph + purity tracking for a cell whose formula
+    /// was removed (or the cell itself was deleted). Called from
+    /// `clear_cell_on_active` paths so a Pure-after-delete or
+    /// Structural-after-delete entry doesn't haunt future recalcs.
+    pub fn forget_cell_in_graph(&mut self, sheet_name: &str, row: usize, col: usize) {
+        let key: CrossSheetKey = (sheet_name.to_string(), row, col);
+        if let Some(node) = self.cross_sheet_key_to_node(&key) {
+            self.graph.unlink_node(node);
+            self.cell_purities.remove(&node);
         }
     }
 

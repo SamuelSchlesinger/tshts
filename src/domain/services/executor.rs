@@ -21,7 +21,6 @@
 //! Parallel impls share `RecalcPlan`/`RecalcContext`/`CalcError` so the
 //! orchestrator code at the call site doesn't change between PRs.
 
-use std::collections::HashMap;
 
 use crate::domain::models::{NodeKey, Workbook};
 
@@ -37,13 +36,8 @@ use crate::domain::models::{NodeKey, Workbook};
 pub struct RecalcContext {
     /// Wall-clock value (Excel serial) captured at pass start. NOW/TODAY
     /// read this instead of `SystemTime::now()` so every clock-volatile
-    /// cell in a single pass returns the same instant.
-    ///
-    /// Today NOW/TODAY in tshts still read `SystemTime::now()` directly
-    /// because the evaluator doesn't yet plumb `RecalcContext` through.
-    /// PR 4 will swap the implementations. The field is here so the
-    /// trait stabilizes before that swap.
-    #[allow(dead_code)]
+    /// cell in a single pass returns the same instant. Published to
+    /// `parser::RECALC_CLOCK` by each executor's `run` method.
     pub clock_snapshot: f64,
 }
 
@@ -132,7 +126,23 @@ impl RecalcExecutor for SequentialExecutor {
     fn run(
         &self,
         plan: &RecalcPlan,
-        _ctx: &mut RecalcContext,
+        ctx: &mut RecalcContext,
+        wb: &mut Workbook,
+    ) -> Result<(), CalcError> {
+        
+
+        // Publish the clock snapshot so NOW()/TODAY() inside this
+        // pass return consistent values. Restored on exit.
+        crate::domain::parser::with_recalc_clock(ctx.clock_snapshot, || {
+            self.run_inner(plan, wb)
+        })
+    }
+}
+
+impl SequentialExecutor {
+    fn run_inner(
+        &self,
+        plan: &RecalcPlan,
         wb: &mut Workbook,
     ) -> Result<(), CalcError> {
         use crate::domain::services::FormulaEvaluator;
@@ -196,22 +206,16 @@ impl RecalcExecutor for SequentialExecutor {
             });
         }
 
-        // Cyclic remainder: fall back to per-sheet iterative-calc.
-        if !plan.cyclic.is_empty() {
-            let mut by_sheet: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
-            for &(sid, r, c) in &plan.cyclic {
-                if let Some(idx) = wb.sheet_idx_of(sid) {
-                    by_sheet.entry(idx).or_default().push((r, c));
-                }
-            }
-            let snapshot = wb.clone();
-            crate::domain::models::with_recalc_context(&snapshot, || {
-                for (sheet_idx, cells) in by_sheet {
-                    for (r, c) in cells {
-                        wb.sheets[sheet_idx].recalculate_dependents(r, c);
-                    }
-                }
-            });
+        // Cyclic remainder: workbook-level iterative-calc that walks
+        // every cycle across all sheets. The legacy per-sheet fallback
+        // only saw one leg of a cross-sheet cycle and never converged.
+        if !plan.cyclic.is_empty()
+            && let Err(_iter_max) = wb.iterative_calc_cyclic(&plan.cyclic)
+        {
+            // Non-convergence isn't fatal — the iterated values are
+            // still written, just stopped at iter_max. A future PR
+            // could surface this to the UI as a "did not converge"
+            // warning; for now we let the values speak for themselves.
         }
 
         Ok(())
@@ -264,11 +268,26 @@ impl RecalcExecutor for ParallelExecutor {
     fn run(
         &self,
         plan: &RecalcPlan,
-        _ctx: &mut RecalcContext,
+        ctx: &mut RecalcContext,
         wb: &mut Workbook,
     ) -> Result<(), CalcError> {
-        use crate::domain::parser::FunctionPurity;
-        use crate::domain::services::FormulaEvaluator;
+        // Publish clock on the main thread; workers re-publish per call
+        // since thread-locals don't cross thread boundaries.
+        crate::domain::parser::with_recalc_clock(ctx.clock_snapshot, || {
+            self.run_inner(plan, ctx.clock_snapshot, wb)
+        })
+    }
+}
+
+impl ParallelExecutor {
+    fn run_inner(
+        &self,
+        plan: &RecalcPlan,
+        clock_snapshot: f64,
+        wb: &mut Workbook,
+    ) -> Result<(), CalcError> {
+        
+        
         use rayon::prelude::*;
         use std::sync::Arc;
 
@@ -312,11 +331,17 @@ impl RecalcExecutor for ParallelExecutor {
             // savings.
             if par_cells.len() >= self.parallel_threshold {
                 let snap_ref: &Workbook = &snapshot;
+                // Each worker publishes the clock on its own thread —
+                // thread-locals don't propagate across worker spawns,
+                // so we re-publish in the closure body.
                 let par_writes: Vec<(NodeKey, String)> = par_cells
                     .par_iter()
                     .with_min_len(self.min_chunk)
                     .filter_map(|&node| {
-                        eval_one(node, snap_ref).map(|v| (node, v))
+                        crate::domain::parser::with_recalc_clock(
+                            clock_snapshot,
+                            || eval_one(node, snap_ref).map(|v| (node, v)),
+                        )
                     })
                     .collect();
                 writes.extend(par_writes);
@@ -348,23 +373,16 @@ impl RecalcExecutor for ParallelExecutor {
             });
         }
 
-        // Cyclic remainder: same fallback as SequentialExecutor.
-        if !plan.cyclic.is_empty() {
-            let mut by_sheet: std::collections::HashMap<usize, Vec<(usize, usize)>> =
-                std::collections::HashMap::new();
-            for &(sid, r, c) in &plan.cyclic {
-                if let Some(idx) = wb.sheet_idx_of(sid) {
-                    by_sheet.entry(idx).or_default().push((r, c));
-                }
-            }
-            let snapshot = wb.clone();
-            crate::domain::models::with_recalc_context(&snapshot, || {
-                for (sheet_idx, cells) in by_sheet {
-                    for (r, c) in cells {
-                        wb.sheets[sheet_idx].recalculate_dependents(r, c);
-                    }
-                }
-            });
+        // Cyclic remainder: workbook-level iterative-calc, same as
+        // SequentialExecutor. (Originally this path used the per-sheet
+        // fallback; iterative_calc_cyclic handles cross-sheet cycles
+        // that the per-sheet path silently dropped.)
+        if !plan.cyclic.is_empty()
+            && let Err(_iter_max) = wb.iterative_calc_cyclic(&plan.cyclic)
+        {
+            // Non-convergence handled the same way as Sequential: the
+            // last-iterate values are kept. A future PR can surface
+            // this as a status warning via CalcError.
         }
 
         Ok(())
