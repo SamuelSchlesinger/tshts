@@ -2172,6 +2172,46 @@ mod tests {
         }
     }
 
+    /// Two NOW() cells typed in any order, with any keystroke between
+    /// them, must show the SAME timestamp after recalc — otherwise the
+    /// user sees inconsistent clocks across their workbook. Excel
+    /// guarantees this via "every recalc re-evaluates every volatile
+    /// cell"; we get it via the auto-seed for VolatileClock cells in
+    /// `recalc_via_graph_inner`.
+    #[test]
+    fn test_now_cells_stay_in_sync_across_edits() {
+        use crate::domain::Workbook;
+        let mut wb = Workbook::default();
+        // Type two =NOW() cells.
+        wb.set_cell_on_active(0, 0, CellData {
+            value: "0".to_string(),
+            formula: Some("=NOW()".to_string()),
+            format: None, comment: None, spill_anchor: None,
+        });
+        wb.set_cell_on_active(1, 0, CellData {
+            value: "0".to_string(),
+            formula: Some("=NOW()".to_string()),
+            format: None, comment: None, spill_anchor: None,
+        });
+        // After the second edit, both A1 and A2 must show the same
+        // clock snapshot (the one captured at the start of A2's recalc).
+        let a1 = wb.sheets[0].get_cell(0, 0).value.clone();
+        let a2 = wb.sheets[0].get_cell(1, 0).value.clone();
+        assert_eq!(a1, a2,
+            "two NOW() cells must agree after recalc; A1={:?} A2={:?}", a1, a2);
+
+        // Editing an unrelated cell should also keep them in sync (any
+        // recalc re-evaluates all VolatileClock cells).
+        wb.set_cell_on_active(0, 5, CellData {
+            value: "42".to_string(), formula: None, format: None,
+            comment: None, spill_anchor: None,
+        });
+        let a1 = wb.sheets[0].get_cell(0, 0).value.clone();
+        let a2 = wb.sheets[0].get_cell(1, 0).value.clone();
+        assert_eq!(a1, a2,
+            "NOW() cells must re-sync on any recalc; A1={:?} A2={:?}", a1, a2);
+    }
+
     /// Non-convergence surfaces as a user-visible status message via
     /// `App::recalc_all`. Matches Excel's "Calculation did not converge"
     /// indicator.
@@ -2190,9 +2230,9 @@ mod tests {
             formula: Some("=A1+1".to_string()),
             format: None, comment: None, spill_anchor: None,
         });
-        app.workbook.sheets[0].iterative_calc = true;
-        app.workbook.sheets[0].iter_max = 3;
-        app.workbook.sheets[0].iter_epsilon = 1e-6;
+        app.workbook.iterative_calc = true;
+        app.workbook.iter_max = 3;
+        app.workbook.iter_epsilon = 1e-6;
 
         app.recalc_all();
         let msg = app.status_message.expect("status message set");
@@ -2230,9 +2270,9 @@ mod tests {
             formula: Some("=A1+1".to_string()),
             format: None, comment: None, spill_anchor: None,
         });
-        wb.sheets[0].iterative_calc = true;
-        wb.sheets[0].iter_max = 5; // keep the test fast
-        wb.sheets[0].iter_epsilon = 1e-6;
+        wb.iterative_calc = true;
+        wb.iter_max = 5; // keep the test fast
+        wb.iter_epsilon = 1e-6;
 
         let cyclic: Vec<NodeKey> = vec![
             wb.cross_sheet_key_to_node(&("Sheet1".to_string(), 0, 0)).unwrap(),
@@ -2417,12 +2457,10 @@ mod tests {
         let mut wb = Workbook::default();
         wb.add_sheet("Sheet2".to_string());
 
-        // Enable iterative_calc on both sheets.
-        for s in &mut wb.sheets {
-            s.iterative_calc = true;
-            s.iter_max = 200;
-            s.iter_epsilon = 1e-6;
-        }
+        // Enable iterative_calc workbook-wide.
+        wb.iterative_calc = true;
+        wb.iter_max = 200;
+        wb.iter_epsilon = 1e-6;
 
         // Sheet1!A1 = Sheet2!A1 * 0.5 + 10
         wb.sheets[0].cells.insert((0, 0), CellData {
@@ -2997,11 +3035,9 @@ mod tests {
     fn test_divergent_iterative_calc_marks_num_error() {
         use crate::domain::Workbook;
         let mut wb = Workbook::default();
-        for s in &mut wb.sheets {
-            s.iterative_calc = true;
-            s.iter_max = 100;
-            s.iter_epsilon = 1e-9;
-        }
+        wb.iterative_calc = true;
+        wb.iter_max = 100;
+        wb.iter_epsilon = 1e-9;
         wb.set_cell_on_active(0, 0, CellData {
             value: "0".to_string(),
             formula: Some("=A1+1".to_string()),
@@ -3024,11 +3060,9 @@ mod tests {
     fn test_convergent_iterative_calc_lands_on_fixed_point() {
         use crate::domain::Workbook;
         let mut wb = Workbook::default();
-        for s in &mut wb.sheets {
-            s.iterative_calc = true;
-            s.iter_max = 200;
-            s.iter_epsilon = 1e-9;
-        }
+        wb.iterative_calc = true;
+        wb.iter_max = 200;
+        wb.iter_epsilon = 1e-9;
         // x = x/2 + 1 → fixed point at x=2 (starting from 0:
         // 0 → 1 → 1.5 → 1.75 → 1.875 → ... → 2)
         wb.set_cell_on_active(0, 0, CellData {
@@ -4208,7 +4242,7 @@ mod tests {
             sheets: vec![], // pathological: empty
             sheet_names: vec![],
             active_sheet: 0,
-            named_ranges: named.clone(),
+            named_ranges: named.clone(), iterative_calc: false, iter_max: 100, iter_epsilon: 1e-6,
             dirty: Default::default(),
             sheet_ids: Vec::new(),
             next_sheet_id: 0,
@@ -4235,7 +4269,7 @@ mod tests {
             sheets: vec![Spreadsheet::default()],
             sheet_names: vec!["Sheet1".to_string()],
             active_sheet: 99,
-            named_ranges: Default::default(),
+            named_ranges: Default::default(), iterative_calc: false, iter_max: 100, iter_epsilon: 1e-6,
             dirty: Default::default(),
             sheet_ids: Vec::new(),
             next_sheet_id: 0,
@@ -4297,7 +4331,7 @@ mod tests {
             sheets: vec![Spreadsheet::default()],
             sheet_names: vec!["Sheet1".to_string()],
             active_sheet: 0,
-            named_ranges: Default::default(),
+            named_ranges: Default::default(), iterative_calc: false, iter_max: 100, iter_epsilon: 1e-6,
             dirty: Default::default(),
             sheet_ids: Vec::new(),
             next_sheet_id: 0,
@@ -4341,7 +4375,7 @@ mod tests {
             sheets: vec![Spreadsheet::default(), Spreadsheet::default()],
             sheet_names: vec!["OnlyOne".to_string()], // mismatched: 2 sheets, 1 name
             active_sheet: 0,
-            named_ranges: Default::default(),
+            named_ranges: Default::default(), iterative_calc: false, iter_max: 100, iter_epsilon: 1e-6,
             dirty: Default::default(),
             sheet_ids: Vec::new(),
             next_sheet_id: 0,

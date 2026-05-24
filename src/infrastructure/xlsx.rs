@@ -61,6 +61,10 @@ pub fn load_xlsx(path: &str) -> Result<Workbook, String> {
         sheet_names: sheet_names.clone(),
         active_sheet: 0,
         named_ranges: std::collections::HashMap::new(),
+        iterative_calc: false,
+        // Defaults match Workbook::default()'s — 100 passes, 1e-6 epsilon.
+        iter_max: 100,
+        iter_epsilon: 1e-6,
         dirty: std::collections::HashSet::new(),
         sheet_ids: (0..sheet_count).map(crate::domain::models::SheetId).collect(),
         next_sheet_id: sheet_count,

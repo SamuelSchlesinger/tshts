@@ -99,6 +99,18 @@ pub struct Workbook {
     pub active_sheet: usize,
     /// Named ranges: name -> cell reference string (e.g., "Revenue" -> "B2:B50")
     pub named_ranges: HashMap<String, String>,
+    /// Iterative-calc toggle. When true, `iterative_calc_cyclic` runs over
+    /// cyclic-remainder cells instead of stamping `#NUM!`. Workbook-wide
+    /// (Excel's setting is global; per-sheet would just leak the legacy
+    /// per-sheet model).
+    #[serde(default)]
+    pub iterative_calc: bool,
+    /// Max passes for iterative recalc. Default 100.
+    #[serde(default = "default_iter_max")]
+    pub iter_max: usize,
+    /// Convergence epsilon (per-cell absolute numeric delta). Default 1e-6.
+    #[serde(default = "default_iter_epsilon")]
+    pub iter_epsilon: f64,
     /// Cells whose value may be stale. Populated by every mutation site
     /// (set/clear/structural-edit/sheet-rename/sheet-remove). Drained by
     /// the recalc executor on each `recalc_via_graph_result()` pass —
@@ -155,6 +167,9 @@ pub struct Workbook {
     pub structural_targets: HashMap<NodeKey, HashSet<NodeKey>>,
 }
 
+pub(crate) fn default_iter_max() -> usize { 100 }
+pub(crate) fn default_iter_epsilon() -> f64 { 1e-6 }
+
 impl Default for Workbook {
     fn default() -> Self {
         Self {
@@ -163,6 +178,9 @@ impl Default for Workbook {
             sheet_names: vec!["Sheet1".to_string()],
             active_sheet: 0,
             named_ranges: HashMap::new(),
+            iterative_calc: false,
+            iter_max: default_iter_max(),
+            iter_epsilon: default_iter_epsilon(),
             dirty: HashSet::new(),
             sheet_ids: vec![SheetId(0)],
             next_sheet_id: 1,
@@ -416,26 +434,13 @@ impl Workbook {
             return Ok(0);
         }
 
-        // Settings: take the most-permissive iter_max and tightest
-        // iter_epsilon across every sheet that owns a cyclic cell, so
-        // a multi-sheet cycle's convergence isn't constrained by the
-        // active sheet's (possibly conservative) settings. The legacy
-        // per-sheet path used the owning sheet's settings; this is the
-        // workbook-level analog.
-        let involved_sheets: std::collections::HashSet<usize> =
-            work.iter().map(|(_, idx, _)| *idx).collect();
-        let iter_max = involved_sheets
-            .iter()
-            .map(|&i| self.sheets[i].iter_max)
-            .max()
-            .unwrap_or(100)
-            .max(1); // Always allow at least one pass — iter_max=0 would
-                     // otherwise leave cyclic cells with stale values
-                     // and confuse callers about convergence.
-        let iter_epsilon = involved_sheets
-            .iter()
-            .map(|&i| self.sheets[i].iter_epsilon)
-            .fold(f64::INFINITY, f64::min);
+        // Iteration settings come straight from the workbook now —
+        // iter_max=0 is bumped to 1 so the loop always runs at least
+        // one pass (otherwise cyclic cells stay at stale values AND
+        // we'd return Err(0) which is a noisy "did not converge in 0
+        // passes" message).
+        let iter_max = self.iter_max.max(1);
+        let iter_epsilon = self.iter_epsilon;
 
         // Track non-numeric stability across two consecutive passes.
         // Pure flip-flop (A → B → A → B ...) would otherwise force
@@ -624,41 +629,55 @@ impl Workbook {
             }
         }
 
-        // Smart auto-seed for VolatileStructural cells (OFFSET, INDIRECT, ...).
-        // Their dep edges are derived conservatively from literal args, so
-        // they don't pick up changes to their value-derived targets via the
-        // static graph. We close that gap by re-seeding them when their
-        // last-known dynamic targets intersect what the user just dirtied.
+        // Auto-seed all volatile cells. Without this, two `=NOW()` cells
+        // typed in quick succession would show different times — the
+        // first cell's value freezes at the recalc that wrote it, and
+        // a later recalc triggered by editing a different cell would
+        // only re-evaluate the dirty-closure subgraph, leaving the
+        // first NOW() at its stale value. Matches Excel's "every
+        // recalc re-evaluates every volatile cell" policy.
         //
-        // Policy:
-        //   * If we have NO recorded targets for the cell yet (first-time
-        //     eval, or just-rebuilt graph), seed it — we must run it once
-        //     to learn its targets.
-        //   * Otherwise, seed only when at least one recorded target lies
-        //     inside the transitive dependents of the user-dirty seeds.
-        //     (We use the closure of dependents, not just the seeds, so
-        //     a chain `target → ... → user-edited cell` still triggers.)
+        // Three purity classes need different auto-seed logic:
         //
-        // VolatileClock/Random are handled separately by RecalcContext +
-        // the thread-local PRNG and don't appear here.
+        //   * VolatileStructural (OFFSET, INDIRECT): smart auto-seed —
+        //     only re-seed when the cell's recorded dynamic targets
+        //     intersect the user-dirty closure. (If we've never run
+        //     the cell, we must seed it once to learn its targets.)
+        //
+        //   * VolatileClock (NOW, TODAY): unconditional auto-seed.
+        //     The clock snapshot for THIS recalc has already advanced;
+        //     every NOW()/TODAY() cell must re-evaluate so users see
+        //     a consistent timestamp across the workbook.
+        //
+        //   * VolatileRandom (RAND, RANDBETWEEN): unconditional auto-seed.
+        //     Each recalc fires the PRNG; cells stay in sync with that.
+        //
+        //   * SideEffecting (GET): NOT auto-seeded. Re-fetching every
+        //     URL on every keystroke would saturate the fetcher; the
+        //     GET cell re-evaluates when the fetcher completion-count
+        //     advances (separate path).
         let user_dirty_closure: HashSet<NodeKey> = if seeds.is_empty() {
             HashSet::new()
         } else {
             self.graph.transitive_dependents(&seeds)
         };
         for (&node, &purity) in &self.cell_purities {
-            if purity != crate::domain::parser::FunctionPurity::VolatileStructural {
-                continue;
-            }
-            match self.structural_targets.get(&node) {
-                None => {
-                    seeds.insert(node);
-                }
-                Some(targets) => {
-                    if targets.iter().any(|t| user_dirty_closure.contains(t)) {
+            use crate::domain::parser::FunctionPurity;
+            match purity {
+                FunctionPurity::VolatileStructural => match self.structural_targets.get(&node) {
+                    None => {
                         seeds.insert(node);
                     }
+                    Some(targets) => {
+                        if targets.iter().any(|t| user_dirty_closure.contains(t)) {
+                            seeds.insert(node);
+                        }
+                    }
+                },
+                FunctionPurity::VolatileClock | FunctionPurity::VolatileRandom => {
+                    seeds.insert(node);
                 }
+                FunctionPurity::Pure | FunctionPurity::SideEffecting => {}
             }
         }
 
@@ -1212,6 +1231,9 @@ impl Workbook {
             sheet_names: vec!["Sheet1".to_string()],
             active_sheet: 0,
             named_ranges: HashMap::new(),
+            iterative_calc: false,
+            iter_max: default_iter_max(),
+            iter_epsilon: default_iter_epsilon(),
             dirty: HashSet::new(),
             sheet_ids: vec![SheetId(0)],
             next_sheet_id: 1,

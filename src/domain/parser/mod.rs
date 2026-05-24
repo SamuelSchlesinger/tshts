@@ -768,8 +768,12 @@ pub(super) fn today_serial() -> f64 {
 
 /// Excel serial value for the current instant. Reads the
 /// `RECALC_CLOCK` thread-local if a recalc is in scope, otherwise
-/// falls back to the live system clock.
-pub(super) fn now_serial() -> f64 {
+/// falls back to the live system clock. `pub` because the interactive
+/// edit path publishes its own clock around the just-edited-cell eval
+/// so the value the user sees lines up with what the next `:recalc`
+/// produces (no NOW/TODAY divergence between live edit and snapshot
+/// recalc).
+pub fn now_serial() -> f64 {
     if let Some(serial) = RECALC_CLOCK.with(|c| c.get()) {
         return serial;
     }

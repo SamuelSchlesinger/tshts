@@ -555,34 +555,27 @@ impl App {
             }
             ["iterative", "on"] => {
                 self.iterative_calc = true;
-                for s in &mut self.workbook.sheets {
-                    s.iterative_calc = true;
-                }
+                self.workbook.iterative_calc = true;
                 // Existing circular formulas need to resolve under the new
-                // mode; without this they keep showing the previous #CYCLE!
+                // mode; without this they keep showing the previous #NUM!
                 // value until the next user edit.
                 self.recalc_all();
                 self.dirty = true;
                 self.status_message = Some(format!(
                     "Iterative calc: on (max {} iters, eps {})",
-                    self.workbook.current_sheet().iter_max,
-                    self.workbook.current_sheet().iter_epsilon
+                    self.workbook.iter_max, self.workbook.iter_epsilon,
                 ));
             }
             ["iterative", "off"] => {
                 self.iterative_calc = false;
-                for s in &mut self.workbook.sheets {
-                    s.iterative_calc = false;
-                }
+                self.workbook.iterative_calc = false;
                 self.recalc_all();
                 self.dirty = true;
                 self.status_message = Some("Iterative calc: off".to_string());
             }
             ["iterative", "max", n] => {
                 if let Ok(v) = n.parse::<usize>() {
-                    for s in &mut self.workbook.sheets {
-                        s.iter_max = v;
-                    }
+                    self.workbook.iter_max = v;
                     if self.iterative_calc {
                         self.recalc_all();
                     }
@@ -594,9 +587,7 @@ impl App {
             }
             ["iterative", "epsilon", n] => {
                 if let Ok(v) = n.parse::<f64>() {
-                    for s in &mut self.workbook.sheets {
-                        s.iter_epsilon = v;
-                    }
+                    self.workbook.iter_epsilon = v;
                     if self.iterative_calc {
                         self.recalc_all();
                     }

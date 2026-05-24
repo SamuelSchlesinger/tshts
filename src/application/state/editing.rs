@@ -140,7 +140,17 @@ impl App {
                 }
             }
             cell_data.formula = Some(self.input.clone());
-            cell_data.value = evaluator.evaluate_formula(&self.input);
+            // Publish a clock so the just-edited cell's value uses the
+            // same NOW()/TODAY() snapshot the immediately-following
+            // recalc will (via set_cell_with_undo → set_cell_on_active →
+            // recalc_via_graph_result). Without this the value flashes
+            // a wall-clock-NOW from this eval, then gets replaced by
+            // the snapshot-NOW from the recalc — visually fine when
+            // they agree but a real divergence under load.
+            cell_data.value = crate::domain::parser::with_recalc_clock(
+                crate::domain::parser::now_serial(),
+                || evaluator.evaluate_formula(&self.input),
+            );
         } else {
             cell_data.value = self.input.clone();
         }

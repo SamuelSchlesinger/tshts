@@ -32,18 +32,6 @@ pub struct Spreadsheet {
     /// resolve via this list.
     #[serde(default)]
     pub tables: Vec<Table>,
-    /// When true, the workbook-level graph executor's `iterative_calc_cyclic`
-    /// loop runs over cyclic-remainder cells from this sheet rather than
-    /// surfacing `#REF!`. Synced from `App::iterative_calc` whenever it's
-    /// toggled.
-    #[serde(skip)]
-    pub iterative_calc: bool,
-    /// Max passes for iterative recalc. Default 100.
-    #[serde(skip, default = "default_iter_max")]
-    pub iter_max: usize,
-    /// Convergence epsilon (per-cell absolute delta). Default 1e-6.
-    #[serde(skip, default = "default_iter_epsilon")]
-    pub iter_epsilon: f64,
     /// Conditional-format style cache, keyed by (row, col). Populated lazily
     /// on first lookup; invalidated wholesale on any cell mutation or rule
     /// change. Refcell so `conditional_style_for(&self)` can write.
@@ -74,9 +62,6 @@ impl Clone for Spreadsheet {
             named_ranges: self.named_ranges.clone(),
             conditional_formats: self.conditional_formats.clone(),
             tables: self.tables.clone(),
-            iterative_calc: self.iterative_calc,
-            iter_max: self.iter_max,
-            iter_epsilon: self.iter_epsilon,
             cf_cache: std::sync::Mutex::new(HashMap::new()),
             view_state: self.view_state.clone(),
         }
@@ -109,9 +94,6 @@ pub struct SheetViewState {
     #[serde(default)]
     pub validations: HashMap<usize, String>,
 }
-
-fn default_iter_max() -> usize { 100 }
-fn default_iter_epsilon() -> f64 { 1e-6 }
 
 /// A named rectangular region with column headers. Auto-expands when rows
 /// are added immediately below.
@@ -151,9 +133,6 @@ impl Default for Spreadsheet {
             named_ranges: HashMap::new(),
             conditional_formats: Vec::new(),
             tables: Vec::new(),
-            iterative_calc: false,
-            iter_max: default_iter_max(),
-            iter_epsilon: default_iter_epsilon(),
             cf_cache: std::sync::Mutex::new(HashMap::new()),
             view_state: SheetViewState::default(),
         }
