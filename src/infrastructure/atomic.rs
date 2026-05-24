@@ -72,3 +72,23 @@ pub fn atomic_write(path: &str, contents: &[u8]) -> io::Result<()> {
     }
     Ok(())
 }
+
+/// Concrete [`FileWriter`](crate::domain::services::FileWriter) backed by
+/// this module's `atomic_write`. Wraps the raw function so the domain
+/// layer can write through the trait without importing
+/// `crate::infrastructure` directly.
+struct AtomicFileWriter;
+
+impl crate::domain::services::FileWriter for AtomicFileWriter {
+    fn write(&self, path: &str, contents: &[u8]) -> Result<(), String> {
+        atomic_write(path, contents).map_err(|e| e.to_string())
+    }
+}
+
+/// Install this module's `atomic_write` as the global file writer used by
+/// `CsvExporter::export_to_csv` (and any future domain-layer file output).
+/// Call once at process startup before any export. Subsequent calls are
+/// silently ignored (the global slot uses `OnceLock` semantics).
+pub fn install_as_file_writer() {
+    crate::domain::services::set_file_writer(Box::new(AtomicFileWriter));
+}

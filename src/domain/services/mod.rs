@@ -86,6 +86,7 @@ mod evaluator;
 mod autofill_pattern;
 mod csv;
 mod executor;
+mod file_writer;
 mod http;
 
 pub use evaluator::FormulaEvaluator;
@@ -94,6 +95,7 @@ pub use csv::CsvExporter;
 pub use executor::{
     CalcError, ParallelExecutor, RecalcContext, RecalcExecutor, RecalcPlan, SequentialExecutor,
 };
+pub use file_writer::{set_file_writer, write_file, FileWriter};
 pub use http::{http_fetch, set_http_fetcher, HttpFetchResult, HttpFetcher};
 
 #[cfg(test)]

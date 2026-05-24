@@ -42,13 +42,11 @@ impl CsvExporter {
             }
             writer.flush().map_err(|e| format!("Failed to flush CSV writer: {}", e))?;
         }
-        // TODO(domain-purity): this `crate::infrastructure` import is a
-        // domain→infrastructure leak. Mirror the fetcher decoupling: define
-        // a `FileWriter` trait in `domain::services`, install the
-        // `atomic_write` impl from infrastructure at startup, and have this
-        // path call the trait. Tracked alongside the fetcher decoupling
-        // task in the session notes.
-        crate::infrastructure::atomic::atomic_write(filename, &buf)
+        // Route through the domain-level file-writer abstraction so this
+        // function doesn't import `crate::infrastructure` directly —
+        // infrastructure installs the impl at startup (see
+        // `infrastructure::atomic::install_as_file_writer`).
+        crate::domain::services::write_file(filename, &buf)
             .map_err(|e| format!("Failed to write CSV: {}", e))?;
         Ok(filename.to_string())
     }
@@ -205,6 +203,14 @@ mod tests {
     use super::*;
     use crate::domain::{CellData, Spreadsheet};
 
+    /// Install the production atomic file writer into the domain's global
+    /// `FileWriter` slot. `main()` does this for the binary; lib tests have
+    /// to do it themselves or `CsvExporter::export_to_csv` returns the
+    /// trait's "no writer installed" error. Idempotent via `OnceLock`.
+    fn install_file_writer_for_test() {
+        crate::infrastructure::atomic::install_as_file_writer();
+    }
+
     #[test]
     fn test_append_from_csv() {
         use std::io::Write;
@@ -229,6 +235,7 @@ mod tests {
 
     #[test]
     fn test_csv_export_basic() {
+        install_file_writer_for_test();
         use tempfile::NamedTempFile;
         
         let mut sheet = Spreadsheet::default();
@@ -270,6 +277,7 @@ mod tests {
 
     #[test]
     fn test_csv_export_sparse_data() {
+        install_file_writer_for_test();
         use tempfile::NamedTempFile;
         
         let mut sheet = Spreadsheet::default();
@@ -294,6 +302,7 @@ mod tests {
 
     #[test]
     fn test_csv_export_with_formulas() {
+        install_file_writer_for_test();
         use tempfile::NamedTempFile;
         
         let mut sheet = Spreadsheet::default();
@@ -322,6 +331,7 @@ mod tests {
 
     #[test]
     fn test_csv_export_special_characters() {
+        install_file_writer_for_test();
         use tempfile::NamedTempFile;
         
         let mut sheet = Spreadsheet::default();
@@ -543,6 +553,7 @@ Break""#).expect("Failed to write to temp file");
 
     #[test]
     fn test_csv_roundtrip() {
+        install_file_writer_for_test();
         use tempfile::NamedTempFile;
         
         // Create original spreadsheet
@@ -623,6 +634,7 @@ Break""#).expect("Failed to write to temp file");
 
     #[test]
     fn agent4_csv_export_includes_formula_only_cells() {
+        install_file_writer_for_test();
         use crate::domain::CellData;
         let dir = std::env::temp_dir();
         let path = dir.join("agent4_csv_formula_export.csv");

@@ -24,7 +24,7 @@ mod infrastructure;
 mod presentation;
 
 use application::App;
-use infrastructure::{autosave, fetcher, FileRepository};
+use infrastructure::{atomic, autosave, fetcher, FileRepository};
 use presentation::{render_ui, InputHandler};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -38,6 +38,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // evaluation; without it `GET()` returns `#VALUE!` (the trait's no-op
     // default).
     fetcher::install_as_http_fetcher();
+    // Same pattern for the atomic file writer used by `CsvExporter::
+    // export_to_csv`. Without this, `:export <file>` returns an error.
+    atomic::install_as_file_writer();
 
     // Set up SIGTERM/SIGHUP handler. SIGINT is consumed by crossterm as a
     // key event when raw mode is enabled, but logout/shutdown sends
