@@ -42,6 +42,12 @@ impl CsvExporter {
             }
             writer.flush().map_err(|e| format!("Failed to flush CSV writer: {}", e))?;
         }
+        // TODO(domain-purity): this `crate::infrastructure` import is a
+        // domain→infrastructure leak. Mirror the fetcher decoupling: define
+        // a `FileWriter` trait in `domain::services`, install the
+        // `atomic_write` impl from infrastructure at startup, and have this
+        // path call the trait. Tracked alongside the fetcher decoupling
+        // task in the session notes.
         crate::infrastructure::atomic::atomic_write(filename, &buf)
             .map_err(|e| format!("Failed to write CSV: {}", e))?;
         Ok(filename.to_string())
@@ -198,17 +204,6 @@ impl CsvExporter {
 mod tests {
     use super::*;
     use crate::domain::{CellData, Spreadsheet};
-
-    fn create_test_spreadsheet() -> Spreadsheet {
-        let mut sheet = Spreadsheet::default();
-        sheet.set_cell(0, 0, CellData { value: "10".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
-        sheet.set_cell(0, 1, CellData { value: "20".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
-        sheet.set_cell(0, 2, CellData { value: "30".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
-        sheet.set_cell(1, 0, CellData { value: "5".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
-        sheet.set_cell(1, 1, CellData { value: "15".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
-        sheet.set_cell(1, 2, CellData { value: "25".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
-        sheet
-    }
 
     #[test]
     fn test_append_from_csv() {

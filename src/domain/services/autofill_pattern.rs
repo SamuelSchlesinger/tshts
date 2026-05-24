@@ -471,7 +471,9 @@ mod tests {
 
         // Decimals should be preserved (trailing zeros removed)
         assert_eq!(AutofillPattern::format_number(5.5), "5.5");
-        assert_eq!(AutofillPattern::format_number(3.14159), "3.14159");
+        #[allow(clippy::approx_constant)]
+        let pi_ish = 3.14159;
+        assert_eq!(AutofillPattern::format_number(pi_ish), "3.14159");
     }
 
     #[test]

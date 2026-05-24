@@ -293,6 +293,31 @@ pub enum FetchResult {
     Error,
 }
 
+/// Concrete [`HttpFetcher`](crate::domain::services::HttpFetcher) backed by
+/// this module's process-wide cache + worker thread. Wraps the raw `fetch`
+/// fn so the domain layer can call HTTP through the trait without importing
+/// `crate::infrastructure` directly.
+struct ProductionFetcher;
+
+impl crate::domain::services::HttpFetcher for ProductionFetcher {
+    fn fetch(&self, url: &str) -> crate::domain::services::HttpFetchResult {
+        use crate::domain::services::HttpFetchResult;
+        match fetch(url) {
+            FetchResult::Value(body) => HttpFetchResult::Value(body),
+            FetchResult::Loading => HttpFetchResult::Loading,
+            FetchResult::Error => HttpFetchResult::Error,
+        }
+    }
+}
+
+/// Install this module's fetcher as the global HTTP fetcher used by the
+/// `GET()` formula function. Call once at process startup before any
+/// formula evaluation. Subsequent calls are silently ignored (the global
+/// slot uses `OnceLock` semantics).
+pub fn install_as_http_fetcher() {
+    crate::domain::services::set_http_fetcher(Box::new(ProductionFetcher));
+}
+
 /// Look up a URL, returning the cached value if fresh, or `Loading` while
 /// the background worker is fetching. Enqueues a request if no entry exists
 /// or the cached one has expired.

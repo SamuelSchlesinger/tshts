@@ -59,7 +59,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
             }
             let rows = rows_f as usize;
             let cols = cols_f as usize;
-            let total = rows.checked_mul(cols).unwrap_or(usize::MAX);
+            let total = rows.saturating_mul(cols);
             if total > MAX_DYNAMIC_ARRAY_CELLS {
                 return Ok(Value::Error(ErrorKind::Num));
             }

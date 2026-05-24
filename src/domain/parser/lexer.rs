@@ -427,7 +427,9 @@ mod tests {
         let mut lexer = Lexer::new("42 3.14 0.5");
         
         assert_eq!(lexer.next_token().unwrap(), Token::Number(42.0));
-        assert_eq!(lexer.next_token().unwrap(), Token::Number(3.14));
+        #[allow(clippy::approx_constant)]
+        let three_fourteen = 3.14;
+        assert_eq!(lexer.next_token().unwrap(), Token::Number(three_fourteen));
         assert_eq!(lexer.next_token().unwrap(), Token::Number(0.5));
         assert_eq!(lexer.next_token().unwrap(), Token::Eof);
     }

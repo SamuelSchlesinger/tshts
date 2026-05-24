@@ -33,6 +33,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // to the default hook so the backtrace still prints.
     install_panic_hook();
 
+    // Wire the infrastructure HTTP fetcher into the domain layer so `GET()`
+    // formula calls find a real implementation. Must run before any formula
+    // evaluation; without it `GET()` returns `#VALUE!` (the trait's no-op
+    // default).
+    fetcher::install_as_http_fetcher();
+
     // Set up SIGTERM/SIGHUP handler. SIGINT is consumed by crossterm as a
     // key event when raw mode is enabled, but logout/shutdown sends
     // SIGTERM (and X-server disconnect sends SIGHUP) which would
@@ -142,16 +148,14 @@ fn run_app<B: Backend>(
                     InputHandler::handle_key_event(app, key.code, key.modifiers);
                 }
                 Event::Mouse(m) => match m.kind {
-                    MouseEventKind::ScrollDown => {
-                        if app.scroll_row + 1 < app.workbook.current_sheet().rows {
+                    MouseEventKind::ScrollDown
+                        if app.scroll_row + 1 < app.workbook.current_sheet().rows => {
                             app.scroll_row += 1;
                         }
-                    }
-                    MouseEventKind::ScrollUp => {
-                        if app.scroll_row > 0 {
+                    MouseEventKind::ScrollUp
+                        if app.scroll_row > 0 => {
                             app.scroll_row -= 1;
                         }
-                    }
                     MouseEventKind::Down(_) => {
                         // Click: select the cell and arm a selection anchor so
                         // a subsequent Drag can extend the range.

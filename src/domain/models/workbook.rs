@@ -21,6 +21,61 @@ fn default_workbook_version() -> u32 {
     1
 }
 
+/// Walk `raw` (the in-memory JSON value of a workbook file just parsed by
+/// `serde_json`) and apply schema migrations from its declared `version`
+/// field up to [`WORKBOOK_SCHEMA_VERSION`]. After this returns `Ok`, the
+/// caller can deserialize the value into a typed [`Workbook`] knowing the
+/// shape matches the current schema.
+///
+/// The migration matrix is empty today — version 1 is the only schema, and
+/// files without a `version` field implicitly carry version 1. When a
+/// future schema bump lands (e.g. a field is renamed or its semantics
+/// change), add a per-step migrator below that mutates `raw` in place and
+/// route it through this function:
+///
+/// ```text
+/// if from < 2 { migrate_v1_to_v2(raw)?; }
+/// if from < 3 { migrate_v2_to_v3(raw)?; }
+/// // ...
+/// ```
+///
+/// Each per-step migrator must leave `raw` valid against schema *M* given
+/// it was valid against *M-1*. Backwards-compatible additions (new
+/// optional fields with `#[serde(default)]`) do NOT need a migration step.
+///
+/// Errors when the declared version is newer than this build understands,
+/// or when the `version` field is present but not a non-negative integer.
+pub fn migrate_workbook_json(raw: &mut serde_json::Value) -> Result<u32, String> {
+    let from = match raw.get("version") {
+        Some(v) => v
+            .as_u64()
+            .ok_or_else(|| format!("workbook 'version' must be a non-negative integer, got: {}", v))?
+            as u32,
+        None => 1,
+    };
+
+    if from > WORKBOOK_SCHEMA_VERSION {
+        return Err(format!(
+            "Workbook schema version {} is newer than this build understands ({}). \
+             Update tshts to open this file.",
+            from, WORKBOOK_SCHEMA_VERSION
+        ));
+    }
+
+    // Migration matrix — currently empty. See doc comment for the pattern
+    // to follow when bumping `WORKBOOK_SCHEMA_VERSION`.
+
+    // Stamp the current version into the value so the typed deserialize
+    // below sees the migrated shape, not the source's.
+    if let Some(obj) = raw.as_object_mut() {
+        obj.insert(
+            "version".to_string(),
+            serde_json::json!(WORKBOOK_SCHEMA_VERSION),
+        );
+    }
+    Ok(from)
+}
+
 thread_local! {
     /// Thread-local pointer to the current `Workbook` for the duration of a
     /// workbook-driven recalc. The pointer is non-null only inside
@@ -346,14 +401,13 @@ impl Workbook {
                 // doesn't pay a HashMap insert. Volatile/side-effecting
                 // cells get an explicit entry.
                 let strip_eq = formula.strip_prefix('=').unwrap_or(&formula);
-                if let Ok(mut p) = Parser::new(strip_eq) {
-                    if let Ok(ast) = p.parse() {
+                if let Ok(mut p) = Parser::new(strip_eq)
+                    && let Ok(ast) = p.parse() {
                         let pur = formula_purity(&ast, &registry);
                         if pur != FunctionPurity::Pure {
                             self.cell_purities.insert(node, pur);
                         }
                     }
-                }
             }
         }
     }
@@ -607,6 +661,7 @@ impl Workbook {
     /// - **Per-level workbook clone** is O(workbook size) per level.
     ///   A future PR can replace this with `Arc<WorkbookSnapshot>` for
     ///   deeper graphs where the clone dominates.
+    ///
     /// Public entry point for the recalc engine. Returns any pass-level
     /// error (e.g. iterative-calc non-convergence) so the App layer can
     /// surface it via status message. Individual cell errors flow
@@ -633,6 +688,16 @@ impl Workbook {
         // will keep it incrementally maintained on writes.
         if self.graph.is_empty() {
             self.build_dep_graph_from_scratch();
+        }
+        // Volatile CF predicates (`=NOW() > _`, etc.) need their cache
+        // cleared on every recalc invocation regardless of whether any
+        // formula cells re-evaluate. Otherwise a workbook with no formula
+        // cells but a NOW-based CF rule would never refresh its styling.
+        // Done up front so the early-return path below still invalidates.
+        for sheet in &mut self.sheets {
+            if sheet.has_volatile_cf_predicate() {
+                sheet.cf_cache.lock().unwrap().clear();
+            }
         }
         if self.dirty.is_empty() && self.cell_purities.is_empty() {
             return Ok(());
@@ -722,6 +787,10 @@ impl Workbook {
             .and_then(|s| s.parse().ok())
             .unwrap_or(512);
         let max_level_size = plan.levels.iter().map(|l| l.len()).max().unwrap_or(0);
+        // Volatile-predicate CF invalidation already ran above, before the
+        // early-return guard. The per-cell `cf_cache.clear()` inside the
+        // executor (on every writeback) covers the orthogonal case where
+        // the predicate is pure and the cell value changed.
         if max_level_size >= threshold {
             crate::domain::services::ParallelExecutor::new().run(&plan, &mut ctx, self)
         } else {

@@ -136,7 +136,7 @@ impl Harness {
             }
         });
 
-        let mut h = Self {
+        let h = Self {
             writer,
             parser,
             reader_thread: Some(reader_thread),
@@ -188,7 +188,7 @@ impl Harness {
     pub fn send_ctrl(&mut self, c: char) {
         let upper = c.to_ascii_uppercase();
         assert!(
-            ('A'..='Z').contains(&upper),
+            upper.is_ascii_uppercase(),
             "send_ctrl only supports ASCII letters, got {:?}",
             c
         );

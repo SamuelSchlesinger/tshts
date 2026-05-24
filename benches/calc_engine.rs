@@ -175,7 +175,7 @@ fn time_executor<E: RecalcExecutor>(
         let plan = full_recalc_plan(&mut wb);
         let mut ctx = RecalcContext::new();
         let start = Instant::now();
-        let _ = executor.run(&plan, &mut ctx, &mut wb).expect("recalc");
+        executor.run(&plan, &mut ctx, &mut wb).expect("recalc");
         let elapsed = start.elapsed();
         black_box(wb.sheets[0].get_cell(0, 0).value.clone());
         samples.push(elapsed);

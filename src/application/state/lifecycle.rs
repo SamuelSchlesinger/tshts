@@ -49,7 +49,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::CellData;
+    
 
     #[test]
     fn test_confirm_discard_save_then_quit_with_known_filename() {

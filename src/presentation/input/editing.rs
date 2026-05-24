@@ -65,9 +65,12 @@ impl InputHandler {
 }
 
 #[cfg(test)]
+// Test names use uppercase letters to mirror the vim keys they exercise
+// (e.g. `test_A_enters_insert_at_end`, `agent_insert_O_*`).
+#[allow(non_snake_case, clippy::field_reassign_with_default, dead_code)]
 mod tests {
     use super::*;
-    use crate::application::{App, AppMode, VimOperator, VisualKind};
+    use crate::application::{App, AppMode};
     use crossterm::event::{KeyCode, KeyModifiers};
 
 
@@ -396,16 +399,86 @@ mod tests {
     }
 
     #[test]
-    fn agent_insert_o_then_esc_leaves_sheet_grown() {
-        // BUG: `o` grows the sheet but cancelling the edit leaves the sheet grown.
+    fn agent_insert_o_then_esc_rolls_back_row() {
+        // `o` opens a fresh row and enters Editing. Esc on that session
+        // (no commit) must roll the row back too — otherwise the sheet
+        // is observably grown by a phantom empty row the user didn't want.
+        let mut app = App::default();
+        let orig_rows = app.workbook.current_sheet().rows;
+        let orig_selected = orig_rows - 1;
+        app.selected_row = orig_selected;
+        typestr(&mut app, "o");
+        // After `o`, we're in Editing with the row already grown.
+        assert!(matches!(app.mode, AppMode::Editing));
+        assert_eq!(app.workbook.current_sheet().rows, orig_rows + 1);
+        assert!(app.pending_open_row);
+        key(&mut app, KeyCode::Esc);
+        assert!(matches!(app.mode, AppMode::Normal));
+        assert!(!app.pending_open_row);
+        assert_eq!(
+            app.workbook.current_sheet().rows,
+            orig_rows,
+            "Esc on a fresh `o` session must roll back the row insertion."
+        );
+        // Note: cursor stays at where `vim_open_row_below` moved it; matching
+        // the regular `u`-undo of a RowInserted, which doesn't restore the
+        // pre-insert cursor either. Re-aligning cursor to `orig_selected`
+        // would be a UX improvement but is out of scope for this fix.
+        let _ = orig_selected;
+    }
+
+    #[test]
+    fn agent_insert_o_then_text_then_esc_also_rolls_back_row() {
+        // Esc discards the input buffer in this codebase (see
+        // `cancel_editing`), so `o<text><Esc>` is "I changed my mind
+        // entirely" — same rollback as `o<Esc>`.
+        let mut app = App::default();
+        let orig_rows = app.workbook.current_sheet().rows;
+        app.selected_row = orig_rows - 1;
+        typestr(&mut app, "ohello");
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(app.workbook.current_sheet().rows, orig_rows);
+    }
+
+    #[test]
+    fn agent_insert_o_then_enter_keeps_row() {
+        // Enter commits the (empty) edit and exits Editing. The row stays,
+        // the undo stack keeps the `RowInserted` entry so the user can
+        // still `u` if they want.
         let mut app = App::default();
         let orig_rows = app.workbook.current_sheet().rows;
         app.selected_row = orig_rows - 1;
         typestr(&mut app, "o");
-        key(&mut app, KeyCode::Esc);
+        key(&mut app, KeyCode::Enter);
         assert!(matches!(app.mode, AppMode::Normal));
-        assert_eq!(app.workbook.current_sheet().rows, orig_rows + 1,
-            "Cancelling `o` does NOT rollback the row growth — observable side-effect.");
+        assert!(!app.pending_open_row, "commit must clear the open-row flag");
+        assert_eq!(app.workbook.current_sheet().rows, orig_rows + 1);
+    }
+
+    #[test]
+    fn agent_open_row_flag_does_not_leak_to_next_edit() {
+        // After `o<Enter>` commits, opening a *different* cell with `i`
+        // and then Esc-cancelling must NOT undo the earlier row insertion.
+        // (Regression guard for the open-row-flag-leak failure mode.)
+        let mut app = App::default();
+        let orig_rows = app.workbook.current_sheet().rows;
+        app.selected_row = orig_rows - 1;
+        typestr(&mut app, "o");
+        key(&mut app, KeyCode::Enter);
+        // Now in Normal mode with row grown by 1.
+        assert_eq!(app.workbook.current_sheet().rows, orig_rows + 1);
+        // Move cursor and enter Editing via `i` (not `o`); cancel.
+        app.selected_row = 0;
+        app.selected_col = 0;
+        typestr(&mut app, "i");
+        assert!(matches!(app.mode, AppMode::Editing));
+        assert!(!app.pending_open_row);
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(
+            app.workbook.current_sheet().rows,
+            orig_rows + 1,
+            "Esc on an `i` session must not unwind the earlier `o`."
+        );
     }
 
     #[test]
@@ -442,9 +515,13 @@ mod tests {
         app.selected_row = 3;
         typestr(&mut app, "ck");
         assert!(matches!(app.mode, AppMode::Editing));
-        // After normalization, top-left of (3,0)..(2,0) is (2,0)
-        assert_eq!(app.selected_row, 2,
-            "BUG: c<motion-upward> should leave cursor at top of range, got {}", app.selected_row);
+        // After normalization, top-left of (3,0)..(2,0) is (2,0): `c<motion-upward>`
+        // must leave the cursor at the top of the affected range.
+        assert_eq!(
+            app.selected_row, 2,
+            "c<motion-upward> should leave cursor at top of range, got {}",
+            app.selected_row
+        );
     }
 
     #[test]

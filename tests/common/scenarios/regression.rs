@@ -107,11 +107,12 @@ impl Scenario for Regression {
     }
 
     fn checks(&self, o: &Output) -> Vec<CellCheck> {
-        let mut v = Vec::new();
-        v.push(CellCheck::new("slope",     "H1", o.slope).with_tolerance(1e-6));
-        v.push(CellCheck::new("intercept", "H2", o.intercept).with_tolerance(1e-6));
-        v.push(CellCheck::new("r_squared", "H3", o.r_squared).with_tolerance(1e-6));
-        v.push(CellCheck::new("ssr",       "H4", o.sum_squared_residuals).with_tolerance(1e-3));
+        let mut v = vec![
+            CellCheck::new("slope",     "H1", o.slope).with_tolerance(1e-6),
+            CellCheck::new("intercept", "H2", o.intercept).with_tolerance(1e-6),
+            CellCheck::new("r_squared", "H3", o.r_squared).with_tolerance(1e-6),
+            CellCheck::new("ssr",       "H4", o.sum_squared_residuals).with_tolerance(1e-3),
+        ];
         for (idx, p) in o.predictions.iter().enumerate() {
             let row = 2 + idx;
             v.push(CellCheck::new(format!("y_hat_{}", idx + 1),

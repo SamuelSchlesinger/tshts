@@ -494,9 +494,11 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
 }
 
 /// Format a value using a subset of Excel TEXT format codes. Supports:
-///   - Date codes: yyyy/yy, mm/m, dd/d (combined as `yyyy-mm-dd`, `m/d/yyyy`, etc.)
-///   - Numeric codes with `0`, `#`, `.`, `,` (thousands separator)
-///   - `0%` / `0.0%` percentage formats
+///
+/// - Date codes: yyyy/yy, mm/m, dd/d (combined as `yyyy-mm-dd`, `m/d/yyyy`, etc.)
+/// - Numeric codes with `0`, `#`, `.`, `,` (thousands separator)
+/// - `0%` / `0.0%` percentage formats
+///
 /// Falls back to `to_string` when the format string isn't recognized.
 fn format_text(v: &Value, format: &str) -> String {
     if format.is_empty() {
@@ -510,8 +512,7 @@ fn format_text(v: &Value, format: &str) -> String {
         return apply_date_format(format, year, month, day);
     }
     // Percentage
-    if format.ends_with('%') {
-        let body = &format[..format.len() - 1];
+    if let Some(body) = format.strip_suffix('%') {
         let pct = n * 100.0;
         return format!("{}%", apply_number_format(body, pct));
     }

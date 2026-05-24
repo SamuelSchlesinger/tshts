@@ -16,6 +16,11 @@ impl App {
         self.mode = AppMode::Editing;
         self.input = cell.formula.unwrap_or(cell.value);
         self.cursor_position = self.input.chars().count();
+        // Fresh edit: the previous session is over, so any open-row marker
+        // left from a prior `o`/`O`+commit cycle must not leak into this
+        // session's Esc handling. `vim_open_row_*` set the flag back to
+        // true after calling this.
+        self.pending_open_row = false;
     }
 
     pub fn vim_enter_insert(&mut self) {
@@ -38,6 +43,8 @@ impl App {
         self.selected_row = at;
         self.ensure_cursor_visible();
         self.start_editing();
+        // Tag this session so Esc rolls back the row insertion too.
+        self.pending_open_row = true;
     }
 
     pub fn vim_open_row_above(&mut self) {
@@ -47,6 +54,7 @@ impl App {
         self.record_action(UndoAction::RowInserted { sheet_idx, at });
         self.ensure_cursor_visible();
         self.start_editing();
+        self.pending_open_row = true;
     }
 
     pub fn vim_substitute_cell(&mut self) {
@@ -86,6 +94,9 @@ impl App {
     }
 
     fn finish_editing_in_direction(&mut self, dir: EditExitDir) {
+        // Commit (any direction) means the user kept the row that `o`/`O`
+        // may have opened; the open-row marker is no longer relevant.
+        self.pending_open_row = false;
         let existing = self
             .workbook
             .current_sheet()
@@ -189,9 +200,18 @@ impl App {
     }
 
     pub fn cancel_editing(&mut self) {
+        let rollback_open_row = self.pending_open_row;
+        self.pending_open_row = false;
         self.mode = AppMode::Normal;
         self.input.clear();
         self.cursor_position = 0;
+        if rollback_open_row {
+            // The current Editing session was opened by `o`/`O`, which
+            // inserted a fresh row and pushed an `UndoAction::RowInserted`.
+            // Esc on this session means "I changed my mind about the whole
+            // open"; roll the row back so the sheet isn't observably grown.
+            self.undo();
+        }
     }
 
 }

@@ -22,7 +22,9 @@ pub use refs::{
 };
 pub use cell::CellData;
 pub use spreadsheet::{Spreadsheet, Table, ConditionalFormat, SheetViewState};
-pub use workbook::{Workbook, WORKBOOK_SCHEMA_VERSION};
+pub use workbook::{migrate_workbook_json, Workbook};
+#[allow(unused_imports)]
+pub use workbook::WORKBOOK_SCHEMA_VERSION;
 #[allow(unused_imports)]
 pub use workbook::CrossSheetKey;
 pub use dep_graph::{NodeKey, SheetId, WorkbookGraph};

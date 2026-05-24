@@ -147,27 +147,30 @@ impl ErrorKind {
     }
 }
 
-impl Value {
-    /// Converts value to string representation.
-    /// For lists/arrays, returns the first element's string (matches Excel's
-    /// "implicit intersection" — a multi-cell value in a scalar context
-    /// degrades to the top-left).
-    pub fn to_string(&self) -> String {
+/// Converts a `Value` to its string representation. For lists/arrays,
+/// returns the first element's string (matches Excel's "implicit
+/// intersection" — a multi-cell value in a scalar context degrades to
+/// the top-left). `.to_string()` works via the `Display` blanket impl.
+impl std::fmt::Display for Value {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Value::Number(n) => n.to_string(),
-            Value::String(s) => s.clone(),
-            Value::Bool(b) => if *b { "TRUE".to_string() } else { "FALSE".to_string() },
-            Value::List(items) => items
-                .first()
-                .map(|v| v.to_string())
-                .unwrap_or_default(),
-            Value::Array { data, .. } => data
-                .first()
-                .map(|v| v.to_string())
-                .unwrap_or_default(),
-            Value::Error(e) => e.as_str().to_string(),
+            Value::Number(n) => write!(f, "{}", n),
+            Value::String(s) => f.write_str(s),
+            Value::Bool(b) => f.write_str(if *b { "TRUE" } else { "FALSE" }),
+            Value::List(items) => match items.first() {
+                Some(v) => write!(f, "{}", v),
+                None => Ok(()),
+            },
+            Value::Array { data, .. } => match data.first() {
+                Some(v) => write!(f, "{}", v),
+                None => Ok(()),
+            },
+            Value::Error(e) => f.write_str(e.as_str()),
         }
     }
+}
+
+impl Value {
 
     pub fn to_number(&self) -> f64 {
         match self {
@@ -292,6 +295,27 @@ where
 }
 
 /// Represents an Abstract Syntax Tree node for expressions.
+//
+// TODO(perf): Expr is 56 bytes on 64-bit (locked in by
+// `tests::expr_variant_size_probe`). The two heaviest variants are
+// `Range(String, String)` and `FunctionCall { name: String, args: Vec<Expr> }`,
+// both ~48 bytes of payload. Boxing them — e.g. `Range(Box<(String,String)>)`
+// — would drop the enum to ~40 bytes, saving ~16 bytes per node.
+//
+// Why this is deferred:
+//  * ASTs are parsed once and cached in `with_parse_cache`, so construction
+//    cost is amortized — the AST walk during recalc is the only hot path.
+//  * For a 100-node AST that's 5.6KB now vs 4KB boxed, well within any
+//    modern L1 (32-64KB). Cache locality is not currently the bottleneck.
+//  * The bench (`cargo bench --bench calc_engine`) reports ~162ms for 10k
+//    cells sequential — most of the time is in formula function dispatch
+//    and value-passing, not AST traversal.
+//  * Updating ~50 match sites for a speculative win without profiling
+//    evidence is a poor trade.
+//
+// When to revisit: profile recalc with `cargo flamegraph --bench calc_engine`
+// and confirm AST walk is a hot frame. If it is, box Range first (smaller
+// change, no struct-rename needed), measure, then decide on FunctionCall.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Number(f64),
@@ -805,8 +829,24 @@ pub(crate) fn numbers_equal(l: f64, r: f64) -> bool {
     diff < scale * 1e-12 || diff < f64::EPSILON
 }
 
-/// Expression evaluator that walks the AST and computes results.
-
 #[cfg(test)]
 mod tests {
+    use super::Expr;
+
+    #[test]
+    fn expr_variant_size_probe() {
+        // Documenting current Expr size so future variant boxing decisions
+        // are data-driven. Bump the expected value when intentionally
+        // changing the layout; spurious bumps mean someone added a heavy
+        // variant by accident.
+        let size = std::mem::size_of::<Expr>();
+        // Empirically 56 bytes on 64-bit (Range(String, String) dominates
+        // at 48 bytes + discriminant + padding). Stays at 56 until a
+        // heavier variant lands; if you intentionally shrink Expr by
+        // boxing variants, tighten this bound to lock in the win.
+        assert_eq!(
+            size, 56,
+            "Expr size changed — investigate intent (was 56 bytes on 64-bit)"
+        );
+    }
 }

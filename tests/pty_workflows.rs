@@ -1,5 +1,8 @@
 //! Multi-step user workflows driven through a real PTY.
 
+// Test names use uppercase letters to mirror vim keys (e.g. `..._via_S`).
+#![allow(non_snake_case)]
+
 mod common;
 
 use common::Harness;

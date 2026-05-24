@@ -163,6 +163,74 @@ mod tests {
     use super::*;
     use crate::domain::{CellData};
     #[test]
+    fn has_volatile_cf_predicate_detects_now_in_rule() {
+        let mut sheet = Spreadsheet::default();
+        // Pure predicate — not volatile.
+        sheet.conditional_formats.push(ConditionalFormat {
+            column: 0,
+            predicate: "_ > 100".to_string(),
+            style: CellStyle::default(),
+        });
+        assert!(!sheet.has_volatile_cf_predicate());
+        // Add a NOW()-based rule — sheet is now volatile.
+        sheet.conditional_formats.push(ConditionalFormat {
+            column: 1,
+            predicate: "NOW() > _".to_string(),
+            style: CellStyle::default(),
+        });
+        assert!(sheet.has_volatile_cf_predicate());
+    }
+
+    #[test]
+    fn recalc_clears_cf_cache_when_predicate_is_volatile() {
+        use crate::domain::Workbook;
+        let mut wb = Workbook::default();
+        wb.sheets[0].set_cell(0, 0, CellData {
+            value: "1".to_string(), formula: None, format: None, comment: None,
+            spill_anchor: None,
+        });
+        wb.sheets[0].conditional_formats.push(ConditionalFormat {
+            column: 0,
+            predicate: "NOW() > _".to_string(),
+            style: CellStyle { bold: true, ..CellStyle::default() },
+        });
+        // Prime the cache.
+        let _ = wb.sheets[0].conditional_style_for(0, 0);
+        assert!(!wb.sheets[0].cf_cache.lock().unwrap().is_empty(),
+            "predicate eval should have populated the cache");
+        // Force a recalc — even with no dirty cells, the post-recalc hook
+        // must still clear the cache because the predicate is volatile.
+        wb.mark_all_formula_cells_dirty();
+        let _ = wb.recalc_via_graph_result();
+        assert!(wb.sheets[0].cf_cache.lock().unwrap().is_empty(),
+            "volatile CF predicate must invalidate cf_cache on recalc");
+    }
+
+    #[test]
+    fn recalc_keeps_cf_cache_when_predicates_are_pure() {
+        use crate::domain::Workbook;
+        let mut wb = Workbook::default();
+        wb.sheets[0].set_cell(0, 0, CellData {
+            value: "150".to_string(), formula: None, format: None, comment: None,
+            spill_anchor: None,
+        });
+        wb.sheets[0].conditional_formats.push(ConditionalFormat {
+            column: 0,
+            predicate: "_ > 100".to_string(),
+            style: CellStyle { bold: true, ..CellStyle::default() },
+        });
+        // Prime the cache.
+        let _ = wb.sheets[0].conditional_style_for(0, 0);
+        assert!(!wb.sheets[0].cf_cache.lock().unwrap().is_empty());
+        // Recalc with no dirty cells touching this sheet: cache stays
+        // because all rules are pure. (A cell mutation would still
+        // invalidate via `set_cell_internal`.)
+        let _ = wb.recalc_via_graph_result();
+        assert!(!wb.sheets[0].cf_cache.lock().unwrap().is_empty(),
+            "pure CF predicates must not trigger spurious cache invalidation");
+    }
+
+    #[test]
     fn test_conditional_format_fires_on_truthy_predicate() {
         let mut sheet = Spreadsheet::default();
         sheet.set_cell(0, 0, CellData {

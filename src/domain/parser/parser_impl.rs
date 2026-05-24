@@ -526,16 +526,6 @@ mod tests {
     use crate::domain::{Spreadsheet, CellData, FormulaEvaluator};
     use crate::domain::parser::*;
 
-    fn create_test_spreadsheet() -> Spreadsheet {
-        let mut sheet = Spreadsheet::default();
-        sheet.set_cell(0, 0, CellData { value: "10".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
-        sheet.set_cell(0, 1, CellData { value: "20".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
-        sheet.set_cell(0, 2, CellData { value: "30".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
-        sheet.set_cell(1, 0, CellData { value: "5".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
-        sheet.set_cell(1, 1, CellData { value: "15".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
-        sheet.set_cell(1, 2, CellData { value: "25".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
-        sheet
-    }
 
 
     #[test]
@@ -546,7 +536,9 @@ mod tests {
         
         let mut parser = Parser::new("3.14").unwrap();
         let expr = parser.parse().unwrap();
-        assert_eq!(expr, Expr::Number(3.14));
+        #[allow(clippy::approx_constant)]
+        let three_fourteen = 3.14;
+        assert_eq!(expr, Expr::Number(three_fourteen));
     }
 
     #[test]
@@ -584,9 +576,9 @@ mod tests {
         let expr = parser.parse().unwrap();
         match expr {
             Expr::Binary { left, operator, right } => {
-                assert!(matches!(left.as_ref(), &Expr::CellRef(ref s) if s == "A1"));
+                assert!(matches!(left.as_ref(), Expr::CellRef(s) if s == "A1"));
                 assert_eq!(operator, BinaryOp::Multiply);
-                assert!(matches!(right.as_ref(), &Expr::CellRef(ref s) if s == "B1"));
+                assert!(matches!(right.as_ref(), Expr::CellRef(s) if s == "B1"));
             }
             _ => panic!("Expected binary expression"),
         }
@@ -709,9 +701,9 @@ mod tests {
         let expr = parser.parse().unwrap();
         match expr {
             Expr::Binary { left, operator, right } => {
-                assert!(matches!(left.as_ref(), &Expr::CellRef(ref s) if s == "A1"));
+                assert!(matches!(left.as_ref(), Expr::CellRef(s) if s == "A1"));
                 assert_eq!(operator, BinaryOp::Greater);
-                assert!(matches!(right.as_ref(), &Expr::CellRef(ref s) if s == "B1"));
+                assert!(matches!(right.as_ref(), Expr::CellRef(s) if s == "B1"));
             }
             _ => panic!("Expected binary expression"),
         }
@@ -741,7 +733,7 @@ mod tests {
                 // First argument should be A1 > 5
                 match &args[0] {
                     Expr::Binary { left: comp_left, operator: BinaryOp::Greater, right: comp_right } => {
-                        assert!(matches!(comp_left.as_ref(), &Expr::CellRef(ref s) if s == "A1"));
+                        assert!(matches!(comp_left.as_ref(), Expr::CellRef(s) if s == "A1"));
                         assert!(matches!(comp_right.as_ref(), &Expr::Number(5.0)));
                     }
                     _ => panic!("Expected comparison in first argument"),
@@ -750,7 +742,7 @@ mod tests {
                 // Second argument should be B1 < 10
                 match &args[1] {
                     Expr::Binary { left: comp_left, operator: BinaryOp::Less, right: comp_right } => {
-                        assert!(matches!(comp_left.as_ref(), &Expr::CellRef(ref s) if s == "B1"));
+                        assert!(matches!(comp_left.as_ref(), Expr::CellRef(s) if s == "B1"));
                         assert!(matches!(comp_right.as_ref(), &Expr::Number(10.0)));
                     }
                     _ => panic!("Expected comparison in second argument"),
@@ -777,9 +769,9 @@ mod tests {
         let expr = parser.parse().unwrap();
         match expr {
             Expr::Binary { left, operator, right } => {
-                assert!(matches!(left.as_ref(), &Expr::String(ref s) if s == "Hello"));
+                assert!(matches!(left.as_ref(), Expr::String(s) if s == "Hello"));
                 assert_eq!(operator, BinaryOp::Concatenate);
-                assert!(matches!(right.as_ref(), &Expr::String(ref s) if s == "World"));
+                assert!(matches!(right.as_ref(), Expr::String(s) if s == "World"));
             }
             _ => panic!("Expected binary expression"),
         }
@@ -791,7 +783,7 @@ mod tests {
         let expr = parser.parse().unwrap();
         match expr {
             Expr::Binary { left, operator, right } => {
-                assert!(matches!(left.as_ref(), &Expr::String(ref s) if s == "Number: "));
+                assert!(matches!(left.as_ref(), Expr::String(s) if s == "Number: "));
                 assert_eq!(operator, BinaryOp::Concatenate);
                 assert!(matches!(right.as_ref(), &Expr::Number(42.0)));
             }
@@ -977,7 +969,7 @@ mod tests {
                         }
                         
                         // Inner right should be " - "
-                        assert!(matches!(inner_right.as_ref(), &Expr::String(ref s) if s == " - "));
+                        assert!(matches!(inner_right.as_ref(), Expr::String(s) if s == " - "));
                     }
                     _ => panic!("Expected concatenation expression"),
                 }

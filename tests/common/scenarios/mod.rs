@@ -312,6 +312,21 @@ pub fn enter_cell(h: &mut Harness, addr: &str, content: &str) {
     buf.push_str(content);
     buf.push('\r');             // commit edit (also moves cursor down)
     h.send_text(&buf);
+    // The harness's default INPUT_SETTLE (120ms) covers short content
+    // but can race a long formula under parallel-test CPU contention:
+    // the app reads bytes one event at a time and each char-in-Editing
+    // triggers a render, so an 80-char formula on a loaded CI box can
+    // need ~300-400ms to fully type + commit. Without this extra wait,
+    // the *next* `enter_cell` arrives while the previous edit is still
+    // running, leaving the app stuck in Editing on the wrong cell.
+    // Empirically this was the cause of intermittent failures in
+    // commission / tax_brackets / sensitivity_table.
+    //
+    // We only wait extra for genuinely long content (> 30 chars); short
+    // literals + simple formulas keep the original throughput.
+    if content.len() > 30 {
+        std::thread::sleep(Duration::from_millis(content.len() as u64 * 3));
+    }
 }
 
 /// Bulk-populate a list of (address, content) pairs.

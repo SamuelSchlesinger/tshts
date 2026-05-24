@@ -385,9 +385,10 @@ impl InputHandler {
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default, dead_code)]
 mod tests {
     use super::*;
-    use crate::application::{App, AppMode, VimOperator, VisualKind};
+    use crate::application::{App, AppMode};
     use crossterm::event::{KeyCode, KeyModifiers};
 
 

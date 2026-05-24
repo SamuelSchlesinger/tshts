@@ -485,7 +485,7 @@ fn eval_one(node: NodeKey, snapshot: &Workbook) -> Option<CellEvalOutcome> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::models::{CellData, SheetId};
+    use crate::domain::models::CellData;
 
     /// Sequential executor produces the same observable results as the
     /// legacy `recalc_via_graph` (which is now a thin wrapper around it).

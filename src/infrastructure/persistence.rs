@@ -62,7 +62,7 @@ impl FileRepository {
                 // empty Workbook and we'd silently overwrite the file with
                 // a default state on the next save — destroying data if
                 // the source was actually a corrupted or unrelated file.
-                let raw: serde_json::Value = serde_json::from_str(&content)
+                let mut raw: serde_json::Value = serde_json::from_str(&content)
                     .map_err(|e| format!("Invalid file format - {}", e))?;
                 let obj = raw.as_object().ok_or_else(|| {
                     "Invalid file format - top-level value is not an object".to_string()
@@ -75,18 +75,13 @@ impl FileRepository {
                          not a tshts file".to_string(),
                     );
                 }
-                // Try workbook format first
-                if let Ok(mut workbook) = serde_json::from_str::<Workbook>(&content) {
-                    // Refuse a file written by a future incompatible version
-                    // rather than silently loading partial state.
-                    if workbook.version > crate::domain::models::WORKBOOK_SCHEMA_VERSION {
-                        return Err(format!(
-                            "Workbook schema version {} is newer than this build understands ({}). \
-                             Update tshts to open this file.",
-                            workbook.version,
-                            crate::domain::models::WORKBOOK_SCHEMA_VERSION
-                        ));
-                    }
+                // Try workbook format first. Run the schema migrator before
+                // typed deserialize so future schema bumps don't panic on
+                // load — see `domain::models::workbook::migrate_workbook_json`.
+                if looks_like_workbook {
+                    crate::domain::models::migrate_workbook_json(&mut raw)?;
+                }
+                if let Ok(mut workbook) = serde_json::from_value::<Workbook>(raw.clone()) {
                     // Validate invariants: a file with `active_sheet` past
                     // `sheets.len()` or mismatched `sheet_names.len()` would
                     // panic on the first UI read. The order here matters:
@@ -136,6 +131,7 @@ impl FileRepository {
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
     use crate::domain::CellData;

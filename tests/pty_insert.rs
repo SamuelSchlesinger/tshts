@@ -1,5 +1,8 @@
 //! Detailed Insert-mode cursor behavior driven through a real PTY.
 
+// Test names use uppercase letters to mirror vim keys (e.g. `insert_A_*`).
+#![allow(non_snake_case)]
+
 mod common;
 
 use common::{Arrow, Harness};

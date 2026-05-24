@@ -111,7 +111,7 @@ impl Scenario for Amortization {
         }
         let last_row = 8 + n;
         enter_cells(h, &[("A6", "payment")]);
-        enter_cell(h, &format!("F1"), &format!("=SUM(B9:B{})", last_row));
+        enter_cell(h, "F1", &format!("=SUM(B9:B{})", last_row));
         // F1 = total interest paid.
     }
 

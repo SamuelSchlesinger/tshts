@@ -17,16 +17,20 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
             if url.is_empty() {
                 return Ok(Value::Error(ErrorKind::Value));
             }
-            use crate::infrastructure::fetcher::{fetch, FetchResult};
-            match fetch(&url) {
-                FetchResult::Value(body) => Ok(Value::String(body)),
-                FetchResult::Loading => Ok(Value::String("Loading…".to_string())),
-                // Fetcher errors carry a human-readable string (#ERROR: ...);
-                // surface as a #VALUE! so the cell renders an error literal
+            // Route through the domain-level fetcher abstraction so this
+            // function doesn't import `crate::infrastructure` directly —
+            // infrastructure installs the impl at startup (see
+            // `infrastructure::fetcher::install_as_http_fetcher`).
+            use crate::domain::services::{http_fetch, HttpFetchResult};
+            match http_fetch(&url) {
+                HttpFetchResult::Value(body) => Ok(Value::String(body)),
+                HttpFetchResult::Loading => Ok(Value::String("Loading…".to_string())),
+                // Fetcher errors carry a human-readable string upstream;
+                // surface as #VALUE! so the cell renders an error literal
                 // and IFERROR can trap it. The original message is dropped
                 // because Value::Error doesn't carry text — acceptable since
                 // the cause is usually a transient network issue.
-                FetchResult::Error => Ok(Value::Error(ErrorKind::Value)),
+                HttpFetchResult::Error => Ok(Value::Error(ErrorKind::Value)),
             }
         }, FunctionPurity::SideEffecting);
 }

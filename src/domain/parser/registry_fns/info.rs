@@ -20,10 +20,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
             if args.len() != 1 {
                 return Ok(Value::Error(ErrorKind::Value));
             }
-            let result = match args[0].first_error() {
-                Some(ErrorKind::NA) | None => false,
-                _ => true,
-            };
+            let result = !matches!(args[0].first_error(), Some(ErrorKind::NA) | None);
             Ok(Value::Bool(result))
         });
         reg.register_function("ISNA", |args| {
