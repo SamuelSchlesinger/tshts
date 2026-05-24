@@ -84,7 +84,7 @@ impl Scenario for Currency {
         let last_fx = 1 + i.fx.len();
         // Use fully-absolute refs so VLOOKUP's range stays pinned as
         // the formula is copied down.
-        let fx_range = format!("$A$2:$B${}", last_fx);
+        let fx_range = super::abs_range(&format!("A2:B{}", last_fx));
 
         // Sub table at D1:H(m+1).
         enter_cells(h, &[
@@ -96,10 +96,10 @@ impl Scenario for Currency {
             enter_cell(h, &format!("D{}", row), s.name);
             enter_cell(h, &format!("E{}", row), s.ccy);
             enter_cell(h, &format!("F{}", row), &lit(s.local_balance));
-            // VLOOKUP exact-match: `0` means false (exact). tshts treats
-            // bare `FALSE` as a CellRef → #NAME?; use the numeric form.
+            // VLOOKUP exact-match via bare FALSE (post-fix: bare TRUE/FALSE
+            // now evaluate as boolean literals — match Excel convention).
             enter_cell(h, &format!("G{}", row),
-                &format!("=VLOOKUP(E{},{},2,0)", row, fx_range));
+                &format!("=VLOOKUP(E{},{},2,FALSE)", row, fx_range));
             enter_cell(h, &format!("H{}", row), &format!("=F{}/G{}", row, row));
         }
         let last_sub = 1 + i.subs.len();

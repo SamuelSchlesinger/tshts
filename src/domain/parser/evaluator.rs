@@ -85,6 +85,19 @@ fn walk_purity(expr: &Expr, registry: &FunctionRegistry, acc: &mut FunctionPurit
 /// ranking: numbers < strings < booleans. Tolerance-based equality means
 /// nearly-equal numbers compare `Equal` (so `<` is strict at the same
 /// precision used by `=`).
+/// Is `name` the case-insensitive identifier `TRUE` or `FALSE`? These
+/// are boolean literals when they appear bare (no parens), matching
+/// Excel's reserved-word semantics. The dedicated `TRUE()` and
+/// `FALSE()` zero-arg function forms still work via the FunctionCall
+/// path; this shortcut only kicks in for the bare-identifier form.
+fn bare_bool_literal(name: &str) -> Option<bool> {
+    match name.to_uppercase().as_str() {
+        "TRUE" => Some(true),
+        "FALSE" => Some(false),
+        _ => None,
+    }
+}
+
 fn cmp_ord(left: &Value, right: &Value) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     let rank = |v: &Value| -> u8 {
@@ -165,7 +178,9 @@ impl<'a> ExpressionEvaluator<'a> {
     }
 
     /// Look up a name and parse its value into an `Expr`. The value may be
-    /// a single cell ref or a range like `A1:B10`.
+    /// a single cell ref or a range like `A1:B10`. Bare TRUE/FALSE are
+    /// handled via `bare_bool_literal` BEFORE callers reach this site —
+    /// they need to return a `Value::Bool`, not an `Expr`.
     fn resolve_name(&self, name: &str) -> Result<Expr, String> {
         let names = self
             .named_ranges
@@ -207,6 +222,9 @@ impl<'a> ExpressionEvaluator<'a> {
                 // workbook-level named ranges.
                 if let Some(v) = self.lookup_local(name) {
                     return Ok(v);
+                }
+                if let Some(b) = bare_bool_literal(name) {
+                    return Ok(Value::Bool(b));
                 }
                 let resolved = self.resolve_name(name)?;
                 self.evaluate(&resolved)
@@ -896,6 +914,11 @@ impl<'a> ExpressionEvaluator<'a> {
             let effective = if let Expr::NamedRef(name) = arg {
                 if self.lookup_local(name).is_some() {
                     None // handled by evaluate(target)
+                } else if bare_bool_literal(name).is_some() {
+                    // TRUE/FALSE as a function arg — let evaluate() handle
+                    // the shortcut via the NamedRef branch. Returning
+                    // None falls through to `evaluate(target)` below.
+                    None
                 } else {
                     Some(self.resolve_name(name)?)
                 }
@@ -980,6 +1003,65 @@ mod tests {
         sheet
     }
 
+
+    /// Bare TRUE / FALSE inside a function argument list — the
+    /// scenarios were hitting #NAME? on `=VLOOKUP(E2,$A$2:$B$6,2,FALSE)`.
+    /// This test pins the function-arg case specifically.
+    #[test]
+    fn test_bare_true_false_inside_function_args() {
+        use crate::domain::services::FormulaEvaluator;
+        let mut sheet = crate::domain::Spreadsheet::default();
+        sheet.cells.insert((0, 0), CellData {
+            value: "apple".to_string(), formula: None, format: None,
+            comment: None, spill_anchor: None,
+        });
+        sheet.cells.insert((0, 1), CellData {
+            value: "5".to_string(), formula: None, format: None,
+            comment: None, spill_anchor: None,
+        });
+        sheet.cells.insert((1, 0), CellData {
+            value: "banana".to_string(), formula: None, format: None,
+            comment: None, spill_anchor: None,
+        });
+        sheet.cells.insert((1, 1), CellData {
+            value: "10".to_string(), formula: None, format: None,
+            comment: None, spill_anchor: None,
+        });
+        let ev = FormulaEvaluator::new(&sheet);
+        // VLOOKUP with bare FALSE as the exact-match flag.
+        assert_eq!(ev.evaluate_formula(
+            "=VLOOKUP(\"apple\",A1:B2,2,FALSE)"), "5",
+            "VLOOKUP should accept bare FALSE as the exact-match arg");
+        assert_eq!(ev.evaluate_formula(
+            "=VLOOKUP(\"banana\",A1:B2,2,FALSE)"), "10");
+    }
+
+    /// Bare TRUE / FALSE (no parens) are boolean literals — most users
+    /// write `=IF(A1>0, FALSE, TRUE)` without `()` after the bools.
+    /// Pre-fix this returned `#NAME?` because TRUE/FALSE registered as
+    /// zero-arg functions and bare identifiers became NamedRef which
+    /// failed to resolve.
+    #[test]
+    fn test_bare_true_false_evaluate_as_booleans() {
+        use crate::domain::services::FormulaEvaluator;
+        let sheet = crate::domain::Spreadsheet::default();
+        let ev = FormulaEvaluator::new(&sheet);
+        // Direct.
+        assert_eq!(ev.evaluate_formula("=TRUE"), "TRUE");
+        assert_eq!(ev.evaluate_formula("=FALSE"), "FALSE");
+        // Case-insensitive (Excel convention).
+        assert_eq!(ev.evaluate_formula("=true"), "TRUE");
+        assert_eq!(ev.evaluate_formula("=False"), "FALSE");
+        // Inside IF as branch values.
+        assert_eq!(ev.evaluate_formula("=IF(1=1, TRUE, FALSE)"), "TRUE");
+        assert_eq!(ev.evaluate_formula("=IF(1=2, TRUE, FALSE)"), "FALSE");
+        // Boolean arithmetic still works.
+        assert_eq!(ev.evaluate_formula("=TRUE+TRUE"), "2");
+        assert_eq!(ev.evaluate_formula("=FALSE*5"), "0");
+        // Zero-arg function form ALSO still works.
+        assert_eq!(ev.evaluate_formula("=TRUE()"), "TRUE");
+        assert_eq!(ev.evaluate_formula("=FALSE()"), "FALSE");
+    }
 
     #[test]
     fn test_expression_evaluator_numbers() {

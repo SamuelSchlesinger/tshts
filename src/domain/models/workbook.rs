@@ -103,12 +103,21 @@ pub struct Workbook {
     /// cyclic-remainder cells instead of stamping `#NUM!`. Workbook-wide
     /// (Excel's setting is global; per-sheet would just leak the legacy
     /// per-sheet model).
+    ///
+    /// Serde history: pre-unification these lived on `Spreadsheet` as
+    /// `#[serde(skip)]` (never persisted). They moved here in the
+    /// per-sheet-cascade removal and switched to `#[serde(default)]`
+    /// so user choices now survive save/load. Files saved before the
+    /// migration don't have the field and default to "off" — same
+    /// behavior as before, so no silent regression.
     #[serde(default)]
     pub iterative_calc: bool,
-    /// Max passes for iterative recalc. Default 100.
+    /// Max passes for iterative recalc. Default 100. See `iterative_calc`
+    /// for serde-migration history.
     #[serde(default = "default_iter_max")]
     pub iter_max: usize,
     /// Convergence epsilon (per-cell absolute numeric delta). Default 1e-6.
+    /// See `iterative_calc` for serde-migration history.
     #[serde(default = "default_iter_epsilon")]
     pub iter_epsilon: f64,
     /// Cells whose value may be stale. Populated by every mutation site
@@ -602,6 +611,15 @@ impl Workbook {
     /// error (e.g. iterative-calc non-convergence) so the App layer can
     /// surface it via status message. Individual cell errors flow
     /// through `Value::Error` and don't reach this signature.
+    ///
+    /// `#[must_use]`: callers that genuinely don't care about the error
+    /// (test fixtures, internal mutators where the only failure mode is
+    /// a non-converging cycle that the test isn't asserting on) must
+    /// explicitly bind with `let _ = ...`. Forces a deliberate decision
+    /// every place this is called rather than letting future errors
+    /// disappear silently.
+    #[must_use = "recalc may report iterative-calc non-convergence; either \
+                  bubble the error or explicitly `let _ = ...` to ignore"]
     pub fn recalc_via_graph_result(
         &mut self,
     ) -> Result<(), crate::domain::services::CalcError> {
@@ -1226,20 +1244,8 @@ impl Workbook {
     /// Creates a Workbook from a single Spreadsheet (for backward compatibility).
     pub fn from_spreadsheet(sheet: Spreadsheet) -> Self {
         Self {
-            version: WORKBOOK_SCHEMA_VERSION,
             sheets: vec![sheet],
-            sheet_names: vec!["Sheet1".to_string()],
-            active_sheet: 0,
-            named_ranges: HashMap::new(),
-            iterative_calc: false,
-            iter_max: default_iter_max(),
-            iter_epsilon: default_iter_epsilon(),
-            dirty: HashSet::new(),
-            sheet_ids: vec![SheetId(0)],
-            next_sheet_id: 1,
-            graph: WorkbookGraph::new(),
-            cell_purities: HashMap::new(),
-            structural_targets: HashMap::new(),
+            ..Self::default()
         }
     }
 

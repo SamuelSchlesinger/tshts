@@ -56,21 +56,11 @@ pub fn load_xlsx(path: &str) -> Result<Workbook, String> {
     }
     let sheet_count = sheet_names.len() as u32;
     let mut out = Workbook {
-        version: crate::domain::models::WORKBOOK_SCHEMA_VERSION,
         sheets: Vec::with_capacity(sheet_names.len()),
         sheet_names: sheet_names.clone(),
-        active_sheet: 0,
-        named_ranges: std::collections::HashMap::new(),
-        iterative_calc: false,
-        // Defaults match Workbook::default()'s — 100 passes, 1e-6 epsilon.
-        iter_max: 100,
-        iter_epsilon: 1e-6,
-        dirty: std::collections::HashSet::new(),
         sheet_ids: (0..sheet_count).map(crate::domain::models::SheetId).collect(),
         next_sheet_id: sheet_count,
-        graph: crate::domain::models::WorkbookGraph::new(),
-        cell_purities: std::collections::HashMap::new(),
-        structural_targets: std::collections::HashMap::new(),
+        ..Workbook::default()
     };
     for name in &sheet_names {
         let range = wb

@@ -4238,17 +4238,12 @@ mod tests {
         let mut named = std::collections::HashMap::new();
         named.insert("REVENUE".to_string(), "Sheet1!A1:A10".to_string());
         let wb = Workbook {
-            version: crate::domain::WORKBOOK_SCHEMA_VERSION,
             sheets: vec![], // pathological: empty
             sheet_names: vec![],
-            active_sheet: 0,
-            named_ranges: named.clone(), iterative_calc: false, iter_max: 100, iter_epsilon: 1e-6,
-            dirty: Default::default(),
             sheet_ids: Vec::new(),
             next_sheet_id: 0,
-            graph: Default::default(),
-            cell_purities: Default::default(),
-            structural_targets: Default::default(),
+            named_ranges: named.clone(),
+            ..Workbook::default()
         };
         let dir = std::env::temp_dir();
         let path = dir.join("empty_sheets_named_ranges.tshts");
@@ -4265,17 +4260,10 @@ mod tests {
         use crate::domain::{Spreadsheet, Workbook};
         use crate::infrastructure::FileRepository;
         let mut wb = Workbook {
-            version: crate::domain::WORKBOOK_SCHEMA_VERSION,
-            sheets: vec![Spreadsheet::default()],
-            sheet_names: vec!["Sheet1".to_string()],
             active_sheet: 99,
-            named_ranges: Default::default(), iterative_calc: false, iter_max: 100, iter_epsilon: 1e-6,
-            dirty: Default::default(),
             sheet_ids: Vec::new(),
             next_sheet_id: 0,
-            graph: Default::default(),
-            cell_purities: Default::default(),
-            structural_targets: Default::default(),
+            ..Workbook::default()
         };
         wb.sheets[0].set_cell(0, 0, CellData { value: "ok".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
         let dir = std::env::temp_dir();
@@ -4328,16 +4316,9 @@ mod tests {
         use crate::infrastructure::FileRepository;
         let wb = Workbook {
             version: 9999, // way past current
-            sheets: vec![Spreadsheet::default()],
-            sheet_names: vec!["Sheet1".to_string()],
-            active_sheet: 0,
-            named_ranges: Default::default(), iterative_calc: false, iter_max: 100, iter_epsilon: 1e-6,
-            dirty: Default::default(),
             sheet_ids: Vec::new(),
             next_sheet_id: 0,
-            graph: Default::default(),
-            cell_purities: Default::default(),
-            structural_targets: Default::default(),
+            ..Workbook::default()
         };
         let dir = std::env::temp_dir();
         let path = dir.join("future_version.tshts");
@@ -4371,17 +4352,11 @@ mod tests {
         use crate::domain::{Spreadsheet, Workbook};
         use crate::infrastructure::FileRepository;
         let wb = Workbook {
-            version: crate::domain::WORKBOOK_SCHEMA_VERSION,
             sheets: vec![Spreadsheet::default(), Spreadsheet::default()],
             sheet_names: vec!["OnlyOne".to_string()], // mismatched: 2 sheets, 1 name
-            active_sheet: 0,
-            named_ranges: Default::default(), iterative_calc: false, iter_max: 100, iter_epsilon: 1e-6,
-            dirty: Default::default(),
             sheet_ids: Vec::new(),
             next_sheet_id: 0,
-            graph: Default::default(),
-            cell_purities: Default::default(),
-            structural_targets: Default::default(),
+            ..Workbook::default()
         };
         let dir = std::env::temp_dir();
         let path = dir.join("agent4_mismatched_names.tshts");

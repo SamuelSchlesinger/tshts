@@ -102,7 +102,7 @@ impl Scenario for Lookup {
         }
         let last_price_row = 1 + i.prices.len();
         // Fully-absolute refs for the VLOOKUP table.
-        let price_range = format!("$A$2:$B${}", last_price_row);
+        let price_range = super::abs_range(&format!("A2:B{}", last_price_row));
 
         // Order book at D1:G(m+1).
         enter_cells(h, &[
@@ -113,10 +113,10 @@ impl Scenario for Lookup {
             enter_cell(h, &format!("D{}", row), o.sku);
             enter_cell(h, &format!("E{}", row), &lit(o.qty));
             // VLOOKUP for the unit price; IFERROR returns 0 if SKU unknown.
-            // VLOOKUP exact-match flag: `0` (not bare `FALSE`, which
-            // tshts treats as an undefined CellRef → #NAME?).
+            // VLOOKUP exact-match via bare FALSE (the natural form, now
+            // that tshts handles bare TRUE/FALSE as literals).
             enter_cell(h, &format!("F{}", row),
-                &format!("=IFERROR(VLOOKUP(D{},{},2,0),0)", row, price_range));
+                &format!("=IFERROR(VLOOKUP(D{},{},2,FALSE),0)", row, price_range));
             enter_cell(h, &format!("G{}", row), &format!("=E{}*F{}", row, row));
         }
         let last_order_row = 1 + i.orders.len();

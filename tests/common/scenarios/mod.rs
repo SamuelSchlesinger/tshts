@@ -284,6 +284,34 @@ fn parse_sum_from_status(status: &str) -> Result<f64, String> {
 
 // ---------- Numeric helpers shared by scenarios ----------
 
+/// Wrap an A1-style address (single cell `"A2"` or range `"A2:B6"`)
+/// in fully-absolute references: `"A2" → "$A$2"`, `"A2:B6" → "$A$2:$B$6"`.
+/// Idempotent. Scenarios reach for this instead of hand-formatting
+/// because `format!("${}", range)` produces a single literal `$`
+/// followed by `range`, which is NOT absolute on both endpoints —
+/// a subtle gotcha that bit the `lookup` and `currency` scenarios
+/// during development.
+pub fn abs_range(addr: &str) -> String {
+    addr.split(':').map(abs_cell).collect::<Vec<_>>().join(":")
+}
+
+/// Wrap a single A1-style cell address in fully-absolute references.
+/// Idempotent.
+pub fn abs_cell(cell: &str) -> String {
+    let bytes = cell.as_bytes();
+    let mut i = 0;
+    if bytes.first() == Some(&b'$') { i += 1; }
+    let col_start = i;
+    while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+        i += 1;
+    }
+    let col_end = i;
+    if bytes.get(i) == Some(&b'$') { i += 1; }
+    let col_letters = &cell[col_start..col_end];
+    let row_digits = &cell[i..];
+    format!("${}${}", col_letters, row_digits)
+}
+
 /// Format an `f64` for inclusion in a tshts formula. Avoids scientific
 /// notation, which the parser doesn't accept, and keeps full precision.
 pub fn lit(x: f64) -> String {
@@ -337,6 +365,23 @@ mod parse_tests {
     fn parse_sum_handles_negative() {
         let s = "SUM=-1.5 AVG=-1.50 COUNT=1";
         assert_eq!(parse_sum_from_status(s).unwrap(), -1.5);
+    }
+
+    #[test]
+    fn abs_cell_anchors_both_parts() {
+        assert_eq!(abs_cell("A1"), "$A$1");
+        assert_eq!(abs_cell("AA10"), "$AA$10");
+        assert_eq!(abs_cell("$A$1"), "$A$1");
+        assert_eq!(abs_cell("$A1"), "$A$1");
+        assert_eq!(abs_cell("A$1"), "$A$1");
+    }
+
+    #[test]
+    fn abs_range_anchors_both_endpoints() {
+        assert_eq!(abs_range("A2:B6"), "$A$2:$B$6");
+        assert_eq!(abs_range("A1"), "$A$1");
+        assert_eq!(abs_range("$A$2:$B$6"), "$A$2:$B$6");
+        assert_eq!(abs_range("$A2:B$6"), "$A$2:$B$6");
     }
 
     #[test]
