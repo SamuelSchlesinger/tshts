@@ -99,3 +99,8 @@ fn scenario_sales_leaderboard() {
 fn scenario_regression() {
     run(&common::scenarios::regression::Regression);
 }
+
+#[test]
+fn scenario_number_formatting() {
+    run(&common::scenarios::formatting::Formatting);
+}

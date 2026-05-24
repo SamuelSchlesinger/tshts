@@ -742,7 +742,12 @@ impl App {
                             self.workbook.current_sheet(),
                             &self.workbook.named_ranges,
                         );
-                        let initial = evaluator.evaluate_formula(&formula);
+                        // Publish a clock for the same NOW()/TODAY()
+                        // consistency reason as the editing/autofill/paste paths.
+                        let initial = crate::domain::parser::with_recalc_clock(
+                            crate::domain::parser::now_serial(),
+                            || evaluator.evaluate_formula(&formula),
+                        );
                         rows.push((
                             t.0 + 1 + i,
                             t.1 + 1,

@@ -109,8 +109,18 @@ pub fn format_cell_value(value: &str, format: &CellFormat) -> String {
         }
         NumberFormat::Currency { symbol, decimals } => {
             if let Ok(n) = value.parse::<f64>() {
-                let formatted = format!("{:.prec$}", n, prec = *decimals as usize);
-                format!("{}{}", symbol, add_thousands_separator(&formatted))
+                // Excel convention: sign goes BEFORE the currency symbol
+                // ("-$42.50"), not between the symbol and the magnitude
+                // ("$-42.50"). Format the absolute value, then prepend
+                // the sign manually so the symbol always sits next to
+                // the digits.
+                let abs_formatted = format!("{:.prec$}", n.abs(), prec = *decimals as usize);
+                let body = add_thousands_separator(&abs_formatted);
+                if n < 0.0 {
+                    format!("-{}{}", symbol, body)
+                } else {
+                    format!("{}{}", symbol, body)
+                }
             } else {
                 value.to_string()
             }

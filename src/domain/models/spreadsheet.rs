@@ -585,11 +585,21 @@ impl Spreadsheet {
     /// viewport so a single wide cell can't push other columns off-screen).
     pub fn auto_resize_column_with_cap(&mut self, col: usize, max_cap: usize) {
         use unicode_width::UnicodeWidthStr;
+        use super::style::format_cell_value;
         let mut max_width = Self::column_label(col).width();
 
         for (&(_, c), cell) in &self.cells {
             if c == col {
-                let value_width = cell.value.width();
+                // The rendered width drives the auto-fit, not the raw
+                // value's width. A cell with raw "9876.54" and currency
+                // format displays as "$9,876.54" (9 chars vs 7); sizing
+                // by raw width would clip the displayed text.
+                let displayed = if let Some(ref fmt) = cell.format {
+                    format_cell_value(&cell.value, fmt)
+                } else {
+                    cell.value.clone()
+                };
+                let value_width = displayed.width();
                 let formula_width = cell.formula.as_ref().map(|f| f.width()).unwrap_or(0);
                 let content_width = value_width.max(formula_width);
                 max_width = max_width.max(content_width);
@@ -606,12 +616,19 @@ impl Spreadsheet {
     /// O(cols × cells) — the per-column loop iterated the entire HashMap.
     pub fn auto_resize_all_columns(&mut self) {
         use unicode_width::UnicodeWidthStr;
+        use super::style::format_cell_value;
         let mut widths: HashMap<usize, usize> = HashMap::with_capacity(self.cols);
         for col in 0..self.cols {
             widths.insert(col, Self::column_label(col).width());
         }
         for (&(_, c), cell) in &self.cells {
-            let value_width = cell.value.width();
+            // Width the user sees, not raw — see auto_resize_column_with_cap.
+            let displayed = if let Some(ref fmt) = cell.format {
+                format_cell_value(&cell.value, fmt)
+            } else {
+                cell.value.clone()
+            };
+            let value_width = displayed.width();
             let formula_width = cell.formula.as_ref().map(|f| f.width()).unwrap_or(0);
             let content_width = value_width.max(formula_width);
             let entry = widths.entry(c).or_insert(3);

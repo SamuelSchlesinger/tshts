@@ -202,27 +202,33 @@ impl App {
         let dest_row = self.selected_row;
         let dest_col = self.selected_col;
 
-        // Compute all new cells first (evaluator borrows spreadsheet immutably)
-        let new_cells: Vec<_> = {
-            let evaluator = crate::domain::FormulaEvaluator::new(self.workbook.current_sheet());
-            clipboard.cells.iter().filter_map(|(row_off, col_off, cell)| {
-                let target_row = dest_row + row_off;
-                let target_col = dest_col + col_off;
-                if target_row >= self.workbook.current_sheet().rows || target_col >= self.workbook.current_sheet().cols {
-                    return None;
-                }
-                let new_cell = if let Some(ref formula) = cell.formula {
-                    let row_offset = target_row as i32 - (clipboard.source_row + row_off) as i32;
-                    let col_offset = target_col as i32 - (clipboard.source_col + col_off) as i32;
-                    let adjusted = evaluator.adjust_formula_references(formula, row_offset, col_offset);
-                    let value = evaluator.evaluate_formula(&adjusted);
-                    CellData { value, formula: Some(adjusted), format: cell.format.clone(), comment: cell.comment.clone(), spill_anchor: None }
-                } else {
-                    cell.clone()
-                };
-                Some((target_row, target_col, new_cell))
-            }).collect()
-        };
+        // Compute all new cells first (evaluator borrows spreadsheet immutably).
+        // One clock snapshot for the whole paste so any pasted =NOW() cells
+        // agree on time, and so they match what the auto-recalc immediately
+        // following will use.
+        let new_cells: Vec<_> = crate::domain::parser::with_recalc_clock(
+            crate::domain::parser::now_serial(),
+            || {
+                let evaluator = crate::domain::FormulaEvaluator::new(self.workbook.current_sheet());
+                clipboard.cells.iter().filter_map(|(row_off, col_off, cell)| {
+                    let target_row = dest_row + row_off;
+                    let target_col = dest_col + col_off;
+                    if target_row >= self.workbook.current_sheet().rows || target_col >= self.workbook.current_sheet().cols {
+                        return None;
+                    }
+                    let new_cell = if let Some(ref formula) = cell.formula {
+                        let row_offset = target_row as i32 - (clipboard.source_row + row_off) as i32;
+                        let col_offset = target_col as i32 - (clipboard.source_col + col_off) as i32;
+                        let adjusted = evaluator.adjust_formula_references(formula, row_offset, col_offset);
+                        let value = evaluator.evaluate_formula(&adjusted);
+                        CellData { value, formula: Some(adjusted), format: cell.format.clone(), comment: cell.comment.clone(), spill_anchor: None }
+                    } else {
+                        cell.clone()
+                    };
+                    Some((target_row, target_col, new_cell))
+                }).collect()
+            },
+        );
 
         // Now apply changes (mutably borrows spreadsheet) — collect the
         // undo batch, then push all writes through `set_many` in one shot
@@ -315,7 +321,11 @@ impl App {
                         }
                     }
                     let evaluator = FormulaEvaluator::new(self.workbook.current_sheet());
-                    let evaluated = evaluator.evaluate_formula(value);
+                    // Same clock-publish rationale as the multi-cell paste path.
+                    let evaluated = crate::domain::parser::with_recalc_clock(
+                        crate::domain::parser::now_serial(),
+                        || evaluator.evaluate_formula(value),
+                    );
                     CellData {
                         value: evaluated,
                         formula: Some(value.to_string()),

@@ -118,6 +118,39 @@ pub trait Scenario {
     /// Build the list of cell checks from the ground-truth output.
     /// Each check ties a spreadsheet cell back to a Rust-computed value.
     fn checks(&self, output: &Self::Output) -> Vec<CellCheck>;
+
+    /// Optional rendered-text checks — for cells where the user-visible
+    /// rendering (currency-formatted, percent-formatted, etc.) is what
+    /// matters and the raw numeric value is only an internal detail.
+    /// Default empty: most scenarios only care about numeric correctness.
+    /// Implementations that test number formatting override this.
+    fn rendered_text_checks(&self, _output: &Self::Output) -> Vec<RenderedTextCheck> {
+        Vec::new()
+    }
+}
+
+/// Asserts that a cell's rendered text (post number-formatting) contains
+/// `expected_substring`. Use for currency / percent / date-format checks
+/// where the framework's SUM= read mechanism (which reads raw numeric
+/// values) doesn't see the formatting. Substring rather than exact match
+/// because the rendered grid may pad/truncate based on column width.
+#[derive(Debug, Clone)]
+pub struct RenderedTextCheck {
+    pub label: String,
+    /// Spreadsheet row, 1-indexed (matches A1 notation).
+    pub row: u16,
+    /// Substring expected somewhere in the row's rendered text.
+    pub expected_substring: String,
+}
+
+impl RenderedTextCheck {
+    pub fn new(label: impl Into<String>, row: u16, expected_substring: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            row,
+            expected_substring: expected_substring.into(),
+        }
+    }
 }
 
 /// Run a scenario end-to-end against a fresh PTY harness.
@@ -181,13 +214,34 @@ pub fn run<S: Scenario>(s: &S) {
         }
     }
 
+    // Rendered-text checks: assert on the user-visible rendering of cells
+    // (currency-formatted, percent-formatted, etc.). The raw numeric SUM
+    // read doesn't capture this — number formatting only shows up in the
+    // grid. We read the row directly via h.data_row() (auto-fit `+` already
+    // ran above so wide values aren't clipped).
+    let render_checks = s.rendered_text_checks(&truth);
+    for check in &render_checks {
+        let row = h.data_row(check.row);
+        if !row.contains(&check.expected_substring) {
+            failures.push(format!(
+                "  {label} (row {row}): expected to contain {expected:?}, \
+                 row rendered as {actual:?}",
+                label = check.label,
+                row = check.row,
+                expected = check.expected_substring,
+                actual = row.trim(),
+            ));
+        }
+    }
+
     if !failures.is_empty() {
+        let total = all_checks.len() + render_checks.len();
         panic!(
             "[scenario:{name}] {failed} of {total} checks failed:\n{detail}\n\n\
              ---- final screen ----\n{screen}",
             name = s.name(),
             failed = failures.len(),
-            total = all_checks.len(),
+            total = total,
             detail = failures.join("\n"),
             screen = h.screen_contents(),
         );
@@ -334,6 +388,7 @@ pub mod commission;
 pub mod compound;
 pub mod currency;
 pub mod dcf;
+pub mod formatting;
 pub mod inventory;
 pub mod leaderboard;
 pub mod lookup;

@@ -105,7 +105,13 @@ impl App {
                         continue;
                     }
 
-                    let new_value = evaluator.evaluate_formula(&adjusted_formula);
+                    // Publish a clock so any NOW()/TODAY() in the autofilled
+                    // formula uses the same snapshot the auto-recalc will,
+                    // and so all cells filled in this batch agree on time.
+                    let new_value = crate::domain::parser::with_recalc_clock(
+                        crate::domain::parser::now_serial(),
+                        || evaluator.evaluate_formula(&adjusted_formula),
+                    );
                     changes.push((*target_row, col, CellData {
                         value: new_value,
                         formula: Some(adjusted_formula),
@@ -189,7 +195,11 @@ impl App {
                         continue;
                     }
 
-                    let new_value = evaluator.evaluate_formula(&adjusted_formula);
+                    // See row-autofill path above for the clock-publish rationale.
+                    let new_value = crate::domain::parser::with_recalc_clock(
+                        crate::domain::parser::now_serial(),
+                        || evaluator.evaluate_formula(&adjusted_formula),
+                    );
                     changes.push((row, *target_col, CellData {
                         value: new_value,
                         formula: Some(adjusted_formula),

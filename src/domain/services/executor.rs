@@ -811,34 +811,95 @@ mod tests {
         let n_literals = (n_cells as u32 / 3).max(3);     // ~1/3 literals
         let mut cells: Vec<(usize, usize, String)> = Vec::new();
         // Literals come first so later formulas always have something
-        // to reference.
+        // to reference. Mix integers and small positive numbers so
+        // SUMPRODUCT and IF-comparison branches see varied inputs.
         for i in 0..n_literals {
-            // Random integer in [-50, 50]. Avoid floats here so string
-            // comparison is stable across the two executors.
             let v = ((next() % 100) as i64) - 50;
             cells.push((i as usize, 0, v.to_string()));
         }
+        // Build a few helper cells in column B so range-aware functions
+        // (SUM, AVERAGE, VLOOKUP) have a contiguous block to consult.
+        // These are mirrors of column A's first ten literals.
+        let n_helpers = n_literals.min(10) as usize;
+        for i in 0..n_helpers {
+            cells.push((i, 1, format!("=A{}", i + 1)));
+        }
         for i in n_literals..(n_cells as u32) {
             let row = i as usize;
-            // Pick 1..=3 earlier cells to combine.
-            let n_refs = 1 + (next() % 3) as usize;
-            let mut formula = String::from("=");
-            for j in 0..n_refs {
-                if j > 0 {
-                    let op = match next() % 4 {
-                        0 => '+',
-                        1 => '-',
-                        2 => '*',
-                        _ => '+', // skip '/' to avoid #DIV/0! noise
-                    };
-                    formula.push(op);
-                }
-                let pick = (next() as usize) % (i as usize);
-                formula.push_str(&format!("A{}", pick + 1));
-            }
+            // Pick a random shape per cell — operator chain, IF, SUM,
+            // MAX, ABS, or VLOOKUP. Each path exercises a different
+            // executor surface; if Sequential and Parallel diverge on
+            // any of them, the fuzz catches it.
+            let formula = match next() % 6 {
+                0 => gen_arith(&mut next, i),
+                1 => gen_if(&mut next, i),
+                2 => gen_sum_range(&mut next, i, n_helpers),
+                3 => gen_max_range(&mut next, i, n_helpers),
+                4 => gen_abs(&mut next, i),
+                _ => gen_vlookup(&mut next, i, n_helpers),
+            };
             cells.push((row, 0, formula));
         }
         cells
+    }
+
+    fn gen_arith(next: &mut impl FnMut() -> u32, i: u32) -> String {
+        let n_refs = 1 + (next() % 3) as usize;
+        let mut f = String::from("=");
+        for j in 0..n_refs {
+            if j > 0 {
+                let op = match next() % 4 {
+                    0 => '+',
+                    1 => '-',
+                    2 => '*',
+                    _ => '+', // skip '/' to avoid #DIV/0! noise
+                };
+                f.push(op);
+            }
+            let pick = (next() as usize) % (i as usize);
+            f.push_str(&format!("A{}", pick + 1));
+        }
+        f
+    }
+
+    fn gen_if(next: &mut impl FnMut() -> u32, i: u32) -> String {
+        let a = (next() as usize) % (i as usize) + 1;
+        let b = (next() as usize) % (i as usize) + 1;
+        let c = (next() as usize) % (i as usize) + 1;
+        let d = (next() as usize) % (i as usize) + 1;
+        format!("=IF(A{}>A{},A{},A{})", a, b, c, d)
+    }
+
+    fn gen_sum_range(next: &mut impl FnMut() -> u32, _i: u32, helpers: usize) -> String {
+        if helpers < 2 { return "=0".to_string(); }
+        // Sum a sub-range of column B (the helpers).
+        let lo = (next() as usize) % helpers;
+        let hi_extra = (next() as usize) % (helpers - lo);
+        let hi = lo + hi_extra;
+        format!("=SUM(B{}:B{})", lo + 1, hi + 1)
+    }
+
+    fn gen_max_range(next: &mut impl FnMut() -> u32, _i: u32, helpers: usize) -> String {
+        if helpers < 2 { return "=0".to_string(); }
+        let lo = (next() as usize) % helpers;
+        let hi_extra = (next() as usize) % (helpers - lo);
+        let hi = lo + hi_extra;
+        format!("=MAX(B{}:B{})", lo + 1, hi + 1)
+    }
+
+    fn gen_abs(next: &mut impl FnMut() -> u32, i: u32) -> String {
+        let pick = (next() as usize) % (i as usize) + 1;
+        format!("=ABS(A{})", pick)
+    }
+
+    fn gen_vlookup(next: &mut impl FnMut() -> u32, _i: u32, helpers: usize) -> String {
+        if helpers < 2 { return "=0".to_string(); }
+        // VLOOKUP into B's helper column. Use approximate-match
+        // (TRUE) since helpers may not be sorted — Excel returns the
+        // last-matching key in approximate mode regardless. Both
+        // executors should behave identically.
+        let target = (next() as usize) % helpers + 1;
+        format!("=IFERROR(VLOOKUP(A{},B1:B{},1,TRUE),0)", target, helpers)
     }
 
     /// Single-snapshot recalc must propagate per-level writes into the
