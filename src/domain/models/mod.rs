@@ -25,7 +25,7 @@ pub use spreadsheet::{Spreadsheet, Table, ConditionalFormat, SheetViewState};
 pub use workbook::{Workbook, WORKBOOK_SCHEMA_VERSION};
 #[allow(unused_imports)]
 pub use workbook::CrossSheetKey;
-pub use dep_graph::{NodeKey, SheetId, TopoLevels, WorkbookGraph};
+pub use dep_graph::{NodeKey, SheetId, WorkbookGraph};
 pub use workbook::with_recalc_context;
 
 #[cfg(test)]

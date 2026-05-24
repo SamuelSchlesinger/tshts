@@ -1703,7 +1703,7 @@ mod tests {
         });
         // Seed: Sheet1!A1 just got set. Mark dirty + recalc.
         wb.mark_dirty("Sheet1", 0, 0);
-        wb.recalc_via_graph();
+        let _ = wb.recalc_via_graph_result();
 
         // Sheet1!A2 = 10 + 1 = 11
         assert_eq!(wb.sheets[0].get_cell(1, 0).value, "11");
@@ -1797,7 +1797,7 @@ mod tests {
         wb.build_dep_graph_from_scratch();
         wb.mark_dirty("Sheet1", 0, 0);
         wb.mark_dirty("Sheet1", 0, 1);
-        wb.recalc_via_graph();
+        let _ = wb.recalc_via_graph_result();
 
         let offset_node = (SheetId(0), 0, 2);
         let b1_node = (SheetId(0), 0, 1);
@@ -1832,7 +1832,7 @@ mod tests {
         wb.mark_dirty("Sheet1", 0, 0);
         wb.mark_dirty("Sheet1", 0, 1);
         wb.mark_dirty("Sheet1", 0, 3);
-        wb.recalc_via_graph();
+        let _ = wb.recalc_via_graph_result();
         assert_eq!(wb.sheets[0].get_cell(0, 2).value, "7");
 
         // User edits D1 (unrelated to OFFSET's target). OFFSET targets
@@ -1843,7 +1843,7 @@ mod tests {
         });
         wb.mark_dirty("Sheet1", 0, 3);
         let plan_before = wb.structural_targets.clone();
-        wb.recalc_via_graph();
+        let _ = wb.recalc_via_graph_result();
         // Sanity: targets cache was preserved (not cleared by recalc).
         assert_eq!(wb.structural_targets, plan_before,
             "targets cache must persist across recalc");
@@ -1856,7 +1856,7 @@ mod tests {
             comment: None, spill_anchor: None,
         });
         wb.mark_dirty("Sheet1", 0, 1);
-        wb.recalc_via_graph();
+        let _ = wb.recalc_via_graph_result();
         assert_eq!(wb.sheets[0].get_cell(0, 2).value, "42");
     }
 
@@ -1880,7 +1880,7 @@ mod tests {
         });
         wb.build_dep_graph_from_scratch();
         wb.mark_dirty("Sheet1", 0, 0);
-        wb.recalc_via_graph();
+        let _ = wb.recalc_via_graph_result();
         let node = (SheetId(0), 0, 1);
         assert!(wb.structural_targets.get(&node).is_some(),
             "OFFSET should record its target after eval");
@@ -1916,7 +1916,7 @@ mod tests {
         });
         wb.build_dep_graph_from_scratch();
         wb.mark_dirty("Sheet1", 0, 0);
-        wb.recalc_via_graph();
+        let _ = wb.recalc_via_graph_result();
         let node = (SheetId(0), 0, 1);
         assert!(wb.cell_purities.get(&node).is_some(), "purity populated");
         assert!(wb.structural_targets.get(&node).is_some(), "targets populated");
@@ -1954,7 +1954,7 @@ mod tests {
         });
         wb.build_dep_graph_from_scratch();
         wb.mark_dirty("Sheet1", 0, 0);
-        wb.recalc_via_graph();
+        let _ = wb.recalc_via_graph_result();
         assert_eq!(wb.sheets[0].get_cell(3, 1).value, "10");
         let old_node = (SheetId(0), 3, 1);
         assert!(wb.cell_purities.get(&old_node).is_some(),
@@ -1962,7 +1962,7 @@ mod tests {
 
         // Insert a row at row 0 — OFFSET shifts from (3, 1) to (4, 1).
         wb.insert_row_on_active(0);
-        wb.recalc_via_graph();
+        let _ = wb.recalc_via_graph_result();
         let new_node = (SheetId(0), 4, 1);
         assert!(wb.cell_purities.get(&old_node).is_none(),
             "stale purity at OLD position must be cleared");
@@ -2022,7 +2022,7 @@ mod tests {
 
         // And :recalc on the new content shouldn't crash or invent
         // values from stale entries.
-        app.workbook.recalc_via_graph();
+        let _ = app.workbook.recalc_via_graph_result();
         assert_eq!(app.workbook.sheets[0].get_cell(0, 0).value, "100");
     }
 
@@ -2048,7 +2048,7 @@ mod tests {
         wb.build_dep_graph_from_scratch();
         wb.mark_dirty("Sheet1", 0, 0);
         wb.mark_dirty("Sheet1", 0, 1);
-        wb.recalc_via_graph();
+        let _ = wb.recalc_via_graph_result();
         assert_eq!(wb.sheets[0].get_cell(0, 2).value, "7");
 
         // Change B1 — OFFSET's target. Smart auto-seed sees B1 in
@@ -2058,7 +2058,7 @@ mod tests {
             comment: None, spill_anchor: None,
         });
         wb.mark_dirty("Sheet1", 0, 1);
-        wb.recalc_via_graph();
+        let _ = wb.recalc_via_graph_result();
         assert_eq!(wb.sheets[0].get_cell(0, 2).value, "99",
             "OFFSET should pick up B1's new value via smart auto-seed");
     }
@@ -2280,7 +2280,7 @@ mod tests {
         // Initial recalc: seed everything dirty.
         wb.mark_dirty("Sheet1", 0, 0);
         wb.mark_dirty("Sheet1", 4, 1);
-        wb.recalc_via_graph();
+        let _ = wb.recalc_via_graph_result();
         assert_eq!(wb.sheets[0].get_cell(0, 2).value, "100", "C1 = INDIRECT(A1) → B5 = 100");
         assert_eq!(wb.sheets[0].get_cell(0, 3).value, "101", "D1 = C1+1 = 101");
 
@@ -2292,7 +2292,7 @@ mod tests {
             formula: None, format: None, comment: None, spill_anchor: None,
         });
         wb.mark_dirty("Sheet1", 4, 1);
-        wb.recalc_via_graph();
+        let _ = wb.recalc_via_graph_result();
         assert_eq!(wb.sheets[0].get_cell(0, 2).value, "200",
             "C1 should pick up B5's new value via auto-seeded re-evaluation");
         assert_eq!(wb.sheets[0].get_cell(0, 3).value, "201",
@@ -2325,7 +2325,7 @@ mod tests {
         wb.build_dep_graph_from_scratch();
         wb.mark_dirty("Sheet1", 0, 0);
         wb.mark_dirty("Sheet1", 0, 1);
-        wb.recalc_via_graph();
+        let _ = wb.recalc_via_graph_result();
         assert_eq!(wb.sheets[0].get_cell(0, 2).value, "7");
 
         // Change B1 to 99. OFFSET cell doesn't statically depend on B1
@@ -2335,7 +2335,7 @@ mod tests {
             formula: None, format: None, comment: None, spill_anchor: None,
         });
         wb.mark_dirty("Sheet1", 0, 1);
-        wb.recalc_via_graph();
+        let _ = wb.recalc_via_graph_result();
         assert_eq!(wb.sheets[0].get_cell(0, 2).value, "99",
             "OFFSET should pick up B1's new value");
     }
@@ -2361,7 +2361,7 @@ mod tests {
         wb.build_dep_graph_from_scratch();
         wb.mark_dirty("Sheet1", 0, 0);
         wb.mark_dirty("Sheet1", 1, 0);
-        wb.recalc_via_graph();
+        let _ = wb.recalc_via_graph_result();
 
         let a = wb.sheets[0].get_cell(0, 0).value;
         let b = wb.sheets[0].get_cell(1, 0).value;
@@ -2389,7 +2389,7 @@ mod tests {
         wb.build_dep_graph_from_scratch();
         wb.mark_dirty("Sheet1", 0, 0);
         wb.mark_dirty("Sheet1", 1, 0);
-        wb.recalc_via_graph();
+        let _ = wb.recalc_via_graph_result();
 
         let a = wb.sheets[0].get_cell(0, 0).value;
         let b = wb.sheets[0].get_cell(1, 0).value;
@@ -2439,7 +2439,7 @@ mod tests {
         wb.build_dep_graph_from_scratch();
         wb.mark_dirty("Sheet1", 0, 0);
         wb.mark_dirty("Sheet2", 0, 0);
-        wb.recalc_via_graph();
+        let _ = wb.recalc_via_graph_result();
 
         // Expected fixed point: solve A = B*0.5 + 10, B = A*0.5 + 5
         //                       A = (A*0.5 + 5)*0.5 + 10 = A*0.25 + 12.5
@@ -2469,7 +2469,7 @@ mod tests {
             format: None, comment: None, spill_anchor: None,
         });
         // Don't mark dirty.
-        wb.recalc_via_graph();
+        let _ = wb.recalc_via_graph_result();
         // Value unchanged.
         assert_eq!(wb.sheets[0].get_cell(0, 0).value, "5");
     }
@@ -2483,7 +2483,7 @@ mod tests {
         // Mark a dirty entry for a sheet that doesn't exist.
         wb.mark_dirty("Nonexistent", 0, 0);
         // Should not panic.
-        wb.recalc_via_graph();
+        let _ = wb.recalc_via_graph_result();
         // No values changed.
         assert!(wb.sheets[0].cells.is_empty());
     }
@@ -2526,7 +2526,7 @@ mod tests {
             format: None, comment: None, spill_anchor: None,
         });
         wb.mark_dirty("Sheet1", 0, 0);
-        wb.recalc_via_graph();
+        let _ = wb.recalc_via_graph_result();
         // Anchor cell evaluates to first element.
         assert_eq!(wb.sheets[0].get_cell(0, 0).value, "1");
         // Ghost cells exist (sheet has more cells than just A1).
@@ -3536,7 +3536,7 @@ mod tests {
         use crate::infrastructure::fetcher::test_hooks;
         enable_network_for_test();
         let url = "https://example.com/get_returns_value_error";
-        test_hooks::seed_error(url, "404 Not Found");
+        test_hooks::seed_error(url);
         let sheet = create_test_spreadsheet();
         let evaluator = FormulaEvaluator::new(&sheet);
         let result = evaluator.evaluate_formula(&format!("=GET(\"{}\")", url));
@@ -3560,7 +3560,7 @@ mod tests {
         use crate::infrastructure::fetcher::test_hooks;
         enable_network_for_test();
         let url = "https://example.com/iferror_traps_get_error";
-        test_hooks::seed_error(url, "503 upstream down");
+        test_hooks::seed_error(url);
         let sheet = create_test_spreadsheet();
         let evaluator = FormulaEvaluator::new(&sheet);
         let result = evaluator.evaluate_formula(

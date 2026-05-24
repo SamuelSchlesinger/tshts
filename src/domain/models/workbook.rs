@@ -195,9 +195,14 @@ impl Workbook {
         self.sheet_ids.push(id);
     }
 
-    /// Returns the [`SheetId`] at the given index, allocating a fresh one
-    /// if the parallel `sheet_ids` vec is missing or stale (e.g. after
-    /// loading a pre-PR-1 file). Bounded by the live sheet count.
+    /// Returns the [`SheetId`] at the given index, allocating a fresh
+    /// one if the parallel `sheet_ids` vec is missing or stale (e.g.
+    /// after loading a pre-PR-1 file). Bounded by the live sheet count.
+    /// Used by `test_sheet_id_allocation_monotonic_no_reuse` to assert
+    /// the monotonic-no-reuse invariant — the executor relies on it,
+    /// so the test stays even though no runtime code path needs the
+    /// helper.
+    #[cfg(test)]
     pub fn sheet_id_at(&mut self, idx: usize) -> Option<SheetId> {
         if idx >= self.sheets.len() {
             return None;
@@ -588,7 +593,7 @@ impl Workbook {
     /// - **Per-level workbook clone** is O(workbook size) per level.
     ///   A future PR can replace this with `Arc<WorkbookSnapshot>` for
     ///   deeper graphs where the clone dominates.
-    /// Public wrapper for the recalc engine. Returns any pass-level
+    /// Public entry point for the recalc engine. Returns any pass-level
     /// error (e.g. iterative-calc non-convergence) so the App layer can
     /// surface it via status message. Individual cell errors flow
     /// through `Value::Error` and don't reach this signature.
@@ -596,16 +601,6 @@ impl Workbook {
         &mut self,
     ) -> Result<(), crate::domain::services::CalcError> {
         self.recalc_via_graph_inner()
-    }
-
-    /// Original entry-point — kept for backward compatibility with
-    /// internal call sites that don't care about pass-level errors
-    /// (e.g. tests that just want behavioral parity). Surfaces errors
-    /// to stderr only.
-    pub fn recalc_via_graph(&mut self) {
-        if let Err(e) = self.recalc_via_graph_inner() {
-            eprintln!("tshts: recalc: {}", e);
-        }
     }
 
     fn recalc_via_graph_inner(

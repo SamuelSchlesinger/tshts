@@ -197,6 +197,22 @@ pub enum UndoAction {
 }
 
 impl UndoAction {
+    /// Human-readable label for use in undo/redo status messages.
+    /// `WorkbookSnapshot` carries its own per-command description (passed
+    /// to `with_snapshot_undo`); everything else gets a static name.
+    pub fn description(&self) -> String {
+        match self {
+            UndoAction::CellModified { .. } => "cell edit".to_string(),
+            UndoAction::Batch(_) => "batch edit".to_string(),
+            UndoAction::ConditionalFormatsReplaced { .. } => "CF rules".to_string(),
+            UndoAction::RowInserted { .. } => "insert row".to_string(),
+            UndoAction::RowDeleted { .. } => "delete row".to_string(),
+            UndoAction::ColInserted { .. } => "insert column".to_string(),
+            UndoAction::ColDeleted { .. } => "delete column".to_string(),
+            UndoAction::WorkbookSnapshot { description, .. } => description.clone(),
+        }
+    }
+
     /// Roll the workbook back to the state before this action was applied.
     /// Used by `App::undo`. Returns any non-fatal recalc error so the
     /// caller can surface it (e.g. iterative-calc non-convergence on a
@@ -801,8 +817,14 @@ impl App {
 
     pub fn undo(&mut self) {
         if let Some(action) = self.undo_stack.pop_back() {
-            if let Err(e) = action.revert(&mut self.workbook) {
-                self.status_message = Some(format!("Undo: {}", e));
+            let label = action.description();
+            match action.revert(&mut self.workbook) {
+                Ok(()) => {
+                    self.status_message = Some(format!("Undo: {}", label));
+                }
+                Err(e) => {
+                    self.status_message = Some(format!("Undo {}: {}", label, e));
+                }
             }
             self.redo_stack.push_back(action);
             self.dirty = true;
@@ -825,8 +847,14 @@ impl App {
 
     pub fn redo(&mut self) {
         if let Some(action) = self.redo_stack.pop_back() {
-            if let Err(e) = action.apply(&mut self.workbook) {
-                self.status_message = Some(format!("Redo: {}", e));
+            let label = action.description();
+            match action.apply(&mut self.workbook) {
+                Ok(()) => {
+                    self.status_message = Some(format!("Redo: {}", label));
+                }
+                Err(e) => {
+                    self.status_message = Some(format!("Redo {}: {}", label, e));
+                }
             }
             self.undo_stack.push_back(action);
             self.dirty = true;

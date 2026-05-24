@@ -72,17 +72,6 @@ pub struct RecalcPlan {
     pub cyclic: Vec<NodeKey>,
 }
 
-impl RecalcPlan {
-    pub fn is_empty(&self) -> bool {
-        self.levels.is_empty() && self.cyclic.is_empty()
-    }
-
-    /// Total cell count across all levels (excluding cyclic remainder).
-    #[allow(dead_code)]
-    pub fn cell_count(&self) -> usize {
-        self.levels.iter().map(|l| l.len()).sum()
-    }
-}
 
 /// Errors a recalc pass can surface to the user. Individual cell
 /// errors flow through `Value::Error` in the cell's value — this type

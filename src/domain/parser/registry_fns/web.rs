@@ -26,7 +26,7 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
                 // and IFERROR can trap it. The original message is dropped
                 // because Value::Error doesn't carry text — acceptable since
                 // the cause is usually a transient network issue.
-                FetchResult::Error(_) => Ok(Value::Error(ErrorKind::Value)),
+                FetchResult::Error => Ok(Value::Error(ErrorKind::Value)),
             }
         }, FunctionPurity::SideEffecting);
 }

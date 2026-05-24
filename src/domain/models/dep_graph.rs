@@ -273,13 +273,6 @@ pub struct TopoLevels {
     pub cyclic: Vec<NodeKey>,
 }
 
-impl TopoLevels {
-    /// Total node count across all levels (excluding cyclic remainder).
-    pub fn linear_count(&self) -> usize {
-        self.levels.iter().map(|l| l.len()).sum()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

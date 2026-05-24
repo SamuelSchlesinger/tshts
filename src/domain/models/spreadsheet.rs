@@ -195,13 +195,11 @@ impl Spreadsheet {
     /// machinery (e.g. cyclic-pass loops that have their own propagation
     /// discipline) but bypasses the normal recompute pipeline.
     ///
-    /// ```
-    /// use tshts::domain::{Spreadsheet, CellData};
-    ///
-    /// let mut sheet = Spreadsheet::default();
-    /// sheet.set_cell(0, 0, CellData { value: "Hello".to_string(), ..Default::default() });
-    /// ```
-    pub fn set_cell(&mut self, row: usize, col: usize, data: CellData) {
+    /// `pub(crate)` because external consumers should use the workbook
+    /// mutators (`Workbook::set_cell_on_active` etc.) which run a full
+    /// recalc; calling Spreadsheet::set_cell directly leaves dependents
+    /// stale and is only safe from inside the calc engine.
+    pub(crate) fn set_cell(&mut self, row: usize, col: usize, data: CellData) {
         self.sweep_spill_ghosts_for(row, col);
         self.set_cell_internal(row, col, data);
         self.maybe_spill(row, col);

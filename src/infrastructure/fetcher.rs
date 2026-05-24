@@ -54,7 +54,11 @@ const MAX_CACHE_ENTRIES: usize = 1024;
 enum CacheEntry {
     Loading,
     Done { fetched_at: Instant, body: String },
-    Error { fetched_at: Instant, body: String },
+    /// We don't carry the error body — `FetchResult::Error` is unit-only
+    /// (no place for text to land in `Value::Error`). The timestamp is
+    /// load-bearing for `ERROR_TTL`: we suppress retries to a known-bad
+    /// URL until that window expires.
+    Error { fetched_at: Instant },
 }
 
 struct Inner {
@@ -110,7 +114,6 @@ fn inner() -> &'static Arc<Inner> {
                     catch_unwind(AssertUnwindSafe(|| perform_fetch(client.as_ref(), &url)))
                         .unwrap_or_else(|_| CacheEntry::Error {
                             fetched_at: Instant::now(),
-                            body: "#ERROR: fetch panicked".to_string(),
                         });
                 {
                     let mut cache = worker
@@ -138,20 +141,12 @@ fn perform_fetch(client: Option<&reqwest::blocking::Client>, url: &str) -> Cache
     // redirect-revalidation, and no user-agent, which silently strips
     // every SSRF defense for the rest of the session.
     let Some(c) = client else {
-        return CacheEntry::Error {
-            fetched_at: Instant::now(),
-            body: "#ERROR: HTTP client failed to initialize".to_string(),
-        };
+        return CacheEntry::Error { fetched_at: Instant::now() };
     };
     let send_result = c.get(url).send();
     let response = match send_result {
         Ok(r) => r,
-        Err(e) => {
-            return CacheEntry::Error {
-                fetched_at: Instant::now(),
-                body: format!("#ERROR: {}", e),
-            }
-        }
+        Err(_) => return CacheEntry::Error { fetched_at: Instant::now() },
     };
     // Reject by Content-Length BEFORE reading the body. A declared-oversize
     // response would otherwise allocate up to MAX_RESPONSE_BYTES + 1 below
@@ -160,29 +155,21 @@ fn perform_fetch(client: Option<&reqwest::blocking::Client>, url: &str) -> Cache
     if let Some(len) = response.content_length()
         && len > MAX_RESPONSE_BYTES
     {
-        return CacheEntry::Error {
-            fetched_at: Instant::now(),
-            body: format!("#ERROR: response too large ({} bytes declared)", len),
-        };
+        return CacheEntry::Error { fetched_at: Instant::now() };
     }
     // Cap servers that don't honestly declare Content-Length: read at most
     // MAX_RESPONSE_BYTES + 1 so we can detect overflow without buffering the
     // full body.
     let mut buf = Vec::new();
-    if let Err(e) = response
+    if response
         .take(MAX_RESPONSE_BYTES + 1)
         .read_to_end(&mut buf)
+        .is_err()
     {
-        return CacheEntry::Error {
-            fetched_at: Instant::now(),
-            body: format!("#ERROR: {}", e),
-        };
+        return CacheEntry::Error { fetched_at: Instant::now() };
     }
     if buf.len() as u64 > MAX_RESPONSE_BYTES {
-        return CacheEntry::Error {
-            fetched_at: Instant::now(),
-            body: format!("#ERROR: response exceeded {} bytes", MAX_RESPONSE_BYTES),
-        };
+        return CacheEntry::Error { fetched_at: Instant::now() };
     }
     let body = String::from_utf8_lossy(&buf).into_owned();
     CacheEntry::Done { fetched_at: Instant::now(), body }
@@ -294,10 +281,16 @@ fn is_blocked_ip(ip: &IpAddr) -> bool {
 }
 
 /// Result returned synchronously to a `GET()` call.
+///
+/// `Error` is unit-only: the GET() formula function maps every error to
+/// `Value::Error(ErrorKind::Value)`, which doesn't carry text, so an
+/// error body would have nowhere to land. The cache still tracks
+/// `CacheEntry::Error` with a timestamp for TTL purposes (so we don't
+/// retry the same failing URL within `ERROR_TTL`).
 pub enum FetchResult {
     Loading,
     Value(String),
-    Error(String),
+    Error,
 }
 
 /// Look up a URL, returning the cached value if fresh, or `Loading` while
@@ -308,9 +301,7 @@ pub fn fetch(url: &str) -> FetchResult {
     // `=GET(...)` formulas. Until the user types `:net on`, every GET()
     // returns a static error and no request is enqueued.
     if !network_enabled() {
-        return FetchResult::Error(
-            "#ERROR: network disabled (use :net on to enable)".to_string(),
-        );
+        return FetchResult::Error;
     }
     let i = inner();
     let now = Instant::now();
@@ -320,21 +311,20 @@ pub fn fetch(url: &str) -> FetchResult {
             FetchResult::Value(body.clone())
         }
         Some(CacheEntry::Loading) => FetchResult::Loading,
-        Some(CacheEntry::Error { fetched_at, body })
+        Some(CacheEntry::Error { fetched_at })
             if now.duration_since(*fetched_at) < ERROR_TTL =>
         {
-            FetchResult::Error(body.clone())
+            FetchResult::Error
         }
         _ => {
             // Stale (TTL'd Done or Error) or missing — validate URL and
             // enqueue if safe.
-            if let Err(reason) = check_url_safety(url) {
-                let body = format!("#ERROR: {}", reason);
+            if check_url_safety(url).is_err() {
                 cache.insert(
                     url.to_string(),
-                    CacheEntry::Error { fetched_at: now, body: body.clone() },
+                    CacheEntry::Error { fetched_at: now },
                 );
-                return FetchResult::Error(body);
+                return FetchResult::Error;
             }
             if cache.len() >= MAX_CACHE_ENTRIES {
                 // Best-effort cleanup: evict any TTL'd Done or Error entries
@@ -351,9 +341,7 @@ pub fn fetch(url: &str) -> FetchResult {
                     CacheEntry::Loading => true,
                 });
                 if cache.len() >= MAX_CACHE_ENTRIES {
-                    return FetchResult::Error(
-                        "#ERROR: fetch cache full (run :cache clear)".to_string(),
-                    );
+                    return FetchResult::Error;
                 }
             }
             cache.insert(url.to_string(), CacheEntry::Loading);
@@ -368,13 +356,12 @@ pub fn fetch(url: &str) -> FetchResult {
                 // instead of polling indefinitely. The error has TTL via
                 // ERROR_TTL, so transient overflow auto-recovers.
                 drop(flight);
-                let body = "#ERROR: too many concurrent fetches".to_string();
                 let mut cache = i.cache.lock().expect("fetcher cache mutex poisoned");
                 cache.insert(
                     url.to_string(),
-                    CacheEntry::Error { fetched_at: now, body: body.clone() },
+                    CacheEntry::Error { fetched_at: now },
                 );
-                return FetchResult::Error(body);
+                return FetchResult::Error;
             }
             if flight.insert(url.to_string()) {
                 let _ = i.sender.send(url.to_string());
@@ -434,19 +421,16 @@ pub(crate) mod test_hooks {
     }
 
     /// Seed a cached error so the next `fetch(url)` returns
-    /// `FetchResult::Error(body)` synchronously. Useful for exercising
-    /// the IFERROR-traps-GET path without depending on a flaky upstream.
-    pub(crate) fn seed_error(url: &str, body: &str) {
+    /// `FetchResult::Error` synchronously. Useful for exercising the
+    /// IFERROR-traps-GET path without depending on a flaky upstream.
+    pub(crate) fn seed_error(url: &str) {
         let i = inner();
         i.cache
             .lock()
             .expect("fetcher cache mutex poisoned")
             .insert(
                 url.to_string(),
-                CacheEntry::Error {
-                    fetched_at: Instant::now(),
-                    body: body.to_string(),
-                },
+                CacheEntry::Error { fetched_at: Instant::now() },
             );
     }
 
