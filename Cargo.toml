@@ -28,7 +28,7 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 # SIGTERM / SIGHUP handler — flips an AtomicBool the main loop polls so we
 # can flush the autosave worker before exit instead of letting logout/
 # shutdown drop queued writes.
-signal-hook = "0.3"
+signal-hook = "0.4"
 # Work-stealing parallel iterator. Used by `ParallelExecutor` to run
 # per-level cell evaluation across multiple cores. We use `par_iter`
 # with `with_min_len(K)` rather than per-cell tasks because the
@@ -41,7 +41,7 @@ tempfile = "3.0"
 # PTY end-to-end test harness. portable-pty spawns the real binary in a
 # pseudo-tty; vt100 parses the escape sequences back into a virtual screen
 # we can assert against. Used by tests/pty_*.rs.
-portable-pty = "0.8"
+portable-pty = "0.9"
 vt100 = "0.15"
 
 [[bench]]
