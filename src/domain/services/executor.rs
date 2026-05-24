@@ -694,6 +694,153 @@ mod tests {
         assert_eq!(wb.sheets[1].get_cell(0, 0).value, "100");
     }
 
+    /// Property test: for many randomly-generated workbooks, both
+    /// executors must produce IDENTICAL cell values. This catches any
+    /// future divergence (e.g. a snapshot-mutation order bug, a
+    /// purity-classification mismatch, a thread-local state leak)
+    /// the moment it lands rather than waiting for it to surface as
+    /// a real-user bug.
+    ///
+    /// Strategy:
+    ///   1. Generate a workbook of N cells. ~30% are literal numbers,
+    ///      ~70% are formulas combining a small set of prior cells
+    ///      with random arithmetic operators. Each formula references
+    ///      only earlier-defined cells so the graph is acyclic by
+    ///      construction (avoids the iterative-calc tangent).
+    ///   2. Build twice — once for Sequential, once for Parallel.
+    ///   3. Compare every cell. ANY difference fails the test with
+    ///      the seed printed so the failure is reproducible.
+    ///
+    /// Deterministic LCG (no rand dep). Seeds 1..=20 sweep a range
+    /// of structures from "small chain" to "wide fanout".
+    #[test]
+    fn property_parallel_matches_sequential_random_workbooks() {
+        for seed in 1u64..=20 {
+            let (seq_wb, par_wb) = run_pair_with_seed(seed);
+            // Compare every cell on every sheet.
+            let n_sheets = seq_wb.sheets.len();
+            assert_eq!(n_sheets, par_wb.sheets.len(),
+                "seed {}: sheet count mismatch", seed);
+            for sheet_idx in 0..n_sheets {
+                let seq_cells = &seq_wb.sheets[sheet_idx].cells;
+                let par_cells = &par_wb.sheets[sheet_idx].cells;
+                assert_eq!(seq_cells.len(), par_cells.len(),
+                    "seed {}: sheet {} cell count mismatch (seq={}, par={})",
+                    seed, sheet_idx, seq_cells.len(), par_cells.len());
+                for (&(r, c), seq_cd) in seq_cells {
+                    let par_cd = par_cells.get(&(r, c))
+                        .unwrap_or_else(|| panic!(
+                            "seed {}: par missing cell sheet={} ({}, {})",
+                            seed, sheet_idx, r, c));
+                    assert_eq!(seq_cd.value, par_cd.value,
+                        "seed {}: divergence at sheet {} ({}, {}): \
+                         seq={:?} par={:?} (formula={:?})",
+                        seed, sheet_idx, r, c, seq_cd.value, par_cd.value,
+                        seq_cd.formula);
+                }
+            }
+        }
+    }
+
+    /// Generate one parity workbook with the given seed, run it through
+    /// both executors, return both for comparison.
+    fn run_pair_with_seed(seed: u64) -> (Workbook, Workbook) {
+        let formulas = generate_random_dag(seed);
+
+        let mut seq_wb = build_workbook_from(&formulas);
+        seq_wb.recalc_via_graph_result().expect("seq seed runs cleanly");
+
+        let mut par_wb = build_workbook_from(&formulas);
+        // Force parallel dispatch even on small workloads — the property
+        // tests would otherwise both fall back to Sequential.
+        let exec = ParallelExecutor { min_chunk: 1, parallel_threshold: 1 };
+        par_wb.build_dep_graph_from_scratch();
+        let seeds: std::collections::HashSet<NodeKey> = par_wb
+            .drain_dirty()
+            .into_iter()
+            .filter_map(|k| par_wb.cross_sheet_key_to_node(&k))
+            .collect();
+        let topo = par_wb.graph.topo_levels_from_seeds(&seeds);
+        let plan = RecalcPlan { levels: topo.levels, cyclic: topo.cyclic };
+        let mut ctx = RecalcContext::new();
+        exec.run(&plan, &mut ctx, &mut par_wb).expect("par seed runs cleanly");
+
+        (seq_wb, par_wb)
+    }
+
+    fn build_workbook_from(formulas: &[(usize, usize, String)]) -> Workbook {
+        let mut wb = Workbook::default();
+        let last = formulas.iter().enumerate();
+        for (idx, (r, c, content)) in last {
+            // First the cell goes in via the public mutator so the graph
+            // and dirty set are maintained. Skip the auto-recalc-per-cell
+            // overhead by using set_cell_on_active — it batches into the
+            // graph + recalcs each time, but the workload is small.
+            let cd = if let Some(rest) = content.strip_prefix('=') {
+                // It's a formula — keep the leading `=`.
+                let _ = rest;
+                CellData {
+                    value: "0".to_string(),
+                    formula: Some(content.clone()),
+                    format: None, comment: None, spill_anchor: None,
+                }
+            } else {
+                CellData {
+                    value: content.clone(),
+                    formula: None,
+                    format: None, comment: None, spill_anchor: None,
+                }
+            };
+            wb.set_cell_on_active(*r, *c, cd);
+            let _ = idx;
+        }
+        wb
+    }
+
+    /// Hand-rolled LCG: deterministic, no external dep. Returns a
+    /// sequence of (row, col, content) tuples laying down a topologically-
+    /// ordered DAG of cells in column A. The first N cells are literals;
+    /// later cells are formulas referencing strictly-earlier ones.
+    fn generate_random_dag(seed: u64) -> Vec<(usize, usize, String)> {
+        let mut state = seed.wrapping_mul(2862933555777941757).wrapping_add(3037000493);
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        let n_cells = 30 + (next() % 30) as usize;       // 30..60 cells
+        let n_literals = (n_cells as u32 / 3).max(3);     // ~1/3 literals
+        let mut cells: Vec<(usize, usize, String)> = Vec::new();
+        // Literals come first so later formulas always have something
+        // to reference.
+        for i in 0..n_literals {
+            // Random integer in [-50, 50]. Avoid floats here so string
+            // comparison is stable across the two executors.
+            let v = ((next() % 100) as i64) - 50;
+            cells.push((i as usize, 0, v.to_string()));
+        }
+        for i in n_literals..(n_cells as u32) {
+            let row = i as usize;
+            // Pick 1..=3 earlier cells to combine.
+            let n_refs = 1 + (next() % 3) as usize;
+            let mut formula = String::from("=");
+            for j in 0..n_refs {
+                if j > 0 {
+                    let op = match next() % 4 {
+                        0 => '+',
+                        1 => '-',
+                        2 => '*',
+                        _ => '+', // skip '/' to avoid #DIV/0! noise
+                    };
+                    formula.push(op);
+                }
+                let pick = (next() as usize) % (i as usize);
+                formula.push_str(&format!("A{}", pick + 1));
+            }
+            cells.push((row, 0, formula));
+        }
+        cells
+    }
+
     /// Single-snapshot recalc must propagate per-level writes into the
     /// snapshot the next level reads from. Without that, a depth-3
     /// chain (A1=lit, A2=A1+1, A3=A2+1) would have A3 reading A2's

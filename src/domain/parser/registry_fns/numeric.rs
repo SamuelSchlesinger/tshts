@@ -370,6 +370,73 @@ pub(in crate::domain::parser) fn register(reg: &mut FunctionRegistry) {
             }
             Ok(Value::Number(num / (den_x * den_y)))
         });
+        // SLOPE(y_array, x_array): slope of the linear regression line
+        // through the (x, y) pairs. Excel signature is (y, x), NOT (x, y).
+        reg.register_function("SLOPE", |args| {
+            if args.len() != 2 {
+                return Ok(Value::Error(ErrorKind::Value));
+            }
+            let y = collect_numbers(&args[..1]);
+            let x = collect_numbers(&args[1..2]);
+            if x.len() != y.len() || x.len() < 2 {
+                return Ok(Value::Error(ErrorKind::NA));
+            }
+            let n = x.len() as f64;
+            let sx: f64 = x.iter().sum();
+            let sy: f64 = y.iter().sum();
+            let sxx: f64 = x.iter().map(|a| a * a).sum();
+            let sxy: f64 = x.iter().zip(y.iter()).map(|(a, b)| a * b).sum();
+            let denom = n * sxx - sx * sx;
+            if denom == 0.0 {
+                return Ok(Value::Error(ErrorKind::Div0));
+            }
+            Ok(Value::Number((n * sxy - sx * sy) / denom))
+        });
+        // INTERCEPT(y_array, x_array): y-intercept of the same regression line.
+        reg.register_function("INTERCEPT", |args| {
+            if args.len() != 2 {
+                return Ok(Value::Error(ErrorKind::Value));
+            }
+            let y = collect_numbers(&args[..1]);
+            let x = collect_numbers(&args[1..2]);
+            if x.len() != y.len() || x.len() < 2 {
+                return Ok(Value::Error(ErrorKind::NA));
+            }
+            let n = x.len() as f64;
+            let sx: f64 = x.iter().sum();
+            let sy: f64 = y.iter().sum();
+            let sxx: f64 = x.iter().map(|a| a * a).sum();
+            let sxy: f64 = x.iter().zip(y.iter()).map(|(a, b)| a * b).sum();
+            let denom = n * sxx - sx * sx;
+            if denom == 0.0 {
+                return Ok(Value::Error(ErrorKind::Div0));
+            }
+            let slope = (n * sxy - sx * sy) / denom;
+            Ok(Value::Number((sy - slope * sx) / n))
+        });
+        // RSQ(y_array, x_array): R² — the square of the Pearson correlation.
+        reg.register_function("RSQ", |args| {
+            if args.len() != 2 {
+                return Ok(Value::Error(ErrorKind::Value));
+            }
+            let y = collect_numbers(&args[..1]);
+            let x = collect_numbers(&args[1..2]);
+            if x.len() != y.len() || x.len() < 2 {
+                return Ok(Value::Error(ErrorKind::NA));
+            }
+            let mx: f64 = x.iter().sum::<f64>() / x.len() as f64;
+            let my: f64 = y.iter().sum::<f64>() / y.len() as f64;
+            let num: f64 = x.iter().zip(y.iter())
+                .map(|(a, b)| (a - mx) * (b - my))
+                .sum();
+            let den_x: f64 = x.iter().map(|a| (a - mx).powi(2)).sum::<f64>().sqrt();
+            let den_y: f64 = y.iter().map(|b| (b - my).powi(2)).sum::<f64>().sqrt();
+            if den_x == 0.0 || den_y == 0.0 {
+                return Ok(Value::Error(ErrorKind::Div0));
+            }
+            let r = num / (den_x * den_y);
+            Ok(Value::Number(r * r))
+        });
         reg.register_function("TRUNC", |args| {
             if args.is_empty() || args.len() > 2 {
                 return Ok(Value::Error(ErrorKind::Value));

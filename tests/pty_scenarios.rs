@@ -69,3 +69,33 @@ fn scenario_sensitivity_table() {
 fn scenario_sales_pipeline() {
     run(&common::scenarios::pipeline::Pipeline);
 }
+
+#[test]
+fn scenario_inventory_fifo() {
+    run(&common::scenarios::inventory::Inventory);
+}
+
+#[test]
+fn scenario_lookup_orders() {
+    run(&common::scenarios::lookup::Lookup);
+}
+
+#[test]
+fn scenario_quarterly_forecast() {
+    run(&common::scenarios::quarterly_forecast::QuarterlyForecast);
+}
+
+#[test]
+fn scenario_currency_translation() {
+    run(&common::scenarios::currency::Currency);
+}
+
+#[test]
+fn scenario_sales_leaderboard() {
+    run(&common::scenarios::leaderboard::Leaderboard);
+}
+
+#[test]
+fn scenario_regression() {
+    run(&common::scenarios::regression::Regression);
+}
