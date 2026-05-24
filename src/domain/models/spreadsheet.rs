@@ -2,7 +2,7 @@
 
 #![allow(unused_imports)]
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashMap;
 use super::*;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -18,12 +18,6 @@ pub struct Spreadsheet {
     pub column_widths: HashMap<usize, usize>,
     /// Default width for columns without custom widths
     pub default_column_width: usize,
-    /// Dependency graph: cell -> set of cells that depend on it
-    #[serde(skip)]
-    pub dependents: HashMap<(usize, usize), HashSet<(usize, usize)>>,
-    /// Dependencies: cell -> set of cells it depends on
-    #[serde(skip)]
-    pub dependencies: HashMap<(usize, usize), HashSet<(usize, usize)>>,
     /// Named ranges resolvable inside formulas. Map keys are uppercase by
     /// convention. Synced from `Workbook::named_ranges` so per-sheet recalc
     /// can resolve names without needing workbook access.
@@ -38,8 +32,10 @@ pub struct Spreadsheet {
     /// resolve via this list.
     #[serde(default)]
     pub tables: Vec<Table>,
-    /// When true, `recalculate_dependents` iterates rather than failing on
-    /// cycles. Synced from `App::iterative_calc` whenever it's toggled.
+    /// When true, the workbook-level graph executor's `iterative_calc_cyclic`
+    /// loop runs over cyclic-remainder cells from this sheet rather than
+    /// surfacing `#REF!`. Synced from `App::iterative_calc` whenever it's
+    /// toggled.
     #[serde(skip)]
     pub iterative_calc: bool,
     /// Max passes for iterative recalc. Default 100.
@@ -75,8 +71,6 @@ impl Clone for Spreadsheet {
             cols: self.cols,
             column_widths: self.column_widths.clone(),
             default_column_width: self.default_column_width,
-            dependents: self.dependents.clone(),
-            dependencies: self.dependencies.clone(),
             named_ranges: self.named_ranges.clone(),
             conditional_formats: self.conditional_formats.clone(),
             tables: self.tables.clone(),
@@ -154,8 +148,6 @@ impl Default for Spreadsheet {
             cols: 26,
             column_widths: HashMap::new(),
             default_column_width: 8,
-            dependents: HashMap::new(),
-            dependencies: HashMap::new(),
             named_ranges: HashMap::new(),
             conditional_formats: Vec::new(),
             tables: Vec::new(),
@@ -190,7 +182,18 @@ impl Spreadsheet {
         self.cf_cache.lock().unwrap().clear();
     }
 
-    /// Writes a cell, updates the dependency graph, and recalculates dependents.
+    /// Writes a cell. Sweeps any spill ghosts owned by the previous version
+    /// of this cell, writes `data` as-is (caller is responsible for the
+    /// `value` field — typically pre-evaluated for formulas), and re-spills
+    /// if the new formula produces an array.
+    ///
+    /// **Does not propagate to dependents.** That's the workbook executor's
+    /// job — call `Workbook::set_cell_on_active` (or any other workbook-level
+    /// mutation API) which marks the cell dirty and routes recalc through
+    /// `Workbook::recalc_via_graph_result()`. Calling `Spreadsheet::set_cell`
+    /// directly is appropriate for low-level test fixtures and intra-workbook
+    /// machinery (e.g. cyclic-pass loops that have their own propagation
+    /// discipline) but bypasses the normal recompute pipeline.
     ///
     /// ```
     /// use tshts::domain::{Spreadsheet, CellData};
@@ -199,24 +202,9 @@ impl Spreadsheet {
     /// sheet.set_cell(0, 0, CellData { value: "Hello".to_string(), ..Default::default() });
     /// ```
     pub fn set_cell(&mut self, row: usize, col: usize, data: CellData) {
-        // Remove old dependencies for this cell
-        self.remove_cell_dependencies(row, col);
-        // Sweep any spill ghosts owned by the previous version of this cell.
         self.sweep_spill_ghosts_for(row, col);
-
-        // Set the cell data
-        self.set_cell_internal(row, col, data.clone());
-
-        // Add new dependencies if this cell has a formula
-        if let Some(ref formula) = data.formula {
-            self.add_cell_dependencies(row, col, formula);
-        }
-
-        // If the formula's result is an Array, expand it into ghost cells.
+        self.set_cell_internal(row, col, data);
         self.maybe_spill(row, col);
-
-        // Recalculate all cells that depend on this cell
-        self.recalculate_dependents(row, col);
     }
 
     /// Drop every spill ghost on the sheet, then re-evaluate `maybe_spill`
@@ -363,333 +351,61 @@ impl Spreadsheet {
         }
     }
 
-    /// Removes all dependencies for a cell.
-    fn remove_cell_dependencies(&mut self, row: usize, col: usize) {
-        let cell_pos = (row, col);
-        
-        // Remove this cell from the dependents of cells it depends on
-        if let Some(deps) = self.dependencies.get(&cell_pos).cloned() {
-            for dep in deps {
-                if let Some(dependents) = self.dependents.get_mut(&dep) {
-                    dependents.remove(&cell_pos);
-                    if dependents.is_empty() {
-                        self.dependents.remove(&dep);
-                    }
-                }
-            }
-        }
-        
-        // Clear this cell's dependencies
-        self.dependencies.remove(&cell_pos);
-    }
-
-    /// Adds dependencies for a cell based on its formula.
-    /// Uses the parse cache to avoid re-tokenizing identical formulas
-    /// (common during autofill/paste).
-    fn add_cell_dependencies(&mut self, row: usize, col: usize, formula: &str) {
-        use crate::domain::services::FormulaEvaluator;
-        let evaluator = if self.named_ranges.is_empty() {
-            FormulaEvaluator::new(self)
-        } else {
-            FormulaEvaluator::new(self).with_names(&self.named_ranges)
-        };
-        let dependencies = evaluator.extract_cell_references(formula);
-        let cell_pos = (row, col);
-
-        if !dependencies.is_empty() {
-            self.dependencies.insert(cell_pos, dependencies.iter().cloned().collect());
-            for dep in dependencies {
-                self.dependents.entry(dep).or_default().insert(cell_pos);
-            }
-        }
-    }
-
-    /// Clears the cell and recalculates dependents.
+    /// Clears the cell. Sweeps any owned spill ghosts. Does not propagate
+    /// to dependents — that's the workbook executor's job (use
+    /// `Workbook::clear_cell_on_active`).
     pub fn clear_cell(&mut self, row: usize, col: usize) {
-        // Remove dependencies for this cell
-        self.remove_cell_dependencies(row, col);
-        // If this cell was a spill anchor, sweep its ghosts away too.
         self.sweep_spill_ghosts_for(row, col);
-        // Remove the cell from the cells map
         self.cells.remove(&(row, col));
-        // Recalculate cells that depend on this cell
-        self.recalculate_dependents(row, col);
     }
 
-    /// Bulk-clear many cells with a single topological recalc at the
-    /// end. Symmetric counterpart of `set_many`. Calling
-    /// `clear_cell` in a loop is O(N²) for a chain because each
-    /// individual call cascades through downstream dependents; this
-    /// path does one cascade over the union of dependents.
+    /// Bulk-clear many cells. Pure write operation; the workbook executor
+    /// handles dep propagation. Symmetric counterpart of `set_many`.
     pub fn clear_many(&mut self, positions: Vec<(usize, usize)>) {
-        if positions.is_empty() {
-            return;
-        }
-        for &(row, col) in &positions {
-            self.remove_cell_dependencies(row, col);
+        for (row, col) in positions {
             self.sweep_spill_ghosts_for(row, col);
             self.cells.remove(&(row, col));
         }
-        // Union of transitive dependents — recalc once.
-        let mut to_recalc = HashSet::new();
-        let mut queue = VecDeque::new();
-        for &(row, col) in &positions {
-            if let Some(deps) = self.dependents.get(&(row, col)).cloned() {
-                for dep in deps {
-                    queue.push_back(dep);
-                }
-            }
-        }
-        while let Some(dep) = queue.pop_front() {
-            if to_recalc.insert(dep)
-                && let Some(next) = self.dependents.get(&dep).cloned()
-            {
-                for n in next {
-                    queue.push_back(n);
-                }
-            }
-        }
-        if to_recalc.is_empty() {
-            return;
-        }
-        // Topological recalc: same Kahn's algorithm as set_many's loop.
-        let mut in_degree: HashMap<(usize, usize), usize> =
-            to_recalc.iter().map(|&c| (c, 0)).collect();
-        for &cell in &to_recalc {
-            if let Some(deps) = self.dependencies.get(&cell) {
-                for dep in deps {
-                    if to_recalc.contains(dep) {
-                        *in_degree.entry(cell).or_insert(0) += 1;
-                    }
-                }
-            }
-        }
-        let mut ready: VecDeque<_> = in_degree
-            .iter()
-            .filter_map(|(c, &d)| if d == 0 { Some(*c) } else { None })
-            .collect();
-        while let Some((r, c)) = ready.pop_front() {
-            self.recalculate_cell(r, c);
-            if let Some(downs) = self.dependents.get(&(r, c)).cloned() {
-                for dep in downs {
-                    if let Some(d) = in_degree.get_mut(&dep) {
-                        *d = d.saturating_sub(1);
-                        if *d == 0 {
-                            ready.push_back(dep);
-                        }
-                    }
-                }
-            }
-        }
     }
 
-    /// Bulk-set many cells with a single topological recalc at the end.
-    /// Used by sort/autofill/paste to avoid N full recalc cascades.
+    /// Bulk-set many cells. Pure write operation; the workbook executor
+    /// handles dep propagation. Used by sort/autofill/paste — write the
+    /// batch, mark dirty at the workbook level, then run a single
+    /// `recalc_via_graph_result()` over the union of dependents.
     pub fn set_many(&mut self, updates: Vec<(usize, usize, CellData)>) {
-        // Remove old deps and write the new values, but defer recalc.
-        for (row, col, data) in &updates {
-            self.remove_cell_dependencies(*row, *col);
-            self.set_cell_internal(*row, *col, data.clone());
-            if let Some(formula) = data.formula.as_ref() {
-                self.add_cell_dependencies(*row, *col, formula);
-            }
-        }
-        // Collect all transitive dependents of every written cell, then run
-        // one topological pass over that combined set.
-        let mut to_recalc = HashSet::new();
-        let mut queue = VecDeque::new();
-        for (row, col, _) in &updates {
-            if let Some(deps) = self.dependents.get(&(*row, *col)).cloned() {
-                for dep in deps {
-                    queue.push_back(dep);
-                }
-            }
-            // Also recompute the cell itself (its formula may need re-eval if
-            // its inputs were among the updates).
-            if self
-                .cells
-                .get(&(*row, *col))
-                .and_then(|c| c.formula.as_ref())
-                .is_some()
-            {
-                to_recalc.insert((*row, *col));
-            }
-        }
-        while let Some(dep) = queue.pop_front() {
-            if to_recalc.insert(dep)
-                && let Some(next) = self.dependents.get(&dep).cloned() {
-                    for n in next {
-                        queue.push_back(n);
-                    }
-                }
-        }
-        if to_recalc.is_empty() {
-            return;
-        }
-        let mut in_degree: HashMap<(usize, usize), usize> =
-            to_recalc.iter().map(|&c| (c, 0)).collect();
-        for &cell in &to_recalc {
-            if let Some(deps) = self.dependencies.get(&cell) {
-                for dep in deps {
-                    if to_recalc.contains(dep) {
-                        *in_degree.entry(cell).or_insert(0) += 1;
-                    }
-                }
-            }
-        }
-        let mut ready: VecDeque<_> = in_degree
-            .iter()
-            .filter(|&(_, d)| *d == 0)
-            .map(|(&c, _)| c)
-            .collect();
-        while let Some(cell) = ready.pop_front() {
-            self.recalculate_cell(cell.0, cell.1);
-            if let Some(deps) = self.dependents.get(&cell).cloned() {
-                for dep in deps {
-                    if let Some(d) = in_degree.get_mut(&dep) {
-                        *d -= 1;
-                        if *d == 0 {
-                            ready.push_back(dep);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Recalculates all cells that depend on the given cell using topological ordering.
-    pub(crate) fn recalculate_dependents(&mut self, row: usize, col: usize) {
-        let cell_pos = (row, col);
-
-        // 1. Collect all transitive dependents
-        let mut to_recalc = HashSet::new();
-        let mut queue = VecDeque::new();
-        if let Some(deps) = self.dependents.get(&cell_pos).cloned() {
-            for dep in deps {
-                queue.push_back(dep);
-            }
-        }
-        while let Some(dep) = queue.pop_front() {
-            if to_recalc.insert(dep)
-                && let Some(next) = self.dependents.get(&dep).cloned() {
-                    for n in next {
-                        queue.push_back(n);
-                    }
-                }
-        }
-
-        if to_recalc.is_empty() {
-            return;
-        }
-
-        // Iterative-calc mode: just sweep all cells in `to_recalc` up to
-        // `iter_max` times, stopping early when no cell's numeric value
-        // changes by more than `iter_epsilon` in a full pass. This is the
-        // standard Excel approach to intentional circular references.
-        if self.iterative_calc {
-            let max = self.iter_max;
-            let eps = self.iter_epsilon;
-            for _ in 0..max {
-                let mut changed = false;
-                for &(r, c) in &to_recalc {
-                    let prev: f64 = self
-                        .cells
-                        .get(&(r, c))
-                        .and_then(|cd| cd.numeric())
-                        .unwrap_or(0.0);
-                    self.recalculate_cell(r, c);
-                    let next: f64 = self
-                        .cells
-                        .get(&(r, c))
-                        .and_then(|cd| cd.numeric())
-                        .unwrap_or(0.0);
-                    if (next - prev).abs() > eps {
-                        changed = true;
-                    }
-                }
-                if !changed {
-                    break;
-                }
-            }
-            return;
-        }
-
-        // 2. Compute in-degrees within recalc set
-        let mut in_degree: HashMap<(usize, usize), usize> = to_recalc.iter().map(|&c| (c, 0)).collect();
-        for &cell in &to_recalc {
-            if let Some(deps) = self.dependencies.get(&cell) {
-                for dep in deps {
-                    if to_recalc.contains(dep) {
-                        *in_degree.entry(cell).or_insert(0) += 1;
-                    }
-                }
-            }
-        }
-
-        // 3. Process in topological order (Kahn's algorithm)
-        let mut ready: VecDeque<_> = in_degree.iter()
-            .filter(|&(_, d)| *d == 0)
-            .map(|(&c, _)| c)
-            .collect();
-        while let Some(cell) = ready.pop_front() {
-            self.recalculate_cell(cell.0, cell.1);
-            in_degree.remove(&cell);
-            if let Some(deps) = self.dependents.get(&cell).cloned() {
-                for dep in deps {
-                    if let Some(d) = in_degree.get_mut(&dep) {
-                        *d -= 1;
-                        if *d == 0 {
-                            ready.push_back(dep);
-                        }
-                    }
-                }
-            }
-        }
-
-        // 4. Anything left has in_degree > 0 — i.e. participates in a cycle
-        // that iterative_calc wasn't enabled to resolve. Surface as `#REF!`
-        // (Excel uses `#CIRC!`; we reuse Ref to avoid expanding ErrorKind)
-        // instead of silently leaving stale values in place.
-        for (row, col) in in_degree.into_keys() {
-            if let Some(cell) = self.cells.get(&(row, col)).cloned() {
-                let mut updated = cell;
-                updated.value = "#REF!".to_string();
-                self.cells.insert((row, col), updated);
-            }
+        for (row, col, data) in updates {
+            self.sweep_spill_ghosts_for(row, col);
+            self.set_cell_internal(row, col, data);
+            self.maybe_spill(row, col);
         }
     }
 
     /// Force a single cell to re-evaluate its formula and refresh `value`.
-    /// Public wrapper around `recalculate_cell` for use after non-`set_cell`
-    /// mutations (e.g. cross-sheet ref rewrites in `Workbook::remove_sheet`)
+    /// Used by the workbook executor (per-cell eval inside a recalc pass)
+    /// and by cross-sheet ref-rewrite paths (`Workbook::remove_sheet` etc.)
     /// where the formula text changed without going through `set_cell`.
+    /// Honors the thread-local workbook context set by
+    /// `Workbook::with_recalc_context` so cross-sheet refs resolve.
     pub fn refresh_cell_value(&mut self, row: usize, col: usize) {
-        self.recalculate_cell(row, col);
-    }
-
-    /// Recalculates a single cell's value based on its formula. Honors the
-    /// thread-local workbook context set by `Workbook::with_recalc_context`
-    /// so cross-sheet refs (`=Sheet2!A1`) in dependent recalcs don't go
-    /// `#REF!` just because the cascade started from `Spreadsheet::set_cell`.
-    fn recalculate_cell(&mut self, row: usize, col: usize) {
         let cell_pos = (row, col);
         if let Some(cell) = self.cells.get(&cell_pos).cloned()
-            && let Some(ref formula) = cell.formula {
-                use crate::domain::services::FormulaEvaluator;
-                let new_value = super::workbook::with_workbook_context(|wb_opt| {
-                    let mut ev = FormulaEvaluator::new(self);
-                    if !self.named_ranges.is_empty() {
-                        ev = ev.with_names(&self.named_ranges);
-                    }
-                    if let Some(wb) = wb_opt {
-                        ev = ev.with_workbook(wb);
-                    }
-                    ev.evaluate_formula(formula)
-                });
-                let mut updated_cell = cell;
-                updated_cell.value = new_value;
-                self.set_cell_internal(row, col, updated_cell);
-            }
+            && let Some(ref formula) = cell.formula
+        {
+            use crate::domain::services::FormulaEvaluator;
+            let new_value = super::workbook::with_workbook_context(|wb_opt| {
+                let mut ev = FormulaEvaluator::new(self);
+                if !self.named_ranges.is_empty() {
+                    ev = ev.with_names(&self.named_ranges);
+                }
+                if let Some(wb) = wb_opt {
+                    ev = ev.with_workbook(wb);
+                }
+                ev.evaluate_formula(formula)
+            });
+            let mut updated_cell = cell;
+            updated_cell.value = new_value;
+            self.set_cell_internal(row, col, updated_cell);
+        }
     }
 
     /// Converts a zero-based column index to an Excel-style label (A, Z, AA, ...).
@@ -978,8 +694,10 @@ impl Spreadsheet {
             self.cells.insert((row, col), cell);
         }
 
-        self.rebuild_dependencies();
         self.resweep_all_spills();
+        // Per-sheet dep graph is gone — the workbook executor rebuilds
+        // the unified graph via `rebuild_cross_sheet_deps` after every
+        // structural edit (see Workbook::insert_row_on_active etc).
     }
 
     /// Deletes the row at the given index, shifting all rows below up by 1.
@@ -1031,8 +749,10 @@ impl Spreadsheet {
             self.cells.insert((row, col), cell);
         }
 
-        self.rebuild_dependencies();
         self.resweep_all_spills();
+        // Per-sheet dep graph is gone — the workbook executor rebuilds
+        // the unified graph via `rebuild_cross_sheet_deps` after every
+        // structural edit (see Workbook::insert_row_on_active etc).
     }
 
     /// Inserts a column at the given index, shifting all columns at or to the right by 1.
@@ -1093,8 +813,10 @@ impl Spreadsheet {
             self.cells.insert((row, col), cell);
         }
 
-        self.rebuild_dependencies();
         self.resweep_all_spills();
+        // Per-sheet dep graph is gone — the workbook executor rebuilds
+        // the unified graph via `rebuild_cross_sheet_deps` after every
+        // structural edit (see Workbook::insert_row_on_active etc).
     }
 
     /// Deletes the column at the given index, shifting all columns to the right left by 1.
@@ -1159,8 +881,10 @@ impl Spreadsheet {
             self.cells.insert((row, col), cell);
         }
 
-        self.rebuild_dependencies();
         self.resweep_all_spills();
+        // Per-sheet dep graph is gone — the workbook executor rebuilds
+        // the unified graph via `rebuild_cross_sheet_deps` after every
+        // structural edit (see Workbook::insert_row_on_active etc).
     }
 
     /// Compute the conditional-format style for the given cell, if any rule
@@ -1208,25 +932,6 @@ impl Spreadsheet {
         result
     }
 
-    /// Rebuilds the dependency graph from formulas. Dependencies aren't
-    /// serialized, so this must run after deserializing a spreadsheet.
-    pub fn rebuild_dependencies(&mut self) {
-        // Clear existing dependencies
-        self.dependencies.clear();
-        self.dependents.clear();
-        
-        // Rebuild dependencies for all cells with formulas
-        let cells_with_formulas: Vec<_> = self.cells
-            .iter()
-            .filter_map(|((row, col), cell)| {
-                cell.formula.as_ref().map(|formula| (*row, *col, formula.clone()))
-            })
-            .collect();
-        
-        for (row, col, formula) in cells_with_formulas {
-            self.add_cell_dependencies(row, col, &formula);
-        }
-    }
 }
 
 fn serialize_cells<S>(cells: &HashMap<(usize, usize), CellData>, serializer: S) -> Result<S::Ok, S::Error>
@@ -1486,200 +1191,17 @@ mod tests {
     }
 
     #[test]
-    fn test_automatic_recalculation() {
-        let mut sheet = Spreadsheet::default();
-        
-        // Set up a simple dependency chain: C1 = A1 + B1
-        sheet.set_cell(0, 0, CellData { value: "10".to_string(), formula: None, format: None, comment: None, spill_anchor: None }); // A1 = 10
-        sheet.set_cell(0, 1, CellData { value: "20".to_string(), formula: None, format: None, comment: None, spill_anchor: None }); // B1 = 20
-        sheet.set_cell(0, 2, CellData { 
-            value: "30".to_string(), 
-            formula: Some("=A1+B1".to_string()),
-            format: None,
-            comment: None,
-        spill_anchor: None,
-        }); // C1 = A1+B1 = 30
-        
-        // Verify initial state
-        assert_eq!(sheet.get_cell(0, 2).value, "30");
-        
-        // Change A1 and verify C1 updates automatically
-        sheet.set_cell(0, 0, CellData { value: "15".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
-        assert_eq!(sheet.get_cell(0, 2).value, "35"); // Should be 15+20=35
-        
-        // Change B1 and verify C1 updates automatically
-        sheet.set_cell(0, 1, CellData { value: "25".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
-        assert_eq!(sheet.get_cell(0, 2).value, "40"); // Should be 15+25=40
-    }
-
-    #[test]
-    fn test_dependency_chain_recalculation() {
-        let mut sheet = Spreadsheet::default();
-        
-        // Set up a dependency chain: A1 -> B1 -> C1
-        sheet.set_cell(0, 0, CellData { value: "5".to_string(), formula: None, format: None, comment: None, spill_anchor: None }); // A1 = 5
-        sheet.set_cell(0, 1, CellData { 
-            value: "10".to_string(), 
-            formula: Some("=A1*2".to_string()),
-            format: None,
-            comment: None,
-        spill_anchor: None,
-        }); // B1 = A1*2 = 10
-        sheet.set_cell(0, 2, CellData { 
-            value: "20".to_string(), 
-            formula: Some("=B1*2".to_string()),
-            format: None,
-            comment: None,
-        spill_anchor: None,
-        }); // C1 = B1*2 = 20
-        
-        // Verify initial state
-        assert_eq!(sheet.get_cell(0, 0).value, "5");
-        assert_eq!(sheet.get_cell(0, 1).value, "10");
-        assert_eq!(sheet.get_cell(0, 2).value, "20");
-        
-        // Change A1 and verify the entire chain updates
-        sheet.set_cell(0, 0, CellData { value: "10".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
-        assert_eq!(sheet.get_cell(0, 0).value, "10");
-        assert_eq!(sheet.get_cell(0, 1).value, "20"); // 10*2=20
-        assert_eq!(sheet.get_cell(0, 2).value, "40"); // 20*2=40
-    }
-
-    #[test]
-    fn test_multiple_dependents() {
-        let mut sheet = Spreadsheet::default();
-        
-        // Set up multiple cells depending on A1
-        sheet.set_cell(0, 0, CellData { value: "10".to_string(), formula: None, format: None, comment: None, spill_anchor: None }); // A1 = 10
-        sheet.set_cell(0, 1, CellData { 
-            value: "11".to_string(), 
-            formula: Some("=A1+1".to_string()),
-            format: None,
-            comment: None,
-        spill_anchor: None,
-        }); // B1 = A1+1 = 11
-        sheet.set_cell(0, 2, CellData { 
-            value: "20".to_string(), 
-            formula: Some("=A1*2".to_string()),
-            format: None,
-            comment: None,
-        spill_anchor: None,
-        }); // C1 = A1*2 = 20
-        sheet.set_cell(0, 3, CellData { 
-            value: "100".to_string(), 
-            formula: Some("=A1*A1".to_string()),
-            format: None,
-            comment: None,
-        spill_anchor: None,
-        }); // D1 = A1*A1 = 100
-        
-        // Verify initial state
-        assert_eq!(sheet.get_cell(0, 1).value, "11");
-        assert_eq!(sheet.get_cell(0, 2).value, "20");
-        assert_eq!(sheet.get_cell(0, 3).value, "100");
-        
-        // Change A1 and verify all dependents update
-        sheet.set_cell(0, 0, CellData { value: "5".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
-        assert_eq!(sheet.get_cell(0, 1).value, "6");   // 5+1=6
-        assert_eq!(sheet.get_cell(0, 2).value, "10");  // 5*2=10
-        assert_eq!(sheet.get_cell(0, 3).value, "25");  // 5*5=25
-    }
-
-    #[test]
-    fn test_dependency_removal() {
-        let mut sheet = Spreadsheet::default();
-        
-        // Set up a dependency
-        sheet.set_cell(0, 0, CellData { value: "10".to_string(), formula: None, format: None, comment: None, spill_anchor: None }); // A1 = 10
-        sheet.set_cell(0, 1, CellData { 
-            value: "20".to_string(), 
-            formula: Some("=A1*2".to_string()),
-            format: None,
-            comment: None,
-        spill_anchor: None,
-        }); // B1 = A1*2 = 20
-        
-        // Verify dependency exists
-        assert_eq!(sheet.get_cell(0, 1).value, "20");
-        
-        // Change A1 and verify B1 updates
-        sheet.set_cell(0, 0, CellData { value: "15".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
-        assert_eq!(sheet.get_cell(0, 1).value, "30");
-        
-        // Replace B1 with a constant value (remove dependency)
-        sheet.set_cell(0, 1, CellData { value: "42".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
-        assert_eq!(sheet.get_cell(0, 1).value, "42");
-        
-        // Change A1 again - B1 should NOT update since dependency is removed
-        sheet.set_cell(0, 0, CellData { value: "100".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
-        assert_eq!(sheet.get_cell(0, 1).value, "42"); // Should remain 42, not recalculate
-    }
-
-    #[test]
-    fn test_rebuild_dependencies() {
-        let mut sheet = Spreadsheet::default();
-        
-        // Manually insert cells with formulas (simulating loading from file)
-        sheet.cells.insert((0, 0), CellData { value: "10".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
-        sheet.cells.insert((0, 1), CellData { 
-            value: "20".to_string(), 
-            formula: Some("=A1*2".to_string()),
-            format: None,
-            comment: None,
-        spill_anchor: None,
-        });
-        sheet.cells.insert((0, 2), CellData { 
-            value: "40".to_string(), 
-            formula: Some("=B1*2".to_string()),
-            format: None,
-            comment: None,
-        spill_anchor: None,
-        });
-        
-        // At this point, dependencies are not tracked
-        assert!(sheet.dependencies.is_empty());
-        assert!(sheet.dependents.is_empty());
-        
-        // Rebuild dependencies
-        sheet.rebuild_dependencies();
-        
-        // Verify dependencies are now tracked
-        assert!(!sheet.dependencies.is_empty());
-        assert!(!sheet.dependents.is_empty());
-        
-        // Test that recalculation works after rebuilding
-        sheet.set_cell(0, 0, CellData { value: "5".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
-        assert_eq!(sheet.get_cell(0, 1).value, "10"); // 5*2=10
-        assert_eq!(sheet.get_cell(0, 2).value, "20"); // 10*2=20
-    }
-
-    #[test]
-    fn test_range_dependency_recalculation() {
-        let mut sheet = Spreadsheet::default();
-        
-        // Set up cells A1:A3 and a SUM formula
-        sheet.set_cell(0, 0, CellData { value: "1".to_string(), formula: None, format: None, comment: None, spill_anchor: None }); // A1 = 1
-        sheet.set_cell(1, 0, CellData { value: "2".to_string(), formula: None, format: None, comment: None, spill_anchor: None }); // A2 = 2
-        sheet.set_cell(2, 0, CellData { value: "3".to_string(), formula: None, format: None, comment: None, spill_anchor: None }); // A3 = 3
-        sheet.set_cell(0, 1, CellData { 
-            value: "6".to_string(), 
-            formula: Some("=SUM(A1:A3)".to_string()),
-            format: None,
-            comment: None,
-        spill_anchor: None,
-        }); // B1 = SUM(A1:A3) = 6
-        
-        // Verify initial state
-        assert_eq!(sheet.get_cell(0, 1).value, "6");
-        
-        // Change one cell in the range
-        sheet.set_cell(1, 0, CellData { value: "5".to_string(), formula: None, format: None, comment: None, spill_anchor: None }); // A2 = 5
-        assert_eq!(sheet.get_cell(0, 1).value, "9"); // Should be 1+5+3=9
-        
-        // Change another cell in the range
-        sheet.set_cell(2, 0, CellData { value: "10".to_string(), formula: None, format: None, comment: None, spill_anchor: None }); // A3 = 10
-        assert_eq!(sheet.get_cell(0, 1).value, "16"); // Should be 1+5+10=16
-    }
+    // NOTE: Per-sheet cascade tests (test_automatic_recalculation,
+    // test_dependency_chain_recalculation, test_multiple_dependents,
+    // test_dependency_removal, test_rebuild_dependencies,
+    // test_range_dependency_recalculation, test_dependency_tracking_persistence,
+    // test_diamond_dependency_recalculation) were deleted along with the
+    // per-sheet cascade itself. The functionality moved to
+    // Workbook::recalc_via_graph + the executor, and is covered by tests in
+    // src/domain/services/evaluator.rs and the scenario framework
+    // (tests/pty_scenarios.rs — DCF, amortization, budgeting all stress
+    // cumulative dependency chains through real user workflows).
+    fn _per_sheet_cascade_tests_moved_to_workbook_level() {}
 
     #[test]
     fn test_circular_dependency_handling() {
@@ -1740,80 +1262,6 @@ mod tests {
         assert!(refs.is_empty());
     }
 
-    #[test]
-    fn test_dependency_tracking_persistence() {
-        use crate::infrastructure::FileRepository;
-        use tempfile::NamedTempFile;
-        
-        let mut original = Spreadsheet::default();
-        
-        // Set up dependencies
-        original.set_cell(0, 0, CellData { value: "10".to_string(), formula: None, format: None, comment: None, spill_anchor: None }); // A1 = 10
-        original.set_cell(0, 1, CellData { 
-            value: "20".to_string(), 
-            formula: Some("=A1*2".to_string()),
-            format: None,
-            comment: None,
-        spill_anchor: None,
-        }); // B1 = A1*2 = 20
-        original.set_cell(0, 2, CellData { 
-            value: "40".to_string(), 
-            formula: Some("=B1*2".to_string()),
-            format: None,
-            comment: None,
-        spill_anchor: None,
-        }); // C1 = B1*2 = 40
-        
-        // Save to file
-        let temp_file = NamedTempFile::new().expect("Failed to create temp file");
-        let file_path = temp_file.path().to_str().unwrap();
-        FileRepository::save_spreadsheet(&original, file_path).expect("Save failed");
-        
-        // Load from file
-        let (mut loaded, _) = FileRepository::load_spreadsheet(file_path).expect("Load failed");
-        
-        // Dependencies should be rebuilt and functional
-        loaded.set_cell(0, 0, CellData { value: "5".to_string(), formula: None, format: None, comment: None, spill_anchor: None }); // Change A1 to 5
-        
-        // Verify that dependent cells were recalculated
-        assert_eq!(loaded.get_cell(0, 1).value, "10"); // B1 = 5*2 = 10
-        assert_eq!(loaded.get_cell(0, 2).value, "20"); // C1 = 10*2 = 20
-    }
-
-    #[test]
-    fn test_diamond_dependency_recalculation() {
-        let mut sheet = Spreadsheet::default();
-
-        // Diamond pattern: A1 -> B1, A1 -> C1, B1 -> C1
-        // A1 = 10
-        sheet.set_cell(0, 0, CellData { value: "10".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
-        // B1 = A1 * 2
-        sheet.set_cell(0, 1, CellData {
-            value: "20".to_string(),
-            formula: Some("=A1*2".to_string()),
-            format: None,
-            comment: None,
-        spill_anchor: None,
-        });
-        // C1 = A1 + B1 (depends on both A1 and B1)
-        sheet.set_cell(0, 2, CellData {
-            value: "30".to_string(),
-            formula: Some("=A1+B1".to_string()),
-            format: None,
-            comment: None,
-        spill_anchor: None,
-        });
-
-        // Verify initial state
-        assert_eq!(sheet.get_cell(0, 0).value, "10");
-        assert_eq!(sheet.get_cell(0, 1).value, "20");
-        assert_eq!(sheet.get_cell(0, 2).value, "30"); // 10 + 20
-
-        // Change A1 — B1 must update before C1 for correct result
-        sheet.set_cell(0, 0, CellData { value: "5".to_string(), formula: None, format: None, comment: None, spill_anchor: None });
-        assert_eq!(sheet.get_cell(0, 1).value, "10"); // 5*2 = 10
-        assert_eq!(sheet.get_cell(0, 2).value, "15"); // 5 + 10 = 15 (not 5 + 20 = 25)
-    }
 
     #[test]
     fn test_auto_resize_column_shrinks() {

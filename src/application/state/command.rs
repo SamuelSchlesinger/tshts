@@ -863,23 +863,50 @@ impl App {
                 }
             }
             ["trace", "dependents"] => {
-                let pos = (self.selected_row, self.selected_col);
-                let deps = self.workbook.current_sheet().dependents.get(&pos).cloned();
-                match deps {
-                    Some(set) if !set.is_empty() => {
-                        let s: Vec<String> = set
-                            .iter()
-                            .map(|(r, c)| {
-                                format!(
-                                    "{}{}",
-                                    crate::domain::Spreadsheet::column_label(*c),
-                                    r + 1
-                                )
-                            })
-                            .collect();
-                        self.status_message = Some(format!("Dependents: {}", s.join(", ")));
-                    }
-                    _ => self.status_message = Some("(no dependents)".to_string()),
+                // Walk the unified workbook graph for cells that read
+                // (sheet, row, col). The graph is keyed by NodeKey =
+                // (SheetId, row, col) and is the single source of truth
+                // post-cascade-removal.
+                let sheet_idx = self.workbook.active_sheet;
+                let sheet_id = self.workbook.sheet_ids[sheet_idx];
+                let node = (sheet_id, self.selected_row, self.selected_col);
+                let mut seed = std::collections::HashSet::new();
+                seed.insert(node);
+                let downstream: Vec<_> = self
+                    .workbook
+                    .graph
+                    .transitive_dependents(&seed)
+                    .into_iter()
+                    .filter(|d| *d != node) // strip self
+                    .collect();
+                if downstream.is_empty() {
+                    self.status_message = Some("(no dependents)".to_string());
+                } else {
+                    let mut labels: Vec<String> = downstream
+                        .iter()
+                        .map(|(sid, r, c)| {
+                            let sheet_name = self
+                                .workbook
+                                .sheet_ids
+                                .iter()
+                                .position(|s| s == sid)
+                                .map(|i| self.workbook.sheet_names[i].clone())
+                                .unwrap_or_else(|| "?".to_string());
+                            let same_sheet = *sid == sheet_id;
+                            let cell_label = format!(
+                                "{}{}",
+                                crate::domain::Spreadsheet::column_label(*c),
+                                r + 1
+                            );
+                            if same_sheet {
+                                cell_label
+                            } else {
+                                format!("{}!{}", sheet_name, cell_label)
+                            }
+                        })
+                        .collect();
+                    labels.sort();
+                    self.status_message = Some(format!("Dependents: {}", labels.join(", ")));
                 }
             }
             ["table", "list"] => {

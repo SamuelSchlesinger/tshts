@@ -76,13 +76,15 @@ impl WorkbookGraph {
     pub fn link(&mut self, node: NodeKey, prereqs: impl IntoIterator<Item = NodeKey>) {
         let mut added_any = false;
         for p in prereqs {
-            // Self-edges are silently dropped — they form trivial 1-cycles
-            // that the cycle detector would reject, but our cycle detection
-            // happens elsewhere (the formula-entry check). The graph
-            // remains a strict DAG for non-iterative recalc.
-            if p == node {
-                continue;
-            }
+            // Self-edges ARE retained so a cell with formula =A1 (in A1)
+            // or =A1+1 lands in the cyclic remainder of topo_levels_from_seeds
+            // and gets iterative-calc treatment (converge or #NUM!).
+            // Pre-PR these were dropped because the user-facing formula-
+            // entry check (`would_create_circular_reference`) rejected
+            // circular formulas before they reached the graph; dropping
+            // self-edges in the graph then kept it a strict DAG. With the
+            // legacy per-sheet cascade gone, the graph IS the iteration
+            // discipline, so self-loops have to live here.
             if self.dependencies.entry(node).or_default().insert(p) {
                 added_any = true;
             }
@@ -194,13 +196,19 @@ impl WorkbookGraph {
         if closure.is_empty() {
             return TopoLevels { levels: Vec::new(), cyclic: Vec::new() };
         }
-        // In-degrees restricted to the closure.
+        // In-degrees restricted to the closure. Self-loops ARE counted —
+        // a cell that references itself (=A1+1) is genuinely cyclic and
+        // belongs in the cyclic remainder, not in level 0 where it would
+        // get a single eval against its own pre-write value. The cyclic
+        // remainder routes through `iterative_calc_cyclic`, which either
+        // converges (legitimate fixed-point iteration like =A1/2+1 → 2)
+        // or stamps `#NUM!` after iter_max.
         let mut in_degree: HashMap<NodeKey, usize> =
             closure.iter().map(|&n| (n, 0)).collect();
         for &n in &closure {
             if let Some(deps) = self.dependencies.get(&n) {
                 for &p in deps {
-                    if closure.contains(&p) && p != n {
+                    if closure.contains(&p) {
                         *in_degree.entry(n).or_insert(0) += 1;
                     }
                 }
@@ -289,11 +297,25 @@ mod tests {
         assert!(!g.dependents.contains_key(&n(0, 0, 0)));
     }
 
+    /// Self-edges ARE retained (post calc-engine unification). The cell's
+    /// own NodeKey shows up in both `dependencies[node]` and
+    /// `dependents[node]`, and `topo_levels_from_seeds` correctly places
+    /// the cell in the cyclic remainder. The graph isn't a strict DAG
+    /// anymore — the iterative-calc loop in the executor handles cycles.
     #[test]
-    fn self_edges_dropped() {
+    fn self_edges_retained_for_iterative_calc() {
+        let node = n(0, 1, 0);
         let mut g = WorkbookGraph::new();
-        g.link(n(0, 1, 0), [n(0, 1, 0)]);
-        assert!(g.is_empty());
+        g.link(node, [node]);
+        assert!(g.dependencies[&node].contains(&node),
+            "self-edge must be tracked as a dependency on the source");
+        assert!(g.dependents[&node].contains(&node),
+            "self-edge must also show up as a dependent");
+        let mut seeds = HashSet::new();
+        seeds.insert(node);
+        let topo = g.topo_levels_from_seeds(&seeds);
+        assert!(topo.cyclic.contains(&node),
+            "self-loop must end up in the cyclic remainder, not in level 0");
     }
 
     #[test]

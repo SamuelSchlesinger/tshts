@@ -125,7 +125,8 @@ impl CsvExporter {
         }
 
         spreadsheet.set_many(buffered);
-        spreadsheet.rebuild_dependencies();
+        // Dep graph is workbook-level and lazy — the next recalc_via_graph
+        // will rebuild from cells.iter().
 
         Ok(spreadsheet)
     }
@@ -171,7 +172,7 @@ impl CsvExporter {
             dest.rows = dest.rows.max(next_row + 5);
         }
         dest.set_many(buffered);
-        dest.rebuild_dependencies();
+        // Dep graph is workbook-level + lazy; next recalc rebuilds.
         Ok(appended)
     }
 

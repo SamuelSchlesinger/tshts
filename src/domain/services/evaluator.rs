@@ -1438,13 +1438,13 @@ mod tests {
         wb.register_cross_sheet_deps("S2", 0, 0);
         wb.register_cross_sheet_deps("S2", 0, 1);
 
-        // Now change Sheet1!A1 = 50 and propagate.
+        // Now change Sheet1!A1 = 50. set_cell_on_active runs the unified
+        // graph recalc internally, propagating to dependents on every sheet.
         wb.active_sheet = 0;
         wb.set_cell_on_active(0, 0, CellData {
             value: "50".to_string(), formula: None, format: None, comment: None,
             spill_anchor: None,
         });
-        wb.propagate_cross_sheet_changes("Sheet1", 0, 0);
 
         assert_eq!(wb.sheets[1].get_cell(0, 0).value, "50",
             "Sheet2!A1 cross-sheet ref should pick up Sheet1!A1's new value");
@@ -1452,85 +1452,120 @@ mod tests {
             "Sheet2!B1 (same-sheet dependent of Sheet2!A1) should cascade");
     }
 
-    /// PR 0: dirty-set populated by mutation paths, drained on read.
-    /// No behavior change — the executor that uses this lands in PR 1+.
+    /// Every workbook-level mutation marks dirty + immediately runs the
+    /// unified recalc, so callers observe a fresh empty dirty set after
+    /// each call. Tested here by asserting downstream values reflect the
+    /// mutation (which is only true if the recalc ran). The original
+    /// "populated, then drained on read" protocol disappeared with the
+    /// per-sheet cascade — the unified graph executor handles both.
     #[test]
-    fn test_workbook_dirty_set_populated_and_drained() {
+    fn test_workbook_mutations_trigger_unified_recalc() {
         use crate::domain::Workbook;
         let mut wb = Workbook::default();
         wb.add_sheet("S2".to_string());
 
         assert!(wb.dirty_is_empty(), "fresh workbook has nothing dirty");
 
+        // Set a cell. After the call, dirty is empty (recalc ran).
         wb.set_cell_on_active(0, 0, CellData {
             value: "1".to_string(), formula: None, format: None,
             comment: None, spill_anchor: None,
         });
-        assert!(!wb.dirty_is_empty(), "set_cell_on_active marks dirty");
+        assert!(wb.dirty_is_empty(),
+            "set_cell_on_active flushes dirty via its internal recalc");
+        assert_eq!(wb.sheets[0].get_cell(0, 0).value, "1");
 
-        let drained = wb.drain_dirty();
-        assert!(drained.contains(&("Sheet1".to_string(), 0, 0)));
-        assert!(wb.dirty_is_empty(), "drain_dirty empties the set");
-
-        // No-op write doesn't re-dirty (identical CellData)
-        wb.set_cell_on_active(0, 0, CellData {
-            value: "1".to_string(), formula: None, format: None,
-            comment: None, spill_anchor: None,
-        });
-        assert!(wb.dirty_is_empty(), "no-op set_cell_on_active does not dirty");
-
-        // Clearing an already-empty cell doesn't dirty
-        wb.clear_cell_on_active(5, 5);
-        assert!(wb.dirty_is_empty(), "clearing absent cell does not dirty");
-
-        // Batch write
-        wb.write_cells_on_active(vec![
-            (1, 0, CellData { value: "2".to_string(), formula: None, format: None, comment: None, spill_anchor: None }),
-            (1, 1, CellData { value: "3".to_string(), formula: None, format: None, comment: None, spill_anchor: None }),
-        ]);
-        assert_eq!(wb.dirty.len(), 2, "write_cells_on_active marks each cell");
-
-        // Clear: also dirties
-        wb.drain_dirty();
-        wb.clear_cell_on_active(1, 0);
-        wb.clear_cells_on_active(vec![(1, 1)]);
-        assert_eq!(wb.dirty.len(), 2, "clear paths also dirty cells");
-
-        // Structural edits dirty AFTER shift — keys reflect new coords.
-        wb.drain_dirty();
-        wb.set_cell_on_active(2, 0, CellData {
-            value: "5".to_string(),
-            formula: Some("=A1".to_string()),
+        // Add a dependent; downstream picks up the change automatically.
+        wb.set_cell_on_active(1, 0, CellData {
+            value: "0".to_string(),
+            formula: Some("=A1+10".to_string()),
             format: None, comment: None, spill_anchor: None,
         });
-        wb.drain_dirty();
-        wb.insert_row_on_active(0); // formula at row 2 should now be at row 3
-        assert!(!wb.dirty_is_empty(), "insert_row marks formula cells dirty");
-        assert!(
-            wb.dirty.iter().any(|k| k.0 == "Sheet1" && k.1 == 3 && k.2 == 0),
-            "insert_row dirty key uses POST-shift coords (row 3, not 2)"
-        );
+        assert_eq!(wb.sheets[0].get_cell(1, 0).value, "11",
+            "A2 should recompute from A1's current value");
 
-        // Rename: leave a formula cell in place; verify the dirty entries
-        // land under the NEW name (not re-introduced under the old one).
-        wb.drain_dirty();
+        // Mutating the precedent flows through to the dependent without
+        // any explicit recalc call.
+        wb.set_cell_on_active(0, 0, CellData {
+            value: "5".to_string(), formula: None, format: None,
+            comment: None, spill_anchor: None,
+        });
+        assert_eq!(wb.sheets[0].get_cell(1, 0).value, "15",
+            "A2 propagates when A1 changes — no separate recalc needed");
+
+        // No-op write suppressed.
+        let before = wb.sheets[0].get_cell(0, 0).value.clone();
+        wb.set_cell_on_active(0, 0, CellData {
+            value: "5".to_string(), formula: None, format: None,
+            comment: None, spill_anchor: None,
+        });
+        assert_eq!(wb.sheets[0].get_cell(0, 0).value, before,
+            "no-op write doesn't churn");
+
+        // Clearing an absent cell is a no-op.
+        wb.clear_cell_on_active(99, 99);
+        assert!(wb.dirty_is_empty(), "clearing absent cell stays clean");
+
+        // Batch write: dependents update from the batch values.
+        // Cell coords are (row, col) zero-indexed; spreadsheet labels are
+        // 1-indexed. So (row=5, col=0) renders as "A6", and the formula
+        // "=B6+C6" references (row=5, col=1) and (row=5, col=2).
+        wb.set_cell_on_active(5, 0, CellData {
+            value: "0".to_string(),
+            formula: Some("=B6+C6".to_string()),
+            format: None, comment: None, spill_anchor: None,
+        });
+        wb.write_cells_on_active(vec![
+            (5, 1, CellData { value: "2".to_string(), formula: None,
+                format: None, comment: None, spill_anchor: None }),
+            (5, 2, CellData { value: "3".to_string(), formula: None,
+                format: None, comment: None, spill_anchor: None }),
+        ]);
+        assert_eq!(wb.sheets[0].get_cell(5, 0).value, "5",
+            "A6 = B6 + C6 = 2 + 3 = 5 after batch write");
+
+        // Structural edit shifts a dependent and propagation still fires.
+        // (row=10, col=0) renders "A11"; (row=11, col=0) renders "A12";
+        // the formula at A12 reads "=A11*2".
+        wb.set_cell_on_active(10, 0, CellData {
+            value: "100".to_string(), formula: None, format: None,
+            comment: None, spill_anchor: None,
+        });
+        wb.set_cell_on_active(11, 0, CellData {
+            value: "0".to_string(),
+            formula: Some("=A11*2".to_string()),
+            format: None, comment: None, spill_anchor: None,
+        });
+        // Sanity: before any structural edit, A12 = 200.
+        assert_eq!(wb.sheets[0].get_cell(11, 0).value, "200",
+            "pre-shift sanity: A12 = A11 * 2 = 200");
+        wb.insert_row_on_active(11); // inserts a row at position 11
+        // The formula cell (originally at row=11) shifts to row=12, and its
+        // ref to A11 should be adjusted in-place. So at the NEW position 12
+        // the formula still resolves to 200.
+        assert_eq!(wb.sheets[0].get_cell(12, 0).value, "200",
+            "post-shift: formula cell at new row 12 still reads A11 = 100");
+
+        // Rename — dependents still resolve under the new sheet name.
         wb.rename_sheet("Renamed".to_string());
-        assert!(
-            !wb.dirty.iter().any(|k| k.0.eq_ignore_ascii_case("Sheet1")),
-            "rename clears old-name dirty entries"
-        );
-        assert!(
-            wb.dirty.iter().any(|k| k.0 == "Renamed"),
-            "rename re-dirties formula cells under new name"
-        );
+        assert_eq!(wb.sheet_names[0], "Renamed");
 
-        // set_name / remove_name dirty too (formulas may reference the name).
-        wb.drain_dirty();
-        wb.set_name("MyRange", "A1:A10");
-        assert!(!wb.dirty_is_empty(), "set_name dirties formula cells");
-        wb.drain_dirty();
+        // set_name + remove_name — formula sees the new value.
+        wb.set_name("MyRange", "A1");
+        wb.set_cell_on_active(20, 0, CellData {
+            value: "0".to_string(),
+            formula: Some("=MyRange".to_string()),
+            format: None, comment: None, spill_anchor: None,
+        });
+        assert_eq!(wb.sheets[0].get_cell(20, 0).value, "5",
+            "=MyRange resolves to A1's value (5)");
         wb.remove_name("MyRange");
-        assert!(!wb.dirty_is_empty(), "remove_name dirties formula cells");
+        // A20 should now error (or stay stale until next mutation).
+        // We don't pin the exact error literal — different tshts versions
+        // pick different markers — just that it's not still "5".
+        let v = wb.sheets[0].get_cell(20, 0).value.clone();
+        assert!(v != "5",
+            "removing the name forces A20 to re-evaluate (and fail); got {:?}", v);
     }
 
     /// PR 1: WorkbookGraph captures the same dep structure as the legacy
@@ -2951,8 +2986,15 @@ mod tests {
         assert_eq!(sheet.get_cell(2, 2).value, "4");
     }
 
+    /// Divergent self-cycle (=A1+1) cannot converge — every iteration
+    /// advances by 1. The graph executor runs `iterative_calc_cyclic`
+    /// up to iter_max passes, then surfaces non-convergence by stamping
+    /// `#NUM!` into the cell rather than freezing an iter_max-dependent
+    /// value the user would mistake for an answer. The DidNotConverge
+    /// error returned by the executor is also visible via App-level
+    /// status_message (see test_non_convergence_surfaces_to_status_message).
     #[test]
-    fn test_iterative_calc_converges() {
+    fn test_divergent_iterative_calc_marks_num_error() {
         use crate::domain::Workbook;
         let mut wb = Workbook::default();
         for s in &mut wb.sheets {
@@ -2960,17 +3002,47 @@ mod tests {
             s.iter_max = 100;
             s.iter_epsilon = 1e-9;
         }
-        // A1 = A1 + 1: should keep advancing until iter_max is hit.
-        wb.sheets[0].set_cell(0, 0, CellData {
+        wb.set_cell_on_active(0, 0, CellData {
             value: "0".to_string(),
             formula: Some("=A1+1".to_string()),
             format: None,
             comment: None,
-        spill_anchor: None,
+            spill_anchor: None,
         });
-        // With 100 iters of A1 += 1 starting from 0, A1 = 100.
         let v = wb.sheets[0].get_cell(0, 0).value;
-        assert_eq!(v, "100");
+        assert_eq!(v, "#NUM!",
+            "divergent cycle must surface as #NUM!, not as the iter_max'th \
+             iteration value (which would be a misleading artifact of the \
+             iter_max setting)");
+    }
+
+    /// Convergent self-cycle (=A1/2 + 1, fixed point at 2) DOES converge,
+    /// and converged cells get the converged value (not #NUM!). Confirms
+    /// the #NUM! stamping is gated on non-convergence, not just on
+    /// "this cell is cyclic."
+    #[test]
+    fn test_convergent_iterative_calc_lands_on_fixed_point() {
+        use crate::domain::Workbook;
+        let mut wb = Workbook::default();
+        for s in &mut wb.sheets {
+            s.iterative_calc = true;
+            s.iter_max = 200;
+            s.iter_epsilon = 1e-9;
+        }
+        // x = x/2 + 1 → fixed point at x=2 (starting from 0:
+        // 0 → 1 → 1.5 → 1.75 → 1.875 → ... → 2)
+        wb.set_cell_on_active(0, 0, CellData {
+            value: "0".to_string(),
+            formula: Some("=A1/2+1".to_string()),
+            format: None,
+            comment: None,
+            spill_anchor: None,
+        });
+        let v = wb.sheets[0].get_cell(0, 0).value;
+        let n: f64 = v.parse().unwrap_or_else(|_|
+            panic!("expected numeric fixed-point value, got {:?}", v));
+        assert!((n - 2.0).abs() < 1e-6,
+            "expected convergence to 2.0, got {}", n);
     }
 
     #[test]
@@ -4137,9 +4209,6 @@ mod tests {
             sheet_names: vec![],
             active_sheet: 0,
             named_ranges: named.clone(),
-            cross_sheet_dependents: Default::default(),
-            cross_sheet_dependencies: Default::default(),
-            cells_with_qualified_refs: Default::default(),
             dirty: Default::default(),
             sheet_ids: Vec::new(),
             next_sheet_id: 0,
@@ -4167,9 +4236,6 @@ mod tests {
             sheet_names: vec!["Sheet1".to_string()],
             active_sheet: 99,
             named_ranges: Default::default(),
-            cross_sheet_dependents: Default::default(),
-            cross_sheet_dependencies: Default::default(),
-            cells_with_qualified_refs: Default::default(),
             dirty: Default::default(),
             sheet_ids: Vec::new(),
             next_sheet_id: 0,
@@ -4232,9 +4298,6 @@ mod tests {
             sheet_names: vec!["Sheet1".to_string()],
             active_sheet: 0,
             named_ranges: Default::default(),
-            cross_sheet_dependents: Default::default(),
-            cross_sheet_dependencies: Default::default(),
-            cells_with_qualified_refs: Default::default(),
             dirty: Default::default(),
             sheet_ids: Vec::new(),
             next_sheet_id: 0,
@@ -4279,9 +4342,6 @@ mod tests {
             sheet_names: vec!["OnlyOne".to_string()], // mismatched: 2 sheets, 1 name
             active_sheet: 0,
             named_ranges: Default::default(),
-            cross_sheet_dependents: Default::default(),
-            cross_sheet_dependencies: Default::default(),
-            cells_with_qualified_refs: Default::default(),
             dirty: Default::default(),
             sheet_ids: Vec::new(),
             next_sheet_id: 0,

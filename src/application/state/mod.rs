@@ -368,11 +368,12 @@ fn restore_workbook(workbook: &mut Workbook, pre: &Workbook) {
 fn restore_cell(workbook: &mut Workbook, row: usize, col: usize, data: Option<&CellData>) {
     // Route through the workbook chokepoints so the dirty set is
     // populated; undo/redo were previously skipping dirty entirely.
+    // `set_cell_on_active` / `clear_cell_on_active` both run a single
+    // graph-driven recalc internally, so no separate propagate call.
     match data {
         Some(d) => workbook.set_cell_on_active(row, col, d.clone()),
         None => workbook.clear_cell_on_active(row, col),
     }
-    workbook.propagate_active_cell(row, col);
 }
 
 /// Bulk-apply CellModified-style entries from a batch in O(N) total —
@@ -426,7 +427,6 @@ where
     // The legacy per-sheet dep graph needs rebuilding because we
     // bypassed `add_cell_dependencies`. The unified graph gets
     // rebuilt lazily inside recalc_via_graph_result.
-    workbook.sheets[active_idx].rebuild_dependencies();
     workbook.rebuild_cross_sheet_deps();
     workbook.build_dep_graph_from_scratch();
     // Use the Result variant — the eprintln-swallowing wrapper would
@@ -740,7 +740,6 @@ impl App {
             // Keep the per-sheet dep graph in sync — the legacy cross-
             // sheet engine still reads it, and `build_dep_graph_from_scratch`
             // uses the per-sheet refs as input.
-            sheet.rebuild_dependencies();
             // Mark every formula cell on this sheet dirty.
             let name = self.workbook.sheet_names[idx].clone();
             for (&(r, c), cd) in &sheet.cells {
@@ -810,11 +809,18 @@ impl App {
         }
     }
 
-    /// Cross-sheet propagation hook for cell mutations that don't go through
-    /// `Workbook::write_cells_on_active`. Forwards to the workbook, which
-    /// owns the actual dep registration + propagation logic.
+    /// Propagation hook for cell mutations that don't go through
+    /// `Workbook::write_cells_on_active`. With the unified graph executor
+    /// as the single source of truth, propagation is just "mark dirty
+    /// + recalc," which `set_cell_on_active` already does. This helper
+    /// stays for callers that wrote a cell via some bespoke path and
+    /// then explicitly want to flush; today it just runs a recalc.
     pub(crate) fn propagate_cell_change(&mut self, row: usize, col: usize) {
-        self.workbook.propagate_active_cell(row, col);
+        // Mark the cell dirty (the bespoke caller may not have done it)
+        // and run the unified recalc.
+        let sheet_name = self.workbook.sheet_names[self.workbook.active_sheet].clone();
+        self.workbook.mark_dirty(&sheet_name, row, col);
+        let _ = self.workbook.recalc_via_graph_result();
     }
 
     pub fn redo(&mut self) {

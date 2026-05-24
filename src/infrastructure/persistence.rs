@@ -27,9 +27,9 @@ impl FileRepository {
         match fs::read_to_string(filename) {
             Ok(content) => {
                 match serde_json::from_str::<Spreadsheet>(&content) {
-                    Ok(mut spreadsheet) => {
-                        // Rebuild dependencies since they're not serialized
-                        spreadsheet.rebuild_dependencies();
+                    Ok(spreadsheet) => {
+                        // Dep graph is workbook-level and rebuilt lazily
+                        // on first `recalc_via_graph_result()`.
                         Ok((spreadsheet, filename.to_string()))
                     }
                     Err(e) => Err(format!("Invalid file format - {}", e)),
@@ -114,21 +114,15 @@ impl FileRepository {
                     if workbook.active_sheet >= workbook.sheets.len() {
                         workbook.active_sheet = 0;
                     }
-                    for sheet in &mut workbook.sheets {
-                        sheet.rebuild_dependencies();
-                    }
-                    workbook.rebuild_cross_sheet_deps();
                     // Pre-PR-1 files have no sheet_ids; allocate now so
-                    // the new graph builder has stable identities. Files
-                    // saved by PR-1+ carry their own IDs and ensure_*
-                    // becomes a no-op.
+                    // the unified graph has stable identities. Files saved
+                    // by PR-1+ carry their own IDs and ensure_* no-ops.
                     workbook.build_dep_graph_from_scratch();
                     return Ok((workbook, filename.to_string()));
                 }
                 // Fall back to single spreadsheet format
                 match serde_json::from_str::<Spreadsheet>(&content) {
-                    Ok(mut spreadsheet) => {
-                        spreadsheet.rebuild_dependencies();
+                    Ok(spreadsheet) => {
                         let mut wb = Workbook::from_spreadsheet(spreadsheet);
                         wb.build_dep_graph_from_scratch();
                         Ok((wb, filename.to_string()))

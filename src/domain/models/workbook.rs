@@ -99,36 +99,13 @@ pub struct Workbook {
     pub active_sheet: usize,
     /// Named ranges: name -> cell reference string (e.g., "Revenue" -> "B2:B50")
     pub named_ranges: HashMap<String, String>,
-    /// Workbook-level dep graph for CROSS-sheet references only. Same-sheet
-    /// deps remain on each Spreadsheet. `dependents[P]` is the set of
-    /// cells that reference `P` from a different sheet. Not serialized —
-    /// rebuilt on load.
-    #[serde(skip)]
-    pub cross_sheet_dependents: HashMap<CrossSheetKey, HashSet<CrossSheetKey>>,
-    /// Inverse of `cross_sheet_dependents`: `dependencies[X]` is the set of
-    /// cells `X` references from other sheets. Used to clear stale deps when
-    /// a formula changes.
-    #[serde(skip)]
-    pub cross_sheet_dependencies: HashMap<CrossSheetKey, HashSet<CrossSheetKey>>,
-    /// Cells whose formula contains *any* sheet-qualified reference (cross-
-    /// sheet OR self-qualified like `=Sheet1!A1` on Sheet1). Used as a
-    /// fast-path check: if no formula anywhere uses a qualified ref, the
-    /// per-write workbook clone in `*_on_active` can be skipped because no
-    /// evaluator inside the recalc cascade will ever ask for workbook
-    /// context. Maintained by `register_cross_sheet_deps`.
-    #[serde(skip)]
-    pub cells_with_qualified_refs: HashSet<CrossSheetKey>,
     /// Cells whose value may be stale. Populated by every mutation site
     /// (set/clear/structural-edit/sheet-rename/sheet-remove). Drained by
-    /// the recalc executor. Not serialized — after a fresh load, on-disk
-    /// values are authoritative; dirty starts empty and grows only from
-    /// subsequent mutations.
-    ///
-    /// Foundation for the parallel-calc engine (PR 1+): the level
-    /// scheduler walks this set instead of re-deriving "what changed
-    /// since last recalc" on every call. Today the existing per-sheet
-    /// `recalculate_dependents` cascades remain authoritative; the
-    /// graph-driven recalc lands in PR 3.
+    /// the recalc executor on each `recalc_via_graph_result()` pass —
+    /// the workbook-level unified `graph` is the single source of truth
+    /// for dependency propagation; there's no separate per-sheet cascade.
+    /// Not serialized; after a fresh load, on-disk values are
+    /// authoritative and dirty starts empty.
     #[serde(skip)]
     pub dirty: HashSet<CrossSheetKey>,
     /// Stable per-sheet IDs, parallel to `sheets` and `sheet_names`.
@@ -186,9 +163,6 @@ impl Default for Workbook {
             sheet_names: vec!["Sheet1".to_string()],
             active_sheet: 0,
             named_ranges: HashMap::new(),
-            cross_sheet_dependents: HashMap::new(),
-            cross_sheet_dependencies: HashMap::new(),
-            cells_with_qualified_refs: HashSet::new(),
             dirty: HashSet::new(),
             sheet_ids: vec![SheetId(0)],
             next_sheet_id: 1,
@@ -572,6 +546,21 @@ impl Workbook {
                 return Ok(pass);
             }
         }
+        // Exhausted iter_max without converging. Stamping the iter_max'th
+        // value into the cells would be misleading — for divergent
+        // formulas (=A1+1, say) that "answer" is purely an artifact of
+        // the iter_max setting. Excel hides this behind a yellow status
+        // bar; we surface it explicitly: every cyclic cell gets `#NUM!`,
+        // the cell-level error literal for "this didn't converge."
+        // `CalcError::DidNotConverge` returned below also bubbles to the
+        // status bar so the user sees WHICH cells diverged.
+        for (node, sheet_idx, _) in &work {
+            let sheet = &mut self.sheets[*sheet_idx];
+            if let Some(cd) = sheet.cells.get_mut(&(node.1, node.2)) {
+                cd.value = "#NUM!".to_string();
+            }
+            sheet.cf_cache.lock().unwrap().clear();
+        }
         Err(iter_max)
     }
 
@@ -711,7 +700,8 @@ impl Workbook {
     /// Structural row insert on the active sheet, with cross-sheet ref
     /// adjustment on every other sheet. If Sheet2 has `=Sheet1!A5` and we
     /// insert a row above A5 in Sheet1, Sheet2's ref shifts to `=Sheet1!A6`.
-    /// Matches Excel's structural-edit semantics.
+    /// Matches Excel's structural-edit semantics. Triggers a unified-graph
+    /// recalc so dependents on every sheet reflect the shift immediately.
     pub fn insert_row_on_active(&mut self, at: usize) {
         let active_idx = self.active_sheet;
         self.sheets[active_idx].insert_row(at);
@@ -722,6 +712,7 @@ impl Workbook {
         // Marking pre-shift would leave dirty pointing at empty cells while
         // the actually-shifted cells go unrecorded.
         self.mark_all_formula_cells_dirty();
+        let _ = self.recalc_via_graph_result();
     }
 
     /// Structural row delete on the active sheet, with cross-sheet ref
@@ -733,6 +724,7 @@ impl Workbook {
             evaluator.adjust_formula_for_sheet_row_delete(formula, target, at)
         });
         self.mark_all_formula_cells_dirty();
+        let _ = self.recalc_via_graph_result();
     }
 
     pub fn insert_col_on_active(&mut self, at: usize) {
@@ -742,6 +734,7 @@ impl Workbook {
             evaluator.adjust_formula_for_sheet_col_insert(formula, target, at)
         });
         self.mark_all_formula_cells_dirty();
+        let _ = self.recalc_via_graph_result();
     }
 
     pub fn delete_col_on_active(&mut self, at: usize) {
@@ -751,6 +744,7 @@ impl Workbook {
             evaluator.adjust_formula_for_sheet_col_delete(formula, target, at)
         });
         self.mark_all_formula_cells_dirty();
+        let _ = self.recalc_via_graph_result();
     }
 
     /// Mark every cell on every sheet that holds a formula as dirty.
@@ -811,7 +805,6 @@ impl Workbook {
                     cd.formula = Some(new_formula);
                 }
             }
-            sheet.rebuild_dependencies();
             // Spill ranges may reference cells that shifted on the mutated
             // sheet; force a re-evaluation so ghosts stay coherent.
             // Skip the mutated sheet — `Spreadsheet::insert_row` already
@@ -926,7 +919,6 @@ impl Workbook {
                     cd.formula = Some(new_formula);
                 }
             }
-            sheet.rebuild_dependencies();
             // The rewrite changed only the formula text; the cached `value`
             // still shows whatever the formula previously evaluated to.
             // Force a recalc so the displayed value matches `#REF!` immediately.
@@ -934,17 +926,9 @@ impl Workbook {
                 sheet.refresh_cell_value(r, c);
             }
         }
-        // Purge any cross-sheet dep entries that touched the removed sheet.
-        self.cross_sheet_dependents
-            .retain(|k, _| !k.0.eq_ignore_ascii_case(&removed_name));
-        for set in self.cross_sheet_dependents.values_mut() {
-            set.retain(|k| !k.0.eq_ignore_ascii_case(&removed_name));
-        }
-        self.cross_sheet_dependencies
-            .retain(|k, _| !k.0.eq_ignore_ascii_case(&removed_name));
-        for set in self.cross_sheet_dependencies.values_mut() {
-            set.retain(|k| !k.0.eq_ignore_ascii_case(&removed_name));
-        }
+        // `rebuild_cross_sheet_deps` wipes the unified graph + purity +
+        // structural_targets and rewalks formula cells, so any nodes
+        // keyed at the removed sheet's SheetId disappear there.
         self.rebuild_cross_sheet_deps();
         true
     }
@@ -1022,7 +1006,6 @@ impl Workbook {
                     touched_per_sheet[sheet_idx].push((r, c));
                 }
             }
-            sheet.rebuild_dependencies();
         }
         // Update named-range values too — they often contain sheet-qualified
         // ranges (`Sheet1!A1:B10`) that need the rename.
@@ -1040,17 +1023,20 @@ impl Workbook {
         }
         // Cross-sheet dep keys reference sheet names by string; rebuild.
         self.rebuild_cross_sheet_deps();
-        // Propagate from every cell whose formula was rewritten so any
-        // dependents that previously errored on the old name recompute.
-        // Batched per-sheet so we pay one workbook clone per sheet
-        // rather than one per touched cell.
+        // Mark every cell whose formula was rewritten so the next recalc
+        // picks up dependents that previously errored on the old name.
+        // The graph-driven recalc handles ordering and cross-sheet
+        // propagation in a single pass.
         for (sheet_idx, touched) in touched_per_sheet.iter().enumerate() {
             if touched.is_empty() {
                 continue;
             }
             let sheet_name = self.sheet_names[sheet_idx].clone();
-            self.propagate_cross_sheet_changes_batch(&sheet_name, touched);
+            for &(r, c) in touched {
+                self.dirty.insert((sheet_name.clone(), r, c));
+            }
         }
+        let _ = self.recalc_via_graph_result();
         true
     }
 
@@ -1061,11 +1047,11 @@ impl Workbook {
         self.named_ranges.insert(key.clone(), value.to_string());
         for sheet in &mut self.sheets {
             sheet.named_ranges.insert(key.clone(), value.to_string());
-            sheet.rebuild_dependencies();
         }
         // Any formula referencing the name now resolves to a (potentially
         // different) value or range; conservative dirty mark covers it.
         self.mark_all_formula_cells_dirty();
+        let _ = self.recalc_via_graph_result();
     }
 
     /// Remove a named range. Returns true if it existed.
@@ -1074,36 +1060,14 @@ impl Workbook {
         let existed = self.named_ranges.remove(&key).is_some();
         for sheet in &mut self.sheets {
             sheet.named_ranges.remove(&key);
-            sheet.rebuild_dependencies();
         }
         if existed {
             // Formulas referencing the removed name now produce errors;
             // mark them all so the next recalc picks up the change.
             self.mark_all_formula_cells_dirty();
+            let _ = self.recalc_via_graph_result();
         }
         existed
-    }
-
-    /// Run propagate_cross_sheet_changes for a single cell on the active
-    /// sheet. Assumes the caller already registered cross-sheet deps
-    /// (via `set_cell_on_active` / `clear_cell_on_active` / direct
-    /// `register_cross_sheet_deps`). Use from mutation paths that need to
-    /// fan-out value changes to dependents without re-registering.
-    ///
-    /// Re-registering here would clear and rebuild the cell's
-    /// structural_targets cache twice per write, defeating the smart
-    /// auto-seed perf win for OFFSET/INDIRECT cells.
-    pub fn propagate_active_cell(&mut self, row: usize, col: usize) {
-        let sheet_name = self.sheet_names[self.active_sheet].clone();
-        self.propagate_cross_sheet_changes(&sheet_name, row, col);
-    }
-
-    /// Fast-path predicate: do any cell formulas in the workbook contain a
-    /// sheet-qualified reference? When false, the workbook clone in the
-    /// `*_on_active` mutators can be skipped because no evaluator inside
-    /// the same-sheet recalc cascade will ever consult workbook context.
-    fn needs_workbook_context(&self) -> bool {
-        !self.cells_with_qualified_refs.is_empty()
     }
 
     /// Mark a single cell as dirty. The cell's value may be stale and must
@@ -1151,14 +1115,15 @@ impl Workbook {
         self.dirty.is_empty()
     }
 
-    /// Write a single cell on the active sheet with workbook context
-    /// published for the same-sheet recalc cascade. Use this instead of
-    /// `current_sheet_mut().set_cell(...)` when downstream cells on the same
-    /// sheet may contain cross-sheet refs that need to resolve correctly.
+    /// Write a single cell on the active sheet. Updates the unified
+    /// graph for this cell, marks dirty, and runs a single graph-driven
+    /// recalc to propagate the change to dependents. This is the only
+    /// public single-cell write API outside of `Spreadsheet::set_cell`
+    /// (which is a low-level pure write reserved for the workbook's
+    /// internals).
     pub fn set_cell_on_active(&mut self, row: usize, col: usize, data: CellData) {
-        // Suppress no-op writes so the dirty set doesn't accumulate entries
-        // for unchanged cells (PR 1's executor would otherwise re-eval
-        // them needlessly).
+        // Suppress no-op writes so the dirty set + recalc don't waste
+        // work for unchanged cells.
         let unchanged = self.sheets[self.active_sheet]
             .cells
             .get(&(row, col))
@@ -1168,54 +1133,40 @@ impl Workbook {
             return;
         }
         self.mark_dirty_active(row, col);
-        if self.needs_workbook_context() {
-            let snapshot = self.clone();
-            with_recalc_context(&snapshot, || {
-                self.sheets[self.active_sheet].set_cell(row, col, data);
-            });
-        } else {
+        // Publish workbook context so `maybe_spill` (inside set_cell)
+        // can resolve cross-sheet refs when checking if the formula
+        // produces an array. For non-formula cells this is wasted but
+        // cheap; the recalc below is the dominant cost anyway.
+        let snapshot = self.clone();
+        with_recalc_context(&snapshot, || {
             self.sheets[self.active_sheet].set_cell(row, col, data);
-        }
+        });
         // Keep the unified graph + purity cache in sync with the new
-        // formula. Without this, an interactive edit from `=A1+1` to
-        // `=INDIRECT(A1)` would leave the cell classified as Pure and
-        // miss the VolatileStructural auto-seed in recalc_via_graph.
+        // formula so the graph executor sees the cell's new shape.
         let sheet_name = self.sheet_names[self.active_sheet].clone();
         self.register_cross_sheet_deps(&sheet_name, row, col);
+        // Propagate via the unified graph. Single source of truth.
+        let _ = self.recalc_via_graph_result();
     }
 
-    /// Clear a single cell on the active sheet with workbook context
-    /// published for the same-sheet recalc cascade.
+    /// Clear a single cell on the active sheet, then propagate to
+    /// dependents via the unified graph.
     pub fn clear_cell_on_active(&mut self, row: usize, col: usize) {
-        // No-op suppression: clearing an already-absent cell shouldn't
-        // dirty the set.
         if !self.sheets[self.active_sheet].cells.contains_key(&(row, col)) {
             return;
         }
         self.mark_dirty_active(row, col);
-        if self.needs_workbook_context() {
-            let snapshot = self.clone();
-            with_recalc_context(&snapshot, || {
-                self.sheets[self.active_sheet].clear_cell(row, col);
-            });
-        } else {
-            self.sheets[self.active_sheet].clear_cell(row, col);
-        }
-        // Drop the cell's graph + purity entries; an Indirect-after-
-        // clear would otherwise auto-seed on the next recalc and try
-        // to evaluate a now-empty cell.
+        self.sheets[self.active_sheet].clear_cell(row, col);
+        // Drop the cell's graph + purity entries so it doesn't get
+        // auto-seeded into the next recalc.
         let sheet_name = self.sheet_names[self.active_sheet].clone();
         self.forget_cell_in_graph(&sheet_name, row, col);
+        let _ = self.recalc_via_graph_result();
     }
 
-    /// Write a batch of cells to the active sheet, then propagate.
-    ///
-    /// Replaces the previous "call set_many then loop calling
-    /// propagate_cell_change at every site" discipline with a single API.
-    /// This is the only mutation path that callers outside of undo/redo
-    /// should use; using `current_sheet_mut().set_cell` directly bypasses
-    /// cross-sheet propagation and is reserved for the workbook's own
-    /// internals (load paths, recalc, undo/redo apply).
+    /// Bulk write — single graph rebuild + single recalc at the end,
+    /// rather than per-cell propagation. The right path for paste,
+    /// autofill, sort, find/replace, and similar batch operations.
     pub fn write_cells_on_active(
         &mut self,
         writes: Vec<(usize, usize, CellData)>,
@@ -1229,28 +1180,19 @@ impl Workbook {
         for &(r, c) in &positions {
             self.dirty.insert((sheet_name.clone(), r, c));
         }
-        // Snapshot for cross-sheet ref resolution during this sheet's
-        // recalc cascade. Without this, formulas like `=B1 + Sheet2!A1`
-        // re-evaluated as part of the dependent recalc lose workbook
-        // context and resolve the Sheet2!A1 ref to `#REF!`. Skip when no
-        // qualified ref exists anywhere — common in single-sheet workbooks.
-        if self.needs_workbook_context() {
-            let snapshot = self.clone();
-            with_recalc_context(&snapshot, || {
-                self.sheets[self.active_sheet].set_many(writes);
-            });
-        } else {
+        // Publish workbook context so per-write `maybe_spill` calls
+        // inside `set_many` see cross-sheet refs.
+        let snapshot = self.clone();
+        with_recalc_context(&snapshot, || {
             self.sheets[self.active_sheet].set_many(writes);
-        }
-        // Cross-sheet propagation in one shot — single workbook clone +
-        // single BFS over the union closure, rather than N per-cell
-        // clones (which was O(N × workbook_size)).
+        });
+        // Update the unified graph for every written position, then
+        // run a single recalc over the union of their dependents.
         self.register_cross_sheet_deps_batch(&sheet_name, &positions);
-        self.propagate_cross_sheet_changes_batch(&sheet_name, &positions);
+        let _ = self.recalc_via_graph_result();
     }
 
-    /// Clear a batch of cells on the active sheet, then propagate.
-    /// Symmetric counterpart to `write_cells_on_active`.
+    /// Bulk clear — symmetric to `write_cells_on_active`.
     pub fn clear_cells_on_active(&mut self, positions: Vec<(usize, usize)>) {
         if positions.is_empty() {
             return;
@@ -1259,20 +1201,12 @@ impl Workbook {
         for &(r, c) in &positions {
             self.dirty.insert((sheet_name.clone(), r, c));
         }
-        // Bulk clear via clear_many — one topological cascade for the
-        // entire union of dependents rather than N per-cell cascades.
-        if self.needs_workbook_context() {
-            let snapshot = self.clone();
-            with_recalc_context(&snapshot, || {
-                self.sheets[self.active_sheet].clear_many(positions.clone());
-            });
-        } else {
-            self.sheets[self.active_sheet].clear_many(positions.clone());
+        self.sheets[self.active_sheet].clear_many(positions.clone());
+        // Drop each cleared cell's graph/purity entries.
+        for &(r, c) in &positions {
+            self.forget_cell_in_graph(&sheet_name, r, c);
         }
-        // Cross-sheet propagation: one batch call for the whole set
-        // rather than N per-cell BFS + workbook clones.
-        self.register_cross_sheet_deps_batch(&sheet_name, &positions);
-        self.propagate_cross_sheet_changes_batch(&sheet_name, &positions);
+        let _ = self.recalc_via_graph_result();
     }
 
     /// Creates a Workbook from a single Spreadsheet (for backward compatibility).
@@ -1283,9 +1217,6 @@ impl Workbook {
             sheet_names: vec!["Sheet1".to_string()],
             active_sheet: 0,
             named_ranges: HashMap::new(),
-            cross_sheet_dependents: HashMap::new(),
-            cross_sheet_dependencies: HashMap::new(),
-            cells_with_qualified_refs: HashSet::new(),
             dirty: HashSet::new(),
             sheet_ids: vec![SheetId(0)],
             next_sheet_id: 1,
@@ -1295,39 +1226,19 @@ impl Workbook {
         }
     }
 
-    /// Re-register the cross-sheet dependencies for the cell at
-    /// `(sheet_name, row, col)`. Called after every cell write. Removes
-    /// stale entries from the old formula and inserts new ones from the
-    /// current one.
+    /// Refresh the unified graph + purity classification for the cell at
+    /// `(sheet_name, row, col)`. Called after every cell write. If the
+    /// cell no longer has a formula, drops its outgoing graph edges,
+    /// cached purity, and dynamic-target entries so it doesn't haunt the
+    /// auto-seed loop. Sheet-name lookup is case-insensitive.
     pub fn register_cross_sheet_deps(&mut self, sheet_name: &str, row: usize, col: usize) {
-        use crate::domain::services::FormulaEvaluator;
         let key: CrossSheetKey = (sheet_name.to_string(), row, col);
-
-        // Step 1: clear old reverse links.
-        if let Some(old_precs) = self.cross_sheet_dependencies.remove(&key) {
-            for p in old_precs {
-                if let Some(set) = self.cross_sheet_dependents.get_mut(&p) {
-                    set.remove(&key);
-                    if set.is_empty() {
-                        self.cross_sheet_dependents.remove(&p);
-                    }
-                }
-            }
-        }
-        // Clear the qualified-ref membership; re-added in Step 4 if the
-        // current formula still has any qualified refs.
-        self.cells_with_qualified_refs.remove(&key);
-
-        // Step 2: pull the current formula. Sheet names are case-insensitive
-        // (Excel convention); using `==` here silently dropped cross-sheet
-        // dep registration when callers passed a different casing.
-        let sheet_idx = match self
+        let Some(sheet_idx) = self
             .sheet_names
             .iter()
             .position(|n| n.eq_ignore_ascii_case(sheet_name))
-        {
-            Some(i) => i,
-            None => return,
+        else {
+            return;
         };
         let formula = match self.sheets[sheet_idx]
             .cells
@@ -1336,12 +1247,7 @@ impl Workbook {
         {
             Some(f) => f,
             None => {
-                // Formula → literal (or cell cleared). Drop unified-graph
-                // outgoing edges, cached purity, and recorded dynamic
-                // targets so they don't pin the auto-seed loop on a node
-                // whose formula no longer exists. Step 1 already cleared
-                // cross_sheet_dependencies; this completes the cleanup
-                // on the unified-graph side.
+                // No formula at this position — drop all derived state.
                 if let Some(node) = self.cross_sheet_key_to_node(&key) {
                     self.graph.unlink_node(node);
                     self.cell_purities.remove(&node);
@@ -1350,60 +1256,7 @@ impl Workbook {
                 return;
             }
         };
-
-        // Step 3: extract qualified refs from the formula. Use a snapshot
-        // so the evaluator can borrow the workbook immutably.
-        let qualified_refs: Vec<(Option<String>, usize, usize)> = {
-            let names = self.named_ranges.clone();
-            let evaluator = FormulaEvaluator::for_workbook(
-                self,
-                &self.sheets[sheet_idx],
-                &names,
-            );
-            evaluator.extract_qualified_refs(&formula)
-        };
-
-        // Track "this cell has at least one qualified ref" (cross OR self-
-        // qualified). Used by the fast path in `*_on_active` to skip the
-        // workbook clone when no formula in the book uses a qualified ref.
-        if qualified_refs.iter().any(|(s, _, _)| s.is_some()) {
-            self.cells_with_qualified_refs.insert(key.clone());
-        }
-
-        // Step 4: register the cross-sheet ones (skip refs back to the same
-        // sheet — those already live in the per-sheet dep graph).
-        for (ref_sheet, ref_row, ref_col) in qualified_refs {
-            // Skip if no explicit sheet or if it points to the same sheet.
-            let resolved_sheet = match ref_sheet {
-                Some(s) if !s.eq_ignore_ascii_case(sheet_name) => s,
-                _ => continue,
-            };
-            // Normalize to the canonical sheet-name casing in `sheet_names`.
-            let canon = self
-                .sheet_names
-                .iter()
-                .find(|n| n.eq_ignore_ascii_case(&resolved_sheet))
-                .cloned()
-                .unwrap_or(resolved_sheet);
-            let prec: CrossSheetKey = (canon, ref_row, ref_col);
-            self.cross_sheet_dependencies
-                .entry(key.clone())
-                .or_default()
-                .insert(prec.clone());
-            self.cross_sheet_dependents
-                .entry(prec)
-                .or_default()
-                .insert(key.clone());
-        }
-
-        // Step 5: keep the unified workbook graph and per-cell purity
-        // cache consistent with the formula change. Without this,
-        // graph-driven recalc walks a stale graph after any
-        // interactive edit. The legacy cross_sheet_* maps above only
-        // cover cross-sheet edges; the unified graph covers both
-        // same-sheet AND cross-sheet, and `cell_purities` is the
-        // engine's only signal that this cell is volatile.
-        self.update_unified_graph_and_purity(sheet_idx, key.clone(), &formula);
+        self.update_unified_graph_and_purity(sheet_idx, key, &formula);
     }
 
     /// Re-derive the unified graph edges + purity classification for a
@@ -1537,226 +1390,11 @@ impl Workbook {
         }
     }
 
-    /// Batch variant of `propagate_cross_sheet_changes`. Clones the
-    /// workbook ONCE and walks a single BFS over the union of seed
-    /// cells. The per-cell variant clones per call — O(N × workbook_size)
-    /// for an N-cell batch. The batch version is O(workbook_size +
-    /// closure_size).
-    pub fn propagate_cross_sheet_changes_batch(
-        &mut self,
-        sheet_name: &str,
-        seeds: &[(usize, usize)],
-    ) {
-        use crate::domain::services::FormulaEvaluator;
-        if seeds.is_empty() {
-            return;
-        }
-
-        // Quick gate: skip the clone if none of the seed cells have any
-        // cross-sheet dependents. The single-cell path had the same
-        // optimization; here we widen it to "any seed has deps".
-        let has_any_deps = seeds.iter().any(|&(r, c)| {
-            self.cross_sheet_dependents
-                .get(&(sheet_name.to_string(), r, c))
-                .is_some_and(|s| !s.is_empty())
-        });
-        if !has_any_deps {
-            return;
-        }
-
-        let mut queue: std::collections::VecDeque<CrossSheetKey> =
-            std::collections::VecDeque::new();
-        let mut visited: HashSet<CrossSheetKey> = HashSet::new();
-        for &(r, c) in seeds {
-            queue.push_back((sheet_name.to_string(), r, c));
-        }
-
-        let mut snapshot = self.clone();
-        let names = snapshot.named_ranges.clone();
-
-        while let Some(key) = queue.pop_front() {
-            if !visited.insert(key.clone()) {
-                continue;
-            }
-            let deps: Vec<CrossSheetKey> = self
-                .cross_sheet_dependents
-                .get(&key)
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .collect();
-            if deps.is_empty() {
-                continue;
-            }
-            for dep in deps {
-                let (dep_sheet, dep_row, dep_col) = dep.clone();
-                let Some(dep_idx) = snapshot
-                    .sheet_names
-                    .iter()
-                    .position(|n| n.eq_ignore_ascii_case(&dep_sheet))
-                else {
-                    continue;
-                };
-                let new_value = {
-                    let snap_sheet = &snapshot.sheets[dep_idx];
-                    let Some(cd) = snap_sheet.cells.get(&(dep_row, dep_col)) else {
-                        continue;
-                    };
-                    let Some(formula) = cd.formula.clone() else {
-                        continue;
-                    };
-                    let evaluator =
-                        FormulaEvaluator::for_workbook(&snapshot, snap_sheet, &names);
-                    evaluator.evaluate_formula(&formula)
-                };
-                if let Some(snap_cd) = snapshot.sheets[dep_idx]
-                    .cells
-                    .get_mut(&(dep_row, dep_col))
-                {
-                    snap_cd.value = new_value.clone();
-                }
-                let dep_real_idx = self
-                    .sheet_names
-                    .iter()
-                    .position(|n| n.eq_ignore_ascii_case(&dep_sheet));
-                if let Some(idx) = dep_real_idx {
-                    let value_actually_changed = self.sheets[idx]
-                        .cells
-                        .get_mut(&(dep_row, dep_col))
-                        .map(|real_cd| {
-                            if real_cd.value != new_value {
-                                real_cd.value = new_value.clone();
-                                true
-                            } else {
-                                false
-                            }
-                        })
-                        .unwrap_or(false);
-                    if value_actually_changed {
-                        // Same-sheet cascade on the destination sheet
-                        // (same logic as the single-cell propagator).
-                        with_recalc_context(&snapshot, || {
-                            self.sheets[idx].recalculate_dependents(dep_row, dep_col);
-                        });
-                        snapshot.sheets[idx] = self.sheets[idx].clone();
-                        queue.push_back(dep);
-                    }
-                }
-            }
-        }
-    }
-
-    /// Recalculate every cell that depends on `(sheet_name, row, col)` via
-    /// the cross-sheet graph. Walks transitively (BFS) so chains like
-    /// Sheet1!A1 → Sheet2!A1 → Sheet3!A1 all update.
-    pub fn propagate_cross_sheet_changes(
-        &mut self,
-        sheet_name: &str,
-        row: usize,
-        col: usize,
-    ) {
-        use crate::domain::services::FormulaEvaluator;
-        let mut queue: std::collections::VecDeque<CrossSheetKey> =
-            std::collections::VecDeque::new();
-        queue.push_back((sheet_name.to_string(), row, col));
-        let mut visited: HashSet<CrossSheetKey> = HashSet::new();
-
-        // Check up front whether any dep edges exist — common case has none,
-        // and we want to skip the expensive workbook clone in that case.
-        let has_any_deps = self
-            .cross_sheet_dependents
-            .get(&(sheet_name.to_string(), row, col))
-            .is_some_and(|s| !s.is_empty());
-        if !has_any_deps {
-            return;
-        }
-
-        // One snapshot for the whole BFS, mutated in-place as we compute new
-        // values so chained refs (Sheet1!A1 → Sheet2!A1 → Sheet3!A1) see the
-        // freshly-recomputed upstream values on later layers.
-        let mut snapshot = self.clone();
-        let names = snapshot.named_ranges.clone();
-
-        while let Some(key) = queue.pop_front() {
-            if !visited.insert(key.clone()) {
-                continue;
-            }
-            let deps: Vec<CrossSheetKey> = self
-                .cross_sheet_dependents
-                .get(&key)
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .collect();
-            if deps.is_empty() {
-                continue;
-            }
-            for dep in deps {
-                let (dep_sheet, dep_row, dep_col) = dep.clone();
-                let Some(dep_idx) = snapshot
-                    .sheet_names
-                    .iter()
-                    .position(|n| n.eq_ignore_ascii_case(&dep_sheet))
-                else {
-                    continue;
-                };
-                let new_value = {
-                    let snap_sheet = &snapshot.sheets[dep_idx];
-                    let Some(cd) = snap_sheet.cells.get(&(dep_row, dep_col)) else {
-                        continue;
-                    };
-                    let Some(formula) = cd.formula.clone() else { continue };
-                    let evaluator =
-                        FormulaEvaluator::for_workbook(&snapshot, snap_sheet, &names);
-                    evaluator.evaluate_formula(&formula)
-                };
-                // Update the snapshot first so downstream layers see it.
-                if let Some(snap_cd) = snapshot.sheets[dep_idx]
-                    .cells
-                    .get_mut(&(dep_row, dep_col))
-                {
-                    snap_cd.value = new_value.clone();
-                }
-                // Write to the real workbook.
-                let dep_real_idx = self
-                    .sheet_names
-                    .iter()
-                    .position(|n| n.eq_ignore_ascii_case(&dep_sheet));
-                if let Some(idx) = dep_real_idx {
-                    let value_actually_changed = self.sheets[idx]
-                        .cells
-                        .get_mut(&(dep_row, dep_col))
-                        .map(|real_cd| {
-                            if real_cd.value != new_value {
-                                real_cd.value = new_value.clone();
-                                true
-                            } else {
-                                false
-                            }
-                        })
-                        .unwrap_or(false);
-                    if value_actually_changed {
-                        // Same-sheet cascade: dependents on the destination
-                        // sheet that referenced the cell we just wrote need
-                        // to recompute too. The previous version skipped
-                        // this — Sheet1!A1 → Sheet2!A1 → Sheet2!B1 left B1
-                        // stale because the cross-sheet engine only walked
-                        // cross-sheet edges. Publishing `snapshot` as the
-                        // workbook context lets the evaluator inside the
-                        // cascade resolve any further cross-sheet refs.
-                        with_recalc_context(&snapshot, || {
-                            self.sheets[idx].recalculate_dependents(dep_row, dep_col);
-                        });
-                        // Refresh the snapshot's view of this sheet so a
-                        // later layer of the cross-sheet BFS sees the
-                        // newly-cascaded same-sheet values.
-                        snapshot.sheets[idx] = self.sheets[idx].clone();
-                        queue.push_back(dep);
-                    }
-                }
-            }
-        }
-    }
+    // `propagate_cross_sheet_changes` + `propagate_cross_sheet_changes_batch`
+    // were deleted along with the legacy cross-sheet maps. The unified
+    // `recalc_via_graph_result()` does both same-sheet and cross-sheet
+    // propagation through one graph executor, so callers just mark dirty
+    // and recalc.
 
     /// Check whether adding a new formula at `(sheet_name, row, col)` with
     /// the given precedents would create a cross-sheet cycle. Walks the
@@ -1770,11 +1408,23 @@ impl Workbook {
         col: usize,
         candidate_precedents: &[(Option<String>, usize, usize)],
     ) -> bool {
-        let target: CrossSheetKey = (sheet_name.to_string(), row, col);
-        let mut stack: Vec<CrossSheetKey> = Vec::new();
+        // Map the target cell to a NodeKey. If we don't have one yet
+        // (sheet doesn't exist, etc.), there's nothing to cycle into.
+        let target_key: CrossSheetKey = (sheet_name.to_string(), row, col);
+        let Some(target_node) = self.cross_sheet_key_to_node(&target_key) else {
+            return false;
+        };
+        // Walk down the unified graph from the target — `transitive_dependents`
+        // gives us every node that already reads the target transitively.
+        // If any candidate precedent is in that set, then target → ... →
+        // candidate in the existing graph; adding the new edge
+        // candidate → target would close the loop.
+        let mut seed = HashSet::new();
+        seed.insert(target_node);
+        let downstream = self.graph.transitive_dependents(&seed);
         for (prec_sheet, prec_row, prec_col) in candidate_precedents {
-            // Only consider cross-sheet precedents (same-sheet cycles are
-            // caught by the existing AST walker).
+            // Only cross-sheet candidates need this walker — same-sheet
+            // cycles are caught by `FormulaEvaluator::would_create_circular_reference`.
             let Some(ps) = prec_sheet else { continue };
             if ps.eq_ignore_ascii_case(sheet_name) {
                 continue;
@@ -1785,45 +1435,23 @@ impl Workbook {
                 .find(|n| n.eq_ignore_ascii_case(ps))
                 .cloned()
                 .unwrap_or_else(|| ps.clone());
-            stack.push((canon, *prec_row, *prec_col));
-        }
-        let mut visited: HashSet<CrossSheetKey> = HashSet::new();
-        while let Some(node) = stack.pop() {
-            if node == target {
+            let prec_key: CrossSheetKey = (canon, *prec_row, *prec_col);
+            if let Some(prec_node) = self.cross_sheet_key_to_node(&prec_key)
+                && downstream.contains(&prec_node)
+            {
                 return true;
-            }
-            if !visited.insert(node.clone()) {
-                continue;
-            }
-            // Also walk down: the cells that *node* in turn depends on.
-            if let Some(deps) = self.cross_sheet_dependencies.get(&node) {
-                for d in deps {
-                    stack.push(d.clone());
-                }
             }
         }
         false
     }
 
-    /// Rebuild the cross-sheet dep graph from scratch by scanning every
-    /// formula in every sheet. Called after load (since the graph isn't
-    /// serialized) and as a fallback when state drifts.
+    /// Rebuild the unified dep graph from scratch by scanning every
+    /// formula in every sheet. Called after load (the graph isn't
+    /// serialized), after structural edits (row/col insert/delete shifts
+    /// NodeKeys that the per-cell `register_cross_sheet_deps` can't
+    /// touch since cells.iter() only sees CURRENT positions), and as
+    /// a fallback when state drifts.
     pub fn rebuild_cross_sheet_deps(&mut self) {
-        self.cross_sheet_dependents.clear();
-        self.cross_sheet_dependencies.clear();
-        // Entries from since-deleted formula cells (or formula→value
-        // transitions before the per-cell cleanup landed) would otherwise
-        // make needs_workbook_context() falsely true, forcing unnecessary
-        // workbook clones in the *_on_active fast path.
-        self.cells_with_qualified_refs.clear();
-        // Wipe unified-graph state too. The per-cell `register_cross_sheet_deps`
-        // below will repopulate from cells.iter(), but it only refreshes
-        // entries for CURRENT (sheet_id, row, col) positions. Stale entries
-        // from positions whose cells were shifted by a structural edit
-        // (row/col insert/delete) would otherwise leak indefinitely —
-        // their NodeKeys are unreachable from cells.iter() so per-cell
-        // registration can't touch them, but `recalc_via_graph` would still
-        // walk them via cell_purities/structural_targets.
         self.graph.clear();
         self.cell_purities.clear();
         self.structural_targets.clear();

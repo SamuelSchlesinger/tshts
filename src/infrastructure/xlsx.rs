@@ -61,9 +61,6 @@ pub fn load_xlsx(path: &str) -> Result<Workbook, String> {
         sheet_names: sheet_names.clone(),
         active_sheet: 0,
         named_ranges: std::collections::HashMap::new(),
-        cross_sheet_dependents: std::collections::HashMap::new(),
-        cross_sheet_dependencies: std::collections::HashMap::new(),
-        cells_with_qualified_refs: std::collections::HashSet::new(),
         dirty: std::collections::HashSet::new(),
         sheet_ids: (0..sheet_count).map(crate::domain::models::SheetId).collect(),
         next_sheet_id: sheet_count,
@@ -148,7 +145,6 @@ pub fn load_xlsx(path: &str) -> Result<Workbook, String> {
             };
             sheet.cells.insert((abs_r, abs_c), cd);
         }
-        sheet.rebuild_dependencies();
         out.sheets.push(sheet);
     }
     // Named ranges (definedNames). Calamine exposes them via `defined_names()`.
