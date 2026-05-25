@@ -23,7 +23,7 @@ reqwest = { version = "0.12", features = ["blocking"] }
 arboard = "3"
 unicode-width = "0.2"
 regex = "1"
-calamine = "0.24"
+calamine = "0.35"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 # SIGTERM / SIGHUP handler — flips an AtomicBool the main loop polls so we
 # can flush the autosave worker before exit instead of letting logout/
