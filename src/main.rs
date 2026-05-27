@@ -129,7 +129,15 @@ fn run_app<B: Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
     terminate: Arc<AtomicBool>,
-) -> io::Result<()> {
+) -> io::Result<()>
+where
+    // ratatui 0.30 made `Terminal::draw` return `Result<_, B::Error>`
+    // (the backend's associated error) instead of always `io::Error`.
+    // We only ever drive this with `CrosstermBackend`, whose `Error`
+    // *is* `io::Error`, so this bound is trivially satisfied — it just
+    // lets the `?` on `terminal.draw(...)` convert cleanly.
+    io::Error: From<B::Error>,
+{
     let mut last_fetch_count = fetcher::completion_count();
     loop {
         // External shutdown signal — break out cleanly. The main fn will

@@ -221,7 +221,7 @@ impl Harness {
         let mut s = String::new();
         for col in 0..COLS {
             if let Some(cell) = p.screen().cell(row, col) {
-                s.push_str(&cell.contents());
+                s.push_str(cell.contents());
             }
         }
         s
