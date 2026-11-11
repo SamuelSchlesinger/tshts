@@ -74,18 +74,15 @@ impl App {
         if let Some(rest) = trimmed.strip_prefix("w ").or_else(|| trimmed.strip_prefix("W ")) {
             let name = rest.trim().to_string();
             if !name.is_empty() {
-                let is_xlsx = name.to_lowercase().ends_with(".xlsx");
                 // See save_in_place_or_prompt: xlsx doesn't round-trip
                 // App-only view state, so skip the snapshot for that target.
-                if !is_xlsx {
+                if !crate::infrastructure::is_xlsx_path(&name) {
                     self.snapshot_view_state_to_active_sheet();
                 }
-                let result = if is_xlsx {
-                    crate::infrastructure::xlsx::save_xlsx(&self.workbook, &name)
-                        .map(|_| name.clone())
-                } else {
-                    crate::infrastructure::FileRepository::save_workbook(&self.workbook, &name)
-                };
+                let result = crate::infrastructure::FileRepository::save_workbook_auto(
+                    &self.workbook,
+                    &name,
+                );
                 self.set_save_result(result);
             } else {
                 self.status_message = Some("Usage: w <filename>".to_string());
@@ -105,7 +102,7 @@ impl App {
             // with the currently-open file's name (or the "spreadsheet.tshts"
             // default), defeating the purpose. Vim's `:e` is also a direct
             // load; users who want a dirty-guard can save first.
-            let result = if name.to_lowercase().ends_with(".xlsx") {
+            let result = if crate::infrastructure::is_xlsx_path(&name) {
                 crate::infrastructure::xlsx::load_xlsx(&name)
                     .map(|wb| (wb, name.clone()))
             } else {

@@ -4,6 +4,14 @@ use crate::domain::{Spreadsheet, Workbook};
 use crate::infrastructure::atomic::atomic_write;
 use std::fs;
 
+/// True when `path` names an `.xlsx` file (case-insensitive).
+///
+/// The one predicate every format-dispatching save/load site shares, so a
+/// new call site can't disagree about what counts as xlsx.
+pub fn is_xlsx_path(path: &str) -> bool {
+    path.to_lowercase().ends_with(".xlsx")
+}
+
 pub struct FileRepository;
 
 impl FileRepository {
@@ -39,6 +47,27 @@ impl FileRepository {
         }
     }
 
+    /// Save `workbook` to `filename`, choosing the on-disk format from the
+    /// file extension: `.xlsx` goes through the xlsx exporter, anything
+    /// else is written as native `.tshts` JSON.
+    ///
+    /// Every save path must route through this (or branch on
+    /// [`is_xlsx_path`] itself). `save_workbook` writes JSON
+    /// unconditionally, so handing it an `.xlsx` filename replaces the
+    /// user's spreadsheet with JSON that no xlsx reader can open — the
+    /// file looks corrupt even though the bytes are a valid workbook.
+    pub fn save_workbook_auto(workbook: &Workbook, filename: &str) -> Result<String, String> {
+        if is_xlsx_path(filename) {
+            crate::infrastructure::xlsx::save_xlsx(workbook, filename)
+                .map(|_| filename.to_string())
+        } else {
+            Self::save_workbook(workbook, filename)
+        }
+    }
+
+    /// Write the workbook as native `.tshts` JSON regardless of the
+    /// filename's extension. Prefer [`save_workbook_auto`] unless the
+    /// caller has already established the target is not an `.xlsx`.
     pub fn save_workbook(workbook: &Workbook, filename: &str) -> Result<String, String> {
         match serde_json::to_string_pretty(workbook) {
             Ok(json) => {
@@ -450,5 +479,84 @@ mod tests {
         assert_eq!(loaded.sheets.len(), 1);
         assert_eq!(loaded.sheet_names[0], "Sheet1");
         assert_eq!(loaded.sheets[0].get_cell(0, 0).value, "Legacy");
+    }
+}
+#[cfg(test)]
+mod format_dispatch_tests {
+    use super::*;
+    use crate::domain::CellData;
+    use crate::infrastructure::xlsx::load_xlsx;
+
+    fn cell(value: &str) -> CellData {
+        CellData {
+            value: value.to_string(),
+            formula: None,
+            format: None,
+            comment: None,
+            spill_anchor: None,
+        }
+    }
+
+    fn workbook_with(value: &str) -> Workbook {
+        let mut wb = Workbook::default();
+        wb.current_sheet_mut().set_cell(0, 0, cell(value));
+        wb
+    }
+
+    #[test]
+    fn is_xlsx_path_is_case_insensitive() {
+        assert!(is_xlsx_path("book.xlsx"));
+        assert!(is_xlsx_path("BOOK.XLSX"));
+        assert!(is_xlsx_path("Mixed.XlSx"));
+        assert!(!is_xlsx_path("book.tshts"));
+        assert!(!is_xlsx_path("xlsx"));
+        assert!(!is_xlsx_path("book.xlsx.bak"));
+    }
+
+    /// Regression: saving to an `.xlsx` target must produce a real xlsx
+    /// package, not `.tshts` JSON. Writing JSON under an `.xlsx` name
+    /// destroyed the user's file — every xlsx reader rejected it.
+    #[test]
+    fn save_workbook_auto_writes_a_real_xlsx_package() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("book.xlsx");
+        let path_str = path.to_str().unwrap();
+
+        FileRepository::save_workbook_auto(&workbook_with("hello"), path_str).unwrap();
+
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(
+            &bytes[..2],
+            b"PK",
+            "expected a zip (xlsx) package, got: {:?}",
+            String::from_utf8_lossy(&bytes[..bytes.len().min(40)])
+        );
+        assert!(
+            !bytes.starts_with(b"{"),
+            "wrote .tshts JSON to an .xlsx path"
+        );
+
+        // And it must read back through the xlsx importer.
+        let loaded = load_xlsx(path_str).unwrap();
+        assert_eq!(loaded.current_sheet().get_cell(0, 0).value, "hello");
+    }
+
+    #[test]
+    fn save_workbook_auto_honors_uppercase_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("BOOK.XLSX");
+        FileRepository::save_workbook_auto(&workbook_with("hi"), path.to_str().unwrap()).unwrap();
+        assert_eq!(&fs::read(&path).unwrap()[..2], b"PK");
+    }
+
+    #[test]
+    fn save_workbook_auto_writes_json_for_native_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("book.tshts");
+        FileRepository::save_workbook_auto(&workbook_with("hello"), path.to_str().unwrap()).unwrap();
+
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.trim_start().starts_with('{'), "expected JSON");
+        assert!(text.contains("\"version\""));
     }
 }

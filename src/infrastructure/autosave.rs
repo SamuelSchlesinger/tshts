@@ -56,7 +56,11 @@ fn inner() -> &'static Inner {
                 while let Ok(next) = rx.try_recv() {
                     latest = next;
                 }
-                let status = match FileRepository::save_workbook(&latest.workbook, &latest.filename) {
+                // Dispatch on extension: an open .xlsx must be auto-saved
+                // through the xlsx exporter. Writing native JSON to an
+                // .xlsx path leaves the user with a file no spreadsheet
+                // application can open.
+                let status = match FileRepository::save_workbook_auto(&latest.workbook, &latest.filename) {
                     Ok(_) => Status {
                         message: format!("Auto-saved {}", latest.filename),
                         is_error: false,
@@ -164,6 +168,9 @@ pub fn is_in_flight() -> bool {
 /// Force-queue a snapshot, bypassing the IDLE debounce and enabled gate.
 /// Called from the shutdown path so a Ctrl+C / SIGTERM with dirty state
 /// doesn't drop the user's last edits. Returns true if a save was queued.
+///
+/// The worker saves in the format implied by `filename`'s extension, so
+/// flushing an open `.xlsx` writes xlsx, not `.tshts` JSON.
 pub fn flush_now(workbook: &Workbook, filename: Option<&str>) -> bool {
     let i = inner();
     let Some(filename) = filename else { return false; };
@@ -188,5 +195,51 @@ pub fn wait_until_idle(timeout: std::time::Duration) {
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::CellData;
+
+    /// Regression for the reported corruption: with an `.xlsx` open, a
+    /// force-close (SIGTERM / Ctrl+C) flushes through this worker. It used
+    /// to call `save_workbook` unconditionally, overwriting the user's
+    /// spreadsheet with `.tshts` JSON — the file then failed to open in
+    /// every xlsx reader, including file-manager previews.
+    #[test]
+    fn flush_now_writes_xlsx_for_an_xlsx_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sheet.xlsx");
+        let path_str = path.to_str().unwrap().to_string();
+
+        let mut wb = Workbook::default();
+        wb.current_sheet_mut().set_cell(
+            0,
+            0,
+            CellData {
+                value: "BOM".to_string(),
+                formula: None,
+                format: None,
+                comment: None,
+                spill_anchor: None,
+            },
+        );
+
+        assert!(flush_now(&wb, Some(&path_str)));
+        wait_until_idle(Duration::from_secs(5));
+
+        let bytes = std::fs::read(&path).expect("autosave wrote no file");
+        assert_eq!(
+            &bytes[..2],
+            b"PK",
+            "autosave wrote non-xlsx bytes to an .xlsx path: {:?}",
+            String::from_utf8_lossy(&bytes[..bytes.len().min(40)])
+        );
+
+        let loaded = crate::infrastructure::xlsx::load_xlsx(&path_str)
+            .expect("autosaved .xlsx must be readable by the xlsx importer");
+        assert_eq!(loaded.current_sheet().get_cell(0, 0).value, "BOM");
     }
 }

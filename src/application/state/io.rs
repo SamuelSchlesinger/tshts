@@ -5,21 +5,18 @@ use super::*;
 impl App {
     pub fn save_in_place_or_prompt(&mut self) {
         if let Some(filename) = self.filename.clone() {
-            let is_xlsx = filename.to_lowercase().ends_with(".xlsx");
             // Only snapshot view state (freezes, hidden ranges, filter,
             // validations) when the file format will actually round-trip
             // it. Doing it unconditionally before an .xlsx save mutates
             // the in-memory workbook with state that xlsx then drops on
             // load — a silently lossy save.
-            if !is_xlsx {
+            if !crate::infrastructure::is_xlsx_path(&filename) {
                 self.snapshot_view_state_to_active_sheet();
             }
-            let result = if is_xlsx {
-                crate::infrastructure::xlsx::save_xlsx(&self.workbook, &filename)
-                    .map(|_| filename.clone())
-            } else {
-                crate::infrastructure::FileRepository::save_workbook(&self.workbook, &filename)
-            };
+            let result = crate::infrastructure::FileRepository::save_workbook_auto(
+                &self.workbook,
+                &filename,
+            );
             self.set_save_result(result);
         } else {
             self.start_save_as();

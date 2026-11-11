@@ -65,8 +65,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Optional file argument. Auto-detects `.xlsx` vs `.tshts` by extension.
     if let Some(path) = std::env::args().nth(1) {
-        let lower = path.to_lowercase();
-        let result = if lower.ends_with(".xlsx") {
+        let result = if infrastructure::is_xlsx_path(&path) {
             infrastructure::xlsx::load_xlsx(&path).map(|wb| (wb, path.clone()))
         } else {
             FileRepository::load_workbook(&path)

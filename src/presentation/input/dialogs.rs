@@ -131,13 +131,13 @@ impl InputHandler {
                 match mode {
                     "save" => {
                         let filename = app.get_save_filename();
-                        app.snapshot_view_state_to_active_sheet();
-                        let result = if filename.to_lowercase().ends_with(".xlsx") {
-                            crate::infrastructure::xlsx::save_xlsx(&app.workbook, &filename)
-                                .map(|_| filename.clone())
-                        } else {
-                            FileRepository::save_workbook(&app.workbook, &filename)
-                        };
+                        // Same view-state gate as save_in_place_or_prompt:
+                        // snapshotting before an xlsx save mutates the
+                        // workbook with state xlsx drops on load.
+                        if !crate::infrastructure::is_xlsx_path(&filename) {
+                            app.snapshot_view_state_to_active_sheet();
+                        }
+                        let result = FileRepository::save_workbook_auto(&app.workbook, &filename);
                         app.set_save_result(result);
                     }
                     "load" => {
