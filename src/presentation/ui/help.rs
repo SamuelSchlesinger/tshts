@@ -261,11 +261,12 @@ Mixed Type Examples:
 === SEARCH FUNCTIONALITY ===
 /               Start text search across all cells
                 Search is case-insensitive and searches both cell values and formulas
-                Live search: results update as you type
+                Live search: jumps to the first match after the cursor as you type
+                (wrapping at the end of the sheet); no match returns to the start
                 ↑↓          Navigate through search results while searching
-                Enter       Finish search and return to normal mode
-                Esc         Cancel search and return to normal mode
-                n/N         Navigate search results in normal mode (after search)
+                Enter       Finish search, staying on the current match
+                Esc         Cancel search, restoring the cursor and view
+                n/N         Next / previous match from the cursor (after search)
 
 === FILE OPERATIONS ===
 Ctrl+S          Save in place (or Save As if file is new)

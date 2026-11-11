@@ -275,10 +275,12 @@ fn test_viewport_and_scrolling() {
     assert_eq!(app.viewport_rows, 20);
     assert_eq!(app.viewport_cols, 8);
     
-    // Test updating viewport size
-    app.update_viewport_size(15, 10);
+    // Test updating viewport size: 10 default-width (8) columns, each
+    // costing width + 1 spacing = 90 cells.
+    app.update_viewport_size(15, 10, 90);
     assert_eq!(app.viewport_rows, 15);
     assert_eq!(app.viewport_cols, 10);
+    assert_eq!(app.viewport_width, 90);
     
     // Test ensure_cursor_visible - cursor within viewport
     app.selected_row = 5;
@@ -302,6 +304,103 @@ fn test_viewport_and_scrolling() {
     app.ensure_cursor_visible();
     assert_eq!(app.scroll_row, 2);  // Scroll to show cursor
     assert_eq!(app.scroll_col, 1);
+}
+
+#[test]
+fn test_vertical_scroll_minimal_when_near_centered_when_far() {
+    // Vim's update_topline(): just past an edge scrolls the minimum; a long
+    // jump centers the cursor. 21 usable rows (the 30-row PTY harness).
+    let mut app = App::default();
+    app.update_viewport_size(21, 10, 90);
+
+    // Below: up to a full screen past the bottom edge -> minimal scroll.
+    app.selected_row = 42; // 21 rows past the first hidden row (21)
+    app.ensure_cursor_visible();
+    assert_eq!(app.scroll_row, 22, "cursor lands on the bottom row");
+
+    // More than a full screen past the bottom -> centered.
+    app.scroll_row = 0;
+    app.selected_row = 43;
+    app.ensure_cursor_visible();
+    assert_eq!(app.scroll_row, 33, "10 rows above, cursor, 10 below");
+
+    // Above: less than ~half a screen above the top -> minimal.
+    app.scroll_row = 60;
+    app.selected_row = 52; // 8 above; half_height = 21/2 - 1 = 9
+    app.ensure_cursor_visible();
+    assert_eq!(app.scroll_row, 52, "cursor lands on the top row");
+
+    // Half a screen or more above -> centered.
+    app.scroll_row = 60;
+    app.selected_row = 51;
+    app.ensure_cursor_visible();
+    assert_eq!(app.scroll_row, 41);
+}
+
+#[test]
+fn test_vertical_center_clamps_to_last_row_and_frozen_rows() {
+    let mut app = App::default();
+    app.update_viewport_size(21, 10, 90);
+    let rows = app.workbook.current_sheet().rows;
+
+    // Far jump to the last row: last row sits at the bottom (like `G` in
+    // Vim), never centered over empty space past the sheet's end.
+    app.selected_row = rows - 1;
+    app.ensure_cursor_visible();
+    assert_eq!(app.scroll_row, rows - 21);
+
+    // Far jump back to the top: can't center above row 0.
+    app.selected_row = 3;
+    app.ensure_cursor_visible();
+    assert_eq!(app.scroll_row, 0);
+
+    // Frozen rows shrink the body (19 usable) and are never scrolled into.
+    app.frozen_rows = 2;
+    app.selected_row = 60;
+    app.ensure_cursor_visible();
+    assert_eq!(app.scroll_row, 51, "9 body rows above, cursor, 9 below");
+    app.selected_row = 4;
+    app.ensure_cursor_visible();
+    assert_eq!(app.scroll_row, 2, "body starts right under the frozen rows");
+}
+
+#[test]
+fn test_horizontal_scroll_accounts_for_column_widths() {
+    // A long jump into a region of wide columns must land the cursor on
+    // screen. Scrolling by a column *count* (taken where the columns were
+    // narrow) would leave it clipped past the right edge.
+    let mut app = App::default();
+    app.update_viewport_size(15, 10, 90); // 10 default (8-wide) columns
+    for c in 40..60 {
+        app.workbook.current_sheet_mut().set_column_width(c, 29); // cost 30
+    }
+    app.selected_col = 50;
+    app.ensure_cursor_visible();
+    // Only 3 thirty-cell columns fit in 90 cells: 48, 49, 50.
+    assert_eq!(app.scroll_col, 48);
+
+    // Moving one column right scrolls by exactly one wide column.
+    app.selected_col = 51;
+    app.ensure_cursor_visible();
+    assert_eq!(app.scroll_col, 49);
+
+    // Hidden columns cost nothing, so they don't push the cursor off.
+    app.hidden_cols.insert(50);
+    app.scroll_col = 48;
+    app.ensure_cursor_visible();
+    assert_eq!(app.scroll_col, 48, "48, (hidden 50), 49, 51 fit in 90 cells");
+}
+
+#[test]
+fn test_horizontal_scroll_respects_frozen_column_width() {
+    let mut app = App::default();
+    app.update_viewport_size(15, 10, 90);
+    app.frozen_cols = 1;
+    app.workbook.current_sheet_mut().set_column_width(0, 44); // costs 45
+    // 45 cells left for the body = 5 default columns.
+    app.selected_col = 20;
+    app.ensure_cursor_visible();
+    assert_eq!(app.scroll_col, 16, "body shows 16..=20 beside frozen A");
 }
 
 #[test]

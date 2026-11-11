@@ -869,3 +869,129 @@ fn agent_grammar_count_does_not_leak_past_motion_into_next_command() {
     assert_eq!(app.selected_row, r_before + 1);
 }
 
+
+// ----- `/` search: Vim 'incsearch' semantics -----
+
+fn foo_at_rows(app: &mut App, rows: &[usize]) {
+    for &r in rows {
+        put(app, r, 0, "foo");
+    }
+}
+
+#[test]
+fn search_starts_after_cursor_and_wraps() {
+    let mut app = App::default();
+    foo_at_rows(&mut app, &[1, 5, 9]);
+    // Standing ON a match: like Vim, `/` finds the next one, not this one.
+    app.selected_row = 5;
+    typestr(&mut app, "/foo");
+    assert_eq!(app.selected_row, 9);
+    assert_eq!(app.search_result_index, 2, "status shows 3/3");
+    key(&mut app, KeyCode::Esc);
+
+    // Past the last match: wraps to the top.
+    app.selected_row = 12;
+    typestr(&mut app, "/foo");
+    assert_eq!(app.selected_row, 1);
+}
+
+#[test]
+fn search_each_keystroke_searches_from_origin() {
+    let mut app = App::default();
+    put(&mut app, 3, 0, "fa");
+    put(&mut app, 6, 0, "fb");
+    put(&mut app, 9, 0, "fa");
+    // "/f" lands on row 3; refining to "fa" must still search from the
+    // origin (row 0) and stay on row 3, not hop past it to row 9.
+    typestr(&mut app, "/f");
+    assert_eq!(app.selected_row, 3);
+    typestr(&mut app, "a");
+    assert_eq!(app.selected_row, 3);
+}
+
+#[test]
+fn search_esc_restores_cursor_and_view() {
+    let mut app = App::default();
+    foo_at_rows(&mut app, &[80]);
+    app.selected_row = 5;
+    app.selected_col = 2;
+    app.scroll_row = 3;
+    app.scroll_col = 1;
+    typestr(&mut app, "/foo");
+    assert_eq!((app.selected_row, app.selected_col), (80, 0));
+    assert_ne!(app.scroll_row, 3, "view followed the match");
+    key(&mut app, KeyCode::Esc);
+    assert!(matches!(app.mode, AppMode::Normal));
+    assert_eq!((app.selected_row, app.selected_col), (5, 2));
+    assert_eq!((app.scroll_row, app.scroll_col), (3, 1));
+    assert!(app.search_origin.is_none());
+}
+
+#[test]
+fn search_query_without_match_snaps_back_to_origin() {
+    let mut app = App::default();
+    foo_at_rows(&mut app, &[80]);
+    app.selected_row = 5;
+    app.scroll_row = 2;
+    typestr(&mut app, "/foo");
+    assert_eq!(app.selected_row, 80);
+    typestr(&mut app, "zzz");
+    assert!(app.search_results.is_empty());
+    assert_eq!((app.selected_row, app.scroll_row), (5, 2));
+    for _ in 0..3 {
+        key(&mut app, KeyCode::Backspace);
+    }
+    assert_eq!(app.selected_row, 80, "matching again jumps back to the hit");
+    // Emptying the query also returns to the origin.
+    for _ in 0..3 {
+        key(&mut app, KeyCode::Backspace);
+    }
+    assert_eq!((app.selected_row, app.scroll_row), (5, 2));
+}
+
+#[test]
+fn search_enter_keeps_navigated_match() {
+    let mut app = App::default();
+    foo_at_rows(&mut app, &[1, 5, 9]);
+    typestr(&mut app, "/foo");
+    assert_eq!(app.selected_row, 1);
+    key(&mut app, KeyCode::Down);
+    assert_eq!(app.selected_row, 5);
+    key(&mut app, KeyCode::Enter);
+    assert!(matches!(app.mode, AppMode::Normal));
+    assert_eq!(app.selected_row, 5, "Enter must not snap back to the first hit");
+    assert!(app.search_origin.is_none());
+}
+
+#[test]
+fn search_n_and_N_continue_from_cursor() {
+    let mut app = App::default();
+    foo_at_rows(&mut app, &[1, 5, 9]);
+    typestr(&mut app, "/foo");
+    key(&mut app, KeyCode::Enter);
+    assert_eq!(app.selected_row, 1);
+
+    // Move away: n/N search from the cursor, not from the last match.
+    app.selected_row = 7;
+    typestr(&mut app, "n");
+    assert_eq!(app.selected_row, 9);
+    assert_eq!(app.status_message, None);
+    app.selected_row = 7;
+    typestr(&mut app, "N");
+    assert_eq!(app.selected_row, 5);
+
+    // Wrap-around is reported, Vim-style.
+    app.selected_row = 9;
+    typestr(&mut app, "n");
+    assert_eq!(app.selected_row, 1);
+    assert_eq!(app.status_message.as_deref(), Some("search hit BOTTOM, continuing at TOP"));
+    // ...and cleared by the next non-wrapping step so it doesn't go stale.
+    typestr(&mut app, "n");
+    assert_eq!(app.selected_row, 5);
+    assert_eq!(app.status_message, None);
+
+    app.selected_row = 1;
+    typestr(&mut app, "N");
+    assert_eq!(app.selected_row, 9);
+    assert_eq!(app.status_message.as_deref(), Some("search hit TOP, continuing at BOTTOM"));
+}
