@@ -11,8 +11,16 @@ impl App {
         self.search_result_index = 0;
         self.cursor_position = 0;
         self.status_message = None;
+        self.search_origin = Some(SearchOrigin {
+            row: self.selected_row,
+            col: self.selected_col,
+            scroll_row: self.scroll_row,
+            scroll_col: self.scroll_col,
+        });
     }
 
+    /// Esc: abandon the search and put the cursor *and* the view back
+    /// where they were when `/` was pressed, as Vim does with 'incsearch'.
     pub fn cancel_search(&mut self) {
         self.mode = AppMode::Normal;
         self.search_query.clear();
@@ -20,14 +28,30 @@ impl App {
         self.search_results_set.clear();
         self.search_result_index = 0;
         self.cursor_position = 0;
+        self.restore_search_origin();
+        self.search_origin = None;
     }
 
+    fn restore_search_origin(&mut self) {
+        if let Some(o) = self.search_origin {
+            self.selected_row = o.row;
+            self.selected_col = o.col;
+            self.scroll_row = o.scroll_row;
+            self.scroll_col = o.scroll_col;
+        }
+    }
+
+    /// Live search, re-run on every query edit. Like Vim's `/`, it looks
+    /// forward from where the search started — the first match *after* the
+    /// origin cell in row-major order, wrapping to the top — and a query
+    /// with no match snaps the cursor and view back to the origin.
     pub fn perform_search(&mut self) {
         self.search_results.clear();
         self.search_results_set.clear();
         self.search_result_index = 0;
 
         if self.search_query.is_empty() {
+            self.restore_search_origin();
             return;
         }
 
@@ -50,26 +74,65 @@ impl App {
             }
         }
         self.search_results.sort();
-        if !self.search_results.is_empty() {
-            self.go_to_current_search_result();
+        if self.search_results.is_empty() {
+            self.restore_search_origin();
+            return;
+        }
+        // Without an origin (perform_search called outside Search mode),
+        // search from the cursor.
+        let from = self
+            .search_origin
+            .map(|o| (o.row, o.col))
+            .unwrap_or((self.selected_row, self.selected_col));
+        let (idx, _wrapped) = self.search_step_from(from, true);
+        self.search_result_index = idx;
+        self.go_to_current_search_result();
+    }
+
+    /// Index of the first result strictly after (`forward`) or before
+    /// `from` in row-major order, wrapping around the sheet. Returns
+    /// whether it wrapped. Requires non-empty `search_results` (sorted).
+    fn search_step_from(&self, from: (usize, usize), forward: bool) -> (usize, bool) {
+        let results = &self.search_results;
+        if forward {
+            // partition_point: count of results <= from.
+            let i = results.partition_point(|&p| p <= from);
+            if i < results.len() { (i, false) } else { (0, true) }
+        } else {
+            let i = results.partition_point(|&p| p < from);
+            if i > 0 { (i - 1, false) } else { (results.len() - 1, true) }
         }
     }
 
+    /// `n` / ↓-while-searching: the next match after the *cursor* (not after
+    /// the last match), so moving away and pressing `n` continues from
+    /// where you are, as in Vim.
     pub fn next_search_result(&mut self) {
-        if !self.search_results.is_empty() {
-            self.search_result_index = (self.search_result_index + 1) % self.search_results.len();
-            self.go_to_current_search_result();
-        }
+        self.step_search_result(true);
     }
 
+    /// `N` / ↑-while-searching: the previous match before the cursor.
     pub fn previous_search_result(&mut self) {
-        if !self.search_results.is_empty() {
-            if self.search_result_index == 0 {
-                self.search_result_index = self.search_results.len() - 1;
-            } else {
-                self.search_result_index -= 1;
-            }
-            self.go_to_current_search_result();
+        self.step_search_result(false);
+    }
+
+    fn step_search_result(&mut self, forward: bool) {
+        if self.search_results.is_empty() {
+            return;
+        }
+        let (idx, wrapped) =
+            self.search_step_from((self.selected_row, self.selected_col), forward);
+        self.search_result_index = idx;
+        self.go_to_current_search_result();
+        // In Normal mode (n/N) report wrap-around like Vim; clear it on a
+        // non-wrapping step so the note doesn't go stale. In Search mode the
+        // status line shows the live prompt instead.
+        if !matches!(self.mode, AppMode::Search) {
+            self.status_message = match (wrapped, forward) {
+                (true, true) => Some("search hit BOTTOM, continuing at TOP".to_string()),
+                (true, false) => Some("search hit TOP, continuing at BOTTOM".to_string()),
+                (false, _) => None,
+            };
         }
     }
 
@@ -83,6 +146,7 @@ impl App {
 
     pub fn finish_search(&mut self) {
         self.mode = AppMode::Normal;
+        self.search_origin = None;
 
         let num_results = self.search_results.len();
         if num_results > 0 {

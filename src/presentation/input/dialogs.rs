@@ -195,7 +195,9 @@ impl InputHandler {
     pub(super) fn handle_search_mode(app: &mut App, key: KeyCode) {
         match key {
             KeyCode::Enter => {
-                app.perform_search();
+                // No re-search here: every query edit already ran one, and
+                // re-running would snap back to the first match after the
+                // origin, discarding any ↑/↓ navigation.
                 app.finish_search();
             }
             KeyCode::Esc => {

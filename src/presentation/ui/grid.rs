@@ -213,14 +213,20 @@ pub(super) fn validation_passes(app: &App, value: &str, predicate: &str) -> bool
 }
 
 pub(super) fn render_spreadsheet(f: &mut Frame, app: &mut App, area: Rect) {
-    // Reserve one row for the header. saturating_sub guards against a 0-row
-    // area (e.g. terminal resized to a single line) which would otherwise
-    // underflow to usize::MAX and crash the next loop iteration.
-    let visible_rows = (area.height as usize).saturating_sub(1);
+    // The grid is a bordered Table: the top and bottom borders take one row
+    // each and the column-letter header takes another, so only
+    // `height - 3` data rows actually render. This must match what the
+    // Table draws — `ensure_cursor_visible` trusts it, and overcounting
+    // leaves the cursor in rows that are "visible" but clipped (e.g. a
+    // search hit or `n` landing just below the bottom edge never scrolled).
+    // saturating_sub guards against a tiny area (terminal resized to a
+    // couple of lines) which would otherwise underflow to usize::MAX.
+    let visible_rows = (area.height as usize).saturating_sub(3);
 
+    // Same for width: the left/right borders take one column each.
     let mut total_width = 4;
     let mut visible_cols = 0;
-    let available_width = area.width as usize;
+    let available_width = (area.width as usize).saturating_sub(2);
     let total_cols = app.workbook.current_sheet().cols;
     let frozen_c = app.frozen_cols.min(total_cols);
 
@@ -250,7 +256,11 @@ pub(super) fn render_spreadsheet(f: &mut Frame, app: &mut App, area: Rect) {
         visible_cols += 1;
     }
 
-    app.update_viewport_size(visible_rows, visible_cols);
+    // Width left for data columns after the 4-wide row-label column. Each
+    // data column costs `width + 1` (its leading column-spacing), matching
+    // the `total_width` accounting above.
+    let col_budget = available_width.saturating_sub(4);
+    app.update_viewport_size(visible_rows, visible_cols, col_budget);
 
     // Build the same column list used in build_row so headers line up.
     let mut header_cols: Vec<usize> = (0..frozen_c)

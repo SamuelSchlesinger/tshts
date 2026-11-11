@@ -12,6 +12,16 @@ mod undo;
 pub use matcher::TextMatcher;
 pub use undo::UndoAction;
 
+/// Cursor + scroll position captured when a `/` search starts. See
+/// `App::search_origin`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchOrigin {
+    pub row: usize,
+    pub col: usize,
+    pub scroll_row: usize,
+    pub scroll_col: usize,
+}
+
 /// The application mode determines how user input is interpreted.
 #[derive(Debug)]
 pub enum AppMode {
@@ -137,6 +147,12 @@ pub struct App {
     pub search_results_set: std::collections::HashSet<(usize, usize)>,
     /// Current search result index
     pub search_result_index: usize,
+    /// Where the cursor and view were when `/` was pressed. Live search
+    /// looks forward from here (not from wherever the previous keystroke's
+    /// match moved the cursor), a query with no match snaps back here, and
+    /// Esc restores it — Vim's 'incsearch' behaviour. `None` outside Search
+    /// mode.
+    pub search_origin: Option<SearchOrigin>,
     /// Selection start position (row, col)
     pub selection_start: Option<(usize, usize)>,
     /// Selection end position (row, col) 
@@ -145,8 +161,16 @@ pub struct App {
     pub selecting: bool,
     /// Viewport height in rows (for scrolling calculations)
     pub viewport_rows: usize,
-    /// Viewport width in columns (for scrolling calculations)
+    /// Number of columns (frozen + body) the last frame rendered. Purely
+    /// informational: it depends on the scroll position and column widths,
+    /// so horizontal scrolling uses `viewport_width` instead.
     pub viewport_cols: usize,
+    /// Terminal cells available for data columns (grid inner width minus
+    /// the row-label column). Each column costs `width + 1` (its leading
+    /// spacing). `ensure_cursor_visible` uses this, not a column count, so a
+    /// long jump (search hit, `n`, goto) into a region with wider columns
+    /// still lands on screen.
+    pub viewport_width: usize,
     /// Input buffer for go-to cell reference
     pub goto_cell_input: String,
     /// Internal clipboard for copy/paste
@@ -290,11 +314,13 @@ impl Default for App {
             search_results: Vec::new(),
             search_results_set: std::collections::HashSet::new(),
             search_result_index: 0,
+            search_origin: None,
             selection_start: None,
             selection_end: None,
             selecting: false,
             viewport_rows: 20,  // Default reasonable size
             viewport_cols: 8,   // Default reasonable size
+            viewport_width: 8 * 9, // 8 default-width (8) columns + spacing
             goto_cell_input: String::new(),
             clipboard: None,
             find_replace_search: String::new(),
@@ -662,9 +688,10 @@ impl App {
         }
     }
 
-    pub fn update_viewport_size(&mut self, rows: usize, cols: usize) {
+    pub fn update_viewport_size(&mut self, rows: usize, cols: usize, width: usize) {
         self.viewport_rows = rows;
         self.viewport_cols = cols;
+        self.viewport_width = width;
     }
 
     pub fn ensure_cursor_visible(&mut self) {
@@ -672,29 +699,87 @@ impl App {
         // the area available for scrolled rows.
         let usable_rows = self.viewport_rows.saturating_sub(self.frozen_rows).max(1);
 
-        // If the cursor is in a frozen row, no scrolling needed — it's always shown.
+        // If the cursor is in a frozen row, no scrolling needed — it's always
+        // shown. Otherwise follow Vim's update_topline(): a cursor just off
+        // an edge scrolls the minimum (scrolljump=1), but one that jumped far
+        // away (search hit, `n`, goto, `G`, big counts) is centered.
+        //   above the view: center when >= ~half a screen above the top
+        //   below the view: center when > a full screen below the bottom
+        // (The asymmetry is Vim's.)
         if self.selected_row >= self.frozen_rows {
+            let sel = self.selected_row;
             let body_top = self.scroll_row.max(self.frozen_rows);
-            if self.selected_row < body_top {
-                self.scroll_row = self.selected_row;
-            } else if self.selected_row >= body_top + usable_rows {
-                self.scroll_row = (self.selected_row + 1).saturating_sub(usable_rows);
-                if self.scroll_row < self.frozen_rows {
-                    self.scroll_row = self.frozen_rows;
-                }
+            let below_view = body_top + usable_rows;
+            let far = if sel < body_top {
+                let half_height = (usable_rows / 2).saturating_sub(1).max(2);
+                body_top - sel >= half_height
+            } else if sel >= below_view {
+                sel - below_view > usable_rows
+            } else {
+                false // already on screen
+            };
+            if far {
+                // Centered, but never past the last row (like Vim at EOF,
+                // where the final line sits at the bottom of the window).
+                let max_top = self
+                    .workbook
+                    .current_sheet()
+                    .rows
+                    .saturating_sub(usable_rows)
+                    .max(self.frozen_rows);
+                self.scroll_row = sel
+                    .saturating_sub((usable_rows - 1) / 2)
+                    .clamp(self.frozen_rows, max_top);
+            } else if sel < body_top {
+                self.scroll_row = sel;
+            } else if sel >= below_view {
+                self.scroll_row = (sel + 1)
+                    .saturating_sub(usable_rows)
+                    .max(self.frozen_rows);
             }
         }
 
-        // Horizontal scrolling — symmetric with rows.
-        let usable_cols = self.viewport_cols.saturating_sub(self.frozen_cols).max(1);
-        if self.selected_col >= self.frozen_cols {
-            let body_left = self.scroll_col.max(self.frozen_cols);
+        // Horizontal scrolling. Columns have per-column widths and may be
+        // hidden, so measure in terminal cells rather than counting columns
+        // (a count taken at the old scroll position goes stale after a long
+        // jump into a region with different widths). Mirrors the renderer's
+        // layout: frozen columns first, then the body from `scroll_col`.
+        let sheet = self.workbook.current_sheet();
+        let frozen_c = self.frozen_cols.min(sheet.cols);
+        if self.selected_col >= frozen_c {
+            let col_cost = |c: usize| {
+                if self.hidden_cols.contains(&c) {
+                    0
+                } else {
+                    sheet.get_column_width(c) + 1
+                }
+            };
+            let frozen_cost: usize = (0..frozen_c).map(col_cost).sum();
+            let budget = self.viewport_width.saturating_sub(frozen_cost);
+            let body_left = self.scroll_col.max(frozen_c);
             if self.selected_col < body_left {
                 self.scroll_col = self.selected_col;
-            } else if self.selected_col >= body_left + usable_cols {
-                self.scroll_col = (self.selected_col + 1).saturating_sub(usable_cols);
-                if self.scroll_col < self.frozen_cols {
-                    self.scroll_col = self.frozen_cols;
+            } else {
+                // Does the cursor column fit when rendering from body_left?
+                let mut used = 0usize;
+                let fits = (body_left..=self.selected_col).all(|c| {
+                    used += col_cost(c);
+                    used <= budget
+                });
+                if !fits {
+                    // Scroll right just enough: the leftmost start column
+                    // that still keeps the cursor column on screen.
+                    let mut left = self.selected_col;
+                    let mut used = col_cost(left);
+                    while left > frozen_c {
+                        let cost = col_cost(left - 1);
+                        if used + cost > budget {
+                            break;
+                        }
+                        used += cost;
+                        left -= 1;
+                    }
+                    self.scroll_col = left;
                 }
             }
         }
